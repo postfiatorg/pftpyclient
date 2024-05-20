@@ -12,7 +12,8 @@ setup(
         'xrpl-py',
         'wxPython',
         'requests',
-        'toml'
+        'toml',
+        'nest_asyncio',
     ],
     author='PFAdmin',
     author_email='admin@postfiat.com',

@@ -118,41 +118,12 @@ class WalletApp(wx.Frame):
         self.url = url
         self.wallet = None
         self.build_ui()
-        self.set_logo()  # Set the custom logo during initialization
         self.worker = None
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.Bind(EVT_UPDATE_GRID, self.on_update_grid)
 
         # Start the force update timer
         self.start_force_update_timer()
-
-    def set_logo(self):
-        """Set the application logo dynamically."""
-        import os  # Import locally to avoid global os.path usage
-
-        # Determine the logo path dynamically
-        script_dir = os.path.dirname(__file__)
-        logo_path = os.path.join(script_dir, '..', 'images', 'simple_pf_logo.png')
-
-        if os.path.exists(logo_path):
-            # Load the logo image
-            logo = wx.Image(logo_path, wx.BITMAP_TYPE_PNG)
-
-            # Rescale the logo to a suitable size (adjust as needed)
-            logo = logo.Scale(32, 32, wx.IMAGE_QUALITY_HIGH)
-
-            # Create a bitmap from the rescaled logo image
-            bitmap = wx.Bitmap(logo)
-
-            # Create an icon from the bitmap
-            icon = wx.Icon()
-            icon.CopyFromBitmap(bitmap)
-
-            # Set the application icon
-            self.SetIcon(icon)
-            logging.info(f"Logo set successfully from path: {logo_path}")
-        else:
-            logging.error(f"Logo file not found: {logo_path}")
 
     def build_ui(self):
         self.panel = wx.Panel(self)
@@ -488,7 +459,7 @@ class WalletApp(wx.Frame):
     def update_tokens(self, account_address):
         logging.debug(f"Fetching token balances for account: {account_address}")
         try:
-            client = xrpl.clients.JsonRpcClient(self.url)
+            client = xrpl.clients.JsonRpcClient("https://s2.ripple.com:51234")
             account_lines = xrpl.models.requests.AccountLines(
                 account=account_address,
                 ledger_index="validated"
@@ -623,7 +594,7 @@ class WalletApp(wx.Frame):
         # Set column width to ensure proper wrapping
         self.accepted_grid.SetColSize(0, 170)
         self.accepted_grid.SetColSize(1, 400)  # Adjust width as needed
-        self.accepted_grid.SetColLabelValue(2, 300)  # Adjust width as needed
+        self.accepted_grid.SetColSize(2, 300)  # Adjust width as needed
 
     def populate_rewards_grid(self, json_data):
         data = json.loads(json_data)

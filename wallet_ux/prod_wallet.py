@@ -459,7 +459,7 @@ class WalletApp(wx.Frame):
     def update_tokens(self, account_address):
         logging.debug(f"Fetching token balances for account: {account_address}")
         try:
-            client = xrpl.clients.JsonRpcClient(self.url)
+            client = xrpl.clients.JsonRpcClient("https://s2.ripple.com:51234")
             account_lines = xrpl.models.requests.AccountLines(
                 account=account_address,
                 ledger_index="validated"
