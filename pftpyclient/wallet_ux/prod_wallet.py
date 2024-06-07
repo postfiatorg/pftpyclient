@@ -8,8 +8,8 @@ import json
 import wx.lib.newevent
 import nest_asyncio
 import logging
-from task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
-from task_manager.basic_tasks import WalletInitiationFunctions
+from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
+from pftpyclient.task_manager.basic_tasks import WalletInitiationFunctions
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 nest_asyncio.apply()
 
 # JSON data to be rendered in the table
-json_data = '{"proposal":{"2024-05-09_23:55__CF24":"Implement a batch job that runs the net income and FCF extractors on the latest earnings transcripts, logs the results, and flags any extraction errors for manual review. .. 850"},"acceptance":{"2024-05-09_23:55__CF24":"I agree that net income and fcf extraction are important and urgent and will work the weekend doing this"}}'
+json_data = '{"proposal":{"2024-05-09_23:55__CF24":"Sample task .. 850"},"acceptance":{"2024-05-09_23:55__CF24":"I agree that net income and fcf extraction are important and urgent and will work the weekend doing this"}}'
 
 UpdateGridEvent, EVT_UPDATE_GRID = wx.lib.newevent.NewEvent()
 
@@ -124,6 +124,7 @@ class WalletApp(wx.Frame):
 
         # Start the force update timer
         self.start_force_update_timer()
+        self.start_pft_update_timer()
 
     def build_ui(self):
         self.panel = wx.Panel(self)
@@ -146,6 +147,12 @@ class WalletApp(wx.Frame):
         self.user_details_sizer.Add(self.lbl_password, flag=wx.ALL, border=5)
         self.txt_password = wx.TextCtrl(self.user_details_tab, style=wx.TE_PASSWORD)
         self.user_details_sizer.Add(self.txt_password, flag=wx.EXPAND | wx.ALL, border=5)
+
+        self.lbl_confirm_password = wx.StaticText(self.user_details_tab, label="Confirm Password:")
+        self.user_details_sizer.Add(self.lbl_confirm_password, flag=wx.ALL, border=5)
+        self.txt_confirm_password = wx.TextCtrl(self.user_details_tab, style=wx.TE_PASSWORD)
+        self.user_details_sizer.Add(self.txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
+
 
         self.lbl_google_doc = wx.StaticText(self.user_details_tab, label="Google Doc Share Link:")
         self.user_details_sizer.Add(self.lbl_google_doc, flag=wx.ALL, border=5)
@@ -177,6 +184,10 @@ class WalletApp(wx.Frame):
         self.btn_genesis = wx.Button(self.user_details_tab, label="Genesis")
         self.user_details_sizer.Add(self.btn_genesis, flag=wx.ALL, border=5)
         self.btn_genesis.Bind(wx.EVT_BUTTON, self.on_genesis)
+
+        self.btn_existing_user = wx.Button(self.user_details_tab, label="Cache Existing User")
+        self.user_details_sizer.Add(self.btn_existing_user, flag=wx.ALL, border=5)
+        self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_existing_user)
 
         self.btn_delete_user = wx.Button(self.user_details_tab, label="Delete Existing User")
         self.user_details_sizer.Add(self.btn_delete_user, flag=wx.ALL, border=5)
@@ -374,23 +385,46 @@ class WalletApp(wx.Frame):
         }
         commitment = self.txt_commitment.GetValue()  # Get the user commitment
 
-        # Call the caching function
-        wallet_functions = WalletInitiationFunctions()
-        output_string = wallet_functions.given_input_map_cache_credentials_locally(input_map)
+        if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
+            wx.MessageBox('Passwords Do Not Match Please Retry', 'Info', wx.OK | wx.ICON_INFORMATION)
 
-        # Display the output string in a message box
-        wx.MessageBox(output_string, 'Genesis Result', wx.OK | wx.ICON_INFORMATION)
+        if self.txt_password.GetValue() == self.txt_confirm_password.GetValue():
+            # Call the caching function
+            wallet_functions = WalletInitiationFunctions()
+            output_string = wallet_functions.given_input_map_cache_credentials_locally(input_map)
 
-        # Call send_initiation_rite with the gathered data
-        wallet_functions.send_initiation_rite(
-            wallet_seed=self.txt_xrp_secret.GetValue(),
-            user=self.txt_username.GetValue(),
-            user_response=commitment
-        )
+
+            # Display the output string in a message box
+            wx.MessageBox(output_string, 'Genesis Result', wx.OK | wx.ICON_INFORMATION)
+
+            # Call send_initiation_rite with the gathered data
+            wallet_functions.send_initiation_rite(
+                wallet_seed=self.txt_xrp_secret.GetValue(),
+                user=self.txt_username.GetValue(),
+                user_response=commitment
+            )
 
     def on_delete_user(self, event):
         self.clear_credential_file()
         wx.MessageBox('User Credential Cache Deleted', 'Info', wx.OK | wx.ICON_INFORMATION)
+
+    def on_existing_user(self, event):
+        input_map = {
+            'Username_Input': self.txt_username.GetValue(),
+            'Password_Input': self.txt_password.GetValue(),
+            'Google Doc Share Link_Input': self.txt_google_doc.GetValue(),
+            'XRP Address_Input': self.txt_xrp_address.GetValue(),
+            'XRP Secret_Input': self.txt_xrp_secret.GetValue(),
+            'Confirm Password_Input': self.txt_confirm_password.GetValue(),
+        }
+
+        if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
+            wx.MessageBox('Passwords Do Not Match Please Retry', 'Info', wx.OK | wx.ICON_INFORMATION)
+
+        if self.txt_password.GetValue() == self.txt_confirm_password.GetValue():
+            wallet_functions = WalletInitiationFunctions()
+            output_string = wallet_functions.given_input_map_cache_credentials_locally(input_map)
+            wx.MessageBox('Existing User Information Cached. Please proceed to Log In', 'Info', wx.OK | wx.ICON_INFORMATION)
 
     def clear_credential_file(self):
         self.wallet = WalletInitiationFunctions()
@@ -482,7 +516,7 @@ class WalletApp(wx.Frame):
                     pft_balance = float(line['balance'])
                     logging.debug(f"Found PFT balance: {pft_balance}")
 
-            wx.CallAfter(self.lbl_pft_balance.SetLabel, f"PFT Balance: {pft_balance}")
+            self.lbl_pft_balance.SetLabel(f"PFT Balance: {pft_balance}")
 
         except Exception as e:
             logging.exception(f"Exception in update_tokens: {e}")
@@ -501,6 +535,11 @@ class WalletApp(wx.Frame):
         self.force_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_force_update, self.force_update_timer)
         self.force_update_timer.Start(60000)  # Update every 60 seconds
+
+    def start_pft_update_timer(self):
+        self.pft_update_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
+        self.pft_update_timer.Start(60000)  # Update every 60 seconds (adjust as needed)
 
     def update_json_data(self, event):
         try:
@@ -546,6 +585,10 @@ class WalletApp(wx.Frame):
         else:
             self.populate_accepted_grid(event.json_data)
 
+    def on_pft_update_timer(self, event):
+        if self.wallet:
+            self.update_tokens(self.wallet.classic_address)
+
     def populate_summary_grid(self, key_account_details):
         self.summary_grid.ClearGrid()
         while self.summary_grid.GetNumberRows() > 0:
@@ -561,11 +604,13 @@ class WalletApp(wx.Frame):
             self.summary_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
             
             # Manually set row height for better display
-            self.summary_grid.SetRowSize(row, 40)  # Adjust the height as needed
+            self.summary_grid.SetRowSize(row, 300)  # Adjust the height as needed
 
         # Set column width to ensure proper wrapping
-        self.summary_grid.SetColSize(0, 200)
-        self.summary_grid.SetColSize(1, 600)  # Adjust width as needed
+        self.summary_grid.SetColSize(0, 100)
+        self.summary_grid.SetColSize(1, 550)  # Adjust width as needed
+        self.summary_grid.AutoSizeRows()
+        self.summary_grid.ForceRefresh()
 
     def populate_accepted_grid(self, json_data):
         data = json.loads(json_data)
@@ -778,7 +823,8 @@ class WalletApp(wx.Frame):
             task_id=task_id,
             all_account_info=all_account_info
         )
-        wx.MessageBox(str(response), 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
+        message = self.task_manager.ux__convert_response_object_to_status_message(response)
+        wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
 
     def on_log_pomodoro(self, event):
         task_id = self.txt_task_id.GetValue()

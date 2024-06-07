@@ -4,7 +4,7 @@ import datetime
 import glob
 from platform import system
 from pathlib import Path
-from postfiatsecurity import hash_tools as pwl
+from pftpyclient.postfiatsecurity import hash_tools as pwl
 
 def datetime_current_EST():
     '''EST should be used for all timestamps'''

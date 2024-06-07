@@ -8,8 +8,8 @@ import json
 import wx.lib.newevent
 import nest_asyncio
 import logging
-from task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
-from task_manager.basic_tasks import WalletInitiationFunctions
+from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
+from pftpyclient.task_manager.basic_tasks import WalletInitiationFunctions
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')

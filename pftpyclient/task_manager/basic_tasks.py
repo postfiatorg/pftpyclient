@@ -1,10 +1,10 @@
-from user_login.credential_input import CredentialManager
+from pftpyclient.user_login.credential_input import CredentialManager
 import xrpl
 import datetime
 from xrpl.wallet import Wallet
 from xrpl.models.requests import AccountTx
 from xrpl.models.transactions import Payment, Memo
-from basic_utilities.settings import *
+from pftpyclient.basic_utilities.settings import *
 import asyncio
 import nest_asyncio
 import pandas as pd
@@ -985,6 +985,7 @@ class PostFiatTaskManager:
                                                    x['full_output'])].copy()
         task_id_to_payout = pft_rewards_only.groupby('task_id').last()['pft_value']
         reward_df['payout']=task_id_to_payout
+        reward_df = reward_df.tail(15)
         return reward_df
 
     ## WALLET UX POPULATION 
@@ -1068,11 +1069,12 @@ class PostFiatTaskManager:
         # Formatting messages
         incoming_message = format_dict(most_recent_incoming_message)
         outgoing_message = format_dict(most_recent_outgoing_message)
-
+        user_classic_address = self.user_wallet.classic_address
         # Compiling key display information
         key_display_info = {
             'Google Doc': key_google_doc,
             'Genesis Username': genesis_username,
+            'Account Address' : user_classic_address,
             'Default Node': user_default_node,
             'Incoming Message': incoming_message,
             'Outgoing Message': outgoing_message

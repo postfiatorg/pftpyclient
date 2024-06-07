@@ -1,6 +1,6 @@
-from basic_utilities import settings as gvst
+from pftpyclient.basic_utilities import settings as gvst
 import getpass
-from basic_utilities.settings import *
+from pftpyclient.basic_utilities.settings import *
 
 
 class CredentialManager:
