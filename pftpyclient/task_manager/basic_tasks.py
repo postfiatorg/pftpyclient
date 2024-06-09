@@ -14,6 +14,12 @@ import binascii
 import re
 import random 
 import string
+import re
+from browser_history import get_history
+from sec_cik_mapper import StockMapper
+import datetime
+
+
 nest_asyncio.apply()
 
 from pathlib import Path
@@ -1106,3 +1112,81 @@ class PostFiatTaskManager:
         pomodoros_only = task_id_only[task_id_only['converted_memos'].apply(lambda x: '==' in x['task_id'])].copy()
         pomodoros_only['parent_task_id']=pomodoros_only['converted_memos'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
+
+
+
+class ProcessUserWebData:
+    def __init__(self):
+        print('kick off web history')
+        self.ticker_regex = re.compile(r'\b[A-Z]{1,5}\b')
+        #self.cik_regex = re.compile(r'CIK=(\d{10})|data/(\d{10})')
+        self.cik_regex = re.compile(r'CIK=(\d+)|data/(\d+)')
+        # THIS DOES NOT WORK FOR 'https://www.sec.gov/edgar/browse/?CIK=1409375&owner=exclude'
+        mapper = StockMapper()
+        self.cik_to_ticker_map = mapper.cik_to_tickers
+    def get_user_web_history_df(self):
+        outputs = get_history()
+        historical_info = pd.DataFrame(outputs.histories)
+        historical_info.columns=['date','url','content']
+        return historical_info
+    def get_primary_ticker_for_cik(self, cik):
+        ret = ''
+        try:
+            ret = list(self.cik_to_ticker_map[cik])[0]
+        except:
+            pass
+        return ret
+
+    def extract_cik_to_ticker(self, input_string):
+        # Define a regex pattern to match CIKs
+        cik_regex = self.cik_regex
+        
+        # Find all matches in the input string
+        matches = cik_regex.findall(input_string)
+        
+        # Extract CIKs from the matches and zfill to 10 characters
+        ciks = [match[0] or match[1] for match in matches]
+        padded_ciks = [cik.zfill(10) for cik in ciks]
+        output = ''
+        if len(padded_ciks) > 0:
+            output = self.get_primary_ticker_for_cik(padded_ciks[0])
+        
+        return output
+    
+
+    def extract_tickers(self, stringer):
+        tickers = list(set(self.ticker_regex.findall(stringer)))
+        return tickers
+
+    def create_basic_web_history_frame(self):
+        all_web_history_df = self.get_user_web_history_df()
+        all_web_history_df['cik_ticker_extraction']= all_web_history_df['url'].apply(lambda x: [self.extract_cik_to_ticker(x)])
+        all_web_history_df['content_tickers']=all_web_history_df['content'].apply(lambda x: self.extract_tickers(x))#.tail(20)
+        all_web_history_df['url_tickers']=all_web_history_df['url'].apply(lambda x: self.extract_tickers(x))#.tail(20)
+        all_web_history_df['all_tickers']=all_web_history_df['content_tickers']+all_web_history_df['url_tickers']+all_web_history_df['cik_ticker_extraction']
+        all_web_history_df['date_str']=all_web_history_df['date'].apply(lambda x: x.strftime('%Y-%m-%d'))
+        str_map = pd.DataFrame(all_web_history_df['date_str'].unique())
+        str_map.columns=['date_str']
+        str_map['date']=pd.to_datetime(str_map['date_str'])
+        all_web_history_df['simplified_date']=all_web_history_df['date_str'].map(str_map.groupby('date_str').last()['date'])
+        all_web_history_df['all_tickers']=all_web_history_df['all_tickers'].apply(lambda x: list(set(x)))
+        return all_web_history_df
+
+    def convert_all_web_history_to_simple_web_data_json(self,all_web_history):
+        recent_slice = all_web_history[all_web_history['simplified_date']>=datetime.datetime.now()-datetime.timedelta(7)].copy()
+        recent_slice['explode_block']=recent_slice.apply(lambda x: pd.DataFrame(([[i,x['simplified_date']] for i in x['all_tickers']])),axis=1)
+        
+        full_ticker_history  =pd.concat(list(recent_slice['explode_block']))
+        full_ticker_history.columns=['ticker','date']
+        full_ticker_history['included']=1
+        stop_tickers=['EDGAR','CIK','ETF','FORM','API','HOME','GAAP','EPS','NYSE','XBRL','AI','SBF','I','US','USD','SEO','','A','X','SEC','PC','EX','UTF','SIC']
+        multidex = full_ticker_history.groupby(['ticker','date']).last().sort_index()
+        financial_attention_df = multidex[~multidex.index.get_level_values(0).isin(stop_tickers)]['included'].unstack(0).sort_values('date').resample('D').last()
+        last_day = financial_attention_df[-1:].sum()
+        last_week = financial_attention_df[-7:].sum()
+        
+        ld_lw = pd.concat([last_day, last_week],axis=1)
+        ld_lw.columns=['last_day','last_week']
+        ld_lw=ld_lw.astype(int)
+        ld_lw[ld_lw.sum(1)>0].to_json()
+        return ld_lw

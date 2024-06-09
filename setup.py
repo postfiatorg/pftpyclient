@@ -14,6 +14,8 @@ setup(
         'requests',
         'toml',
         'nest_asyncio',
+        'browser_history',
+        'sec-cik-mapper'
     ],
     author='PFAdmin',
     author_email='admin@postfiat.com',
