@@ -523,13 +523,12 @@ class PostFiatTaskManager:
 
 
         
-        validated_tx = pd.DataFrame(full_transaction_history)
+        validated_tx = pd.DataFrame(full_transaction_history).rename(columns={'tx_json':'tx'})
         validated_tx['has_memos']=validated_tx['tx'].apply(lambda x: 'Memos' in x.keys())
         live_memo_tx = validated_tx[validated_tx['has_memos']== True].copy()
         live_memo_tx['main_memo_data']=live_memo_tx['tx'].apply(lambda x: x['Memos'][0]['Memo'])
         live_memo_tx['converted_memos']=live_memo_tx['main_memo_data'].apply(lambda x: 
                                                                              self.convert_memo_dict(x))
-        live_memo_tx['hash']=live_memo_tx['tx'].apply(lambda x: x['hash'])
         live_memo_tx['account']= live_memo_tx['tx'].apply(lambda x: x['Account'])
         live_memo_tx['destination']=live_memo_tx['tx'].apply(lambda x: x['Destination'])
         
