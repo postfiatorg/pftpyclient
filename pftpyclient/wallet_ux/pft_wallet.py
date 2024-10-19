@@ -427,9 +427,7 @@ class WalletApp(wx.Frame):
         self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
 
         # Fetch and display key account details
-        all_account_info = self.task_manager.get_memo_detail_df_for_account(
-            account_address=classic_address, transaction_limit=5000
-        )
+        all_account_info = self.task_manager.get_memo_detail_df_for_account()
         key_account_details = self.task_manager.process_account_info(all_account_info)
 
         self.populate_summary_grid(key_account_details)

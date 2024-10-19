@@ -10,6 +10,7 @@ import nest_asyncio
 import logging
 from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
 from pftpyclient.task_manager.basic_tasks import WalletInitiationFunctions
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -121,10 +122,6 @@ class WalletApp(wx.Frame):
         self.worker = None
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.Bind(EVT_UPDATE_GRID, self.on_update_grid)
-
-        # Start the force update timer
-        self.start_force_update_timer()
-        self.start_pft_update_timer()
 
     def build_ui(self):
         self.panel = wx.Panel(self)
@@ -437,6 +434,8 @@ class WalletApp(wx.Frame):
         self.wallet = self.task_manager.user_wallet
         classic_address = self.wallet.classic_address
 
+        logging.debug(f"Logged in as {username}")
+
         # Clear the summary tab
         self.summary_sizer.Clear(True)
 
@@ -461,9 +460,7 @@ class WalletApp(wx.Frame):
         self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
 
         # Fetch and display key account details
-        all_account_info = self.task_manager.get_memo_detail_df_for_account(
-            account_address=classic_address, transaction_limit=5000
-        )
+        all_account_info = self.task_manager.get_memo_detail_df_for_account()
         key_account_details = self.task_manager.process_account_info(all_account_info)
 
         self.populate_summary_grid(key_account_details)
@@ -476,8 +473,11 @@ class WalletApp(wx.Frame):
         # Immediately populate the grid with current data
         self.update_json_data(None)
 
-        # Start the timer to fetch and update JSON data
+        # Start timers
         self.start_json_update_timer()
+        self.start_force_update_timer()
+        self.start_pft_update_timer()
+        self.start_transaction_update_timer()
 
     def run_bg_job(self, job):
         if self.worker.context:
@@ -541,11 +541,18 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
         self.pft_update_timer.Start(60000)  # Update every 60 seconds (adjust as needed)
 
+    def start_transaction_update_timer(self):
+        self.tx_update_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
+        self.tx_update_timer.Start(60000)  # Update every 60 seconds (adjust as needed)
+
+    def on_transaction_update_timer(self, _):
+        logging.debug("Transaction update timer triggered")
+        self.task_manager.update_transactions()
+
     def update_json_data(self, event):
         try:
-            all_account_info = self.task_manager.get_memo_detail_df_for_account(
-                account_address=self.wallet.classic_address, transaction_limit=5000
-            )
+            all_account_info = self.task_manager.get_memo_detail_df_for_account()
 
             # Update Accepted tab
             json_data = self.task_manager.convert_all_account_info_into_outstanding_task_df(
@@ -710,9 +717,7 @@ class WalletApp(wx.Frame):
         dialog = CustomDialog("Ask For Task", ["Task Request"])
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account(
-                account_address=self.wallet.classic_address, transaction_limit=5000
-            )
+            all_account_info = self.task_manager.get_memo_detail_df_for_account()
             response = self.task_manager.request_post_fiat(request_message=request_message, all_account_info=all_account_info)
             message = self.task_manager.ux__convert_response_object_to_status_message(response)
             wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
@@ -725,9 +730,7 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             acceptance_string = values["Acceptance String"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account(
-                account_address=self.wallet.classic_address, transaction_limit=5000
-            )
+            all_account_info = self.task_manager.get_memo_detail_df_for_account()
             response = self.task_manager.send_acceptance_for_task_id(
                 task_id=task_id,
                 acceptance_string=acceptance_string,
@@ -744,9 +747,7 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             refusal_reason = values["Refusal Reason"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account(
-                account_address=self.wallet.classic_address, transaction_limit=5000
-            )
+            all_account_info = self.task_manager.get_memo_detail_df_for_account()
             response = self.task_manager.send_refusal_for_task(
                 task_id=task_id,
                 refusal_reason=refusal_reason,
@@ -763,9 +764,7 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             completion_string = values["Completion String"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account(
-                account_address=self.wallet.classic_address, transaction_limit=5000
-            )
+            all_account_info = self.task_manager.get_memo_detail_df_for_account()
             response = self.task_manager.send_post_fiat_initial_completion(
                 completion_string=completion_string,
                 task_id=task_id,
@@ -778,9 +777,7 @@ class WalletApp(wx.Frame):
 
     def on_force_update(self, event):
         logging.info("Kicking off Force Update")
-        all_account_info = self.task_manager.get_memo_detail_df_for_account(
-            account_address=self.wallet.classic_address, transaction_limit=5000
-        )
+        all_account_info = self.task_manager.get_memo_detail_df_for_account()
 
         try:
             verification_data = self.task_manager.convert_all_account_info_into_required_verification_df(
@@ -815,9 +812,7 @@ class WalletApp(wx.Frame):
     def on_submit_verification_details(self, event):
         task_id = self.txt_task_id.GetValue()
         response_string = self.txt_verification_details.GetValue()
-        all_account_info = self.task_manager.get_memo_detail_df_for_account(
-            account_address=self.wallet.classic_address, transaction_limit=5000
-        )
+        all_account_info = self.task_manager.get_memo_detail_df_for_account()
         response = self.task_manager.send_post_fiat_verification_response(
             response_string=response_string,
             task_id=task_id,

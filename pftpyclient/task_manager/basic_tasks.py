@@ -1,6 +1,5 @@
 from pftpyclient.user_login.credential_input import CredentialManager
 import xrpl
-import datetime
 from xrpl.wallet import Wallet
 from xrpl.models.requests import AccountTx
 from xrpl.models.transactions import Payment, Memo
@@ -18,12 +17,16 @@ import re
 from browser_history import get_history
 from sec_cik_mapper import StockMapper
 import datetime
-
+import os 
+from pftpyclient.basic_utilities.settings import DATADUMP_DIRECTORY_PATH
+import logging
+import time
+import json
+import ast
 
 nest_asyncio.apply()
 
 from pathlib import Path
-
 
 class WalletInitiationFunctions:
     def __init__(self):
@@ -212,17 +215,91 @@ class PostFiatTaskManager:
         self.user_wallet = self.spawn_user_wallet()
         self.establish_trust_line_if_needed()
         self.user_google_doc = self.pw_map[self.credential_manager.google_doc_name]
+        self.csv_file_path = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.csv")
 
         self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
-        all_account_info = self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
-                                                                transaction_limit=5000)
+
+        self.transactions = pd.DataFrame()
+        self.update_transactions()
+        
+        # to-do: see if all_account_info needs to be initialized in this way
+        all_account_info = self.get_memo_detail_df_for_account()
+
         # this initializes the user to the node 
         self.send_genesis_to_default_node_if_not_sent(all_account_info=all_account_info)
         # and also sends the node the google doc for the user 
-        #self.check_and_prompt_google_doc(all_account_info=all_account_info)
-        self.send_google_doc_to_node_if_not_sent(all_account_info=all_account_info, user_google_doc=self.user_google_doc)
+        self.check_and_prompt_google_doc(all_account_info=all_account_info)
 
     ## GENERIC UTILITY FUNCTIONS 
+
+    def save_transactions_to_csv(self):
+        self.transactions.to_csv(self.csv_file_path, index=False)
+        logging.debug(f"Saved {len(self.transactions)} transactions to {self.csv_file_path}")
+
+    def load_transactions_from_csv(self):
+        """ Loads the transactions from the CSV file into a dataframe, and deserializes some columns"""
+        tx_df = None
+        if os.path.exists(self.csv_file_path):
+            logging.debug(f"Loading transactions from {self.csv_file_path}")
+            try:
+                tx_df = pd.read_csv(self.csv_file_path)
+
+                # deserialize columns
+                for col in ['meta', 'tx_json']:
+                    if col in tx_df.columns:
+                        tx_df[col] = tx_df[col].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else x)
+
+            except Exception as e:
+                logging.error(f"Error loading transactions from {self.csv_file_path}: {e}")
+                os.remove(self.csv_file_path) # delete the file, it's corrupt or empty
+                return pd.DataFrame()
+            else:
+                return tx_df
+
+        logging.debug(f"No existing transaction history file found at {self.csv_file_path}")
+        return pd.DataFrame() # empty dataframe if file does not exist
+
+    def get_new_transactions(self, last_known_ledger_index):
+        """Retrieves new transactions from the node after the last known transaction date"""
+        logging.debug(f"Getting new transactions after ledger index {last_known_ledger_index}")
+        return self.get_account_transactions(
+            account_address=self.user_wallet.classic_address,
+            ledger_index_min=last_known_ledger_index,
+            ledger_index_max=-1,
+            limit=1000  # adjust as needed
+        )
+
+    def update_transactions(self):
+        """ Checks for new transactions and caches them locally """
+        logging.debug("Updating transactions")
+        
+        # if the transactions dataframe is empty, attempt to load from local csv
+        if self.transactions.empty: 
+            self.transactions = self.load_transactions_from_csv()
+
+        # if the transactions dataframe is still empty, use ledger index of -1 to fetch all transactions
+        if self.transactions.empty:
+            last_known_ledger_index = -1
+
+        # otherwise, use the last known ledger index from the transactions dataframe
+        else:
+            last_known_ledger_index = self.transactions['ledger_index'].max()
+            logging.debug(f"Last known ledger index: {last_known_ledger_index}")
+
+        # fetch new transactions from the node
+        new_tx_list = self.get_new_transactions(last_known_ledger_index)
+
+        # # DEBUGGING
+        # logging.debug(f"New transactions: {new_tx_list}")
+
+        if new_tx_list:
+            logging.debug(f"Adding {len(new_tx_list)} new transactions...")
+            self.transactions = pd.concat([self.transactions, pd.DataFrame(new_tx_list)], ignore_index=True).drop_duplicates(subset=['hash'])
+            self.save_transactions_to_csv()
+            logging.debug("Added new transactions")
+        else:
+            logging.debug("No new transactions found. Finished updating local tx history")
+
 
     def to_hex(self,string):
         return binascii.hexlify(string.encode()).decode()
@@ -245,7 +322,7 @@ class PostFiatTaskManager:
     def check_if_tx_pft(self,tx):
         ret= False
         try:
-            if tx['Amount']['currency'] == "PFT":
+            if tx['DeliverMax']['currency'] == "PFT":
                 ret = True
         except:
             pass
@@ -493,9 +570,10 @@ class PostFiatTaskManager:
         memo_format=user_hex)  
         return memo
     
-    def get_account_transactions(self, account_address,
+    def get_account_transactions__limited(self, account_address,
                                     ledger_index_min=-1,
-                                    ledger_index_max=-1, limit=10):
+                                    ledger_index_max=-1, 
+                                    limit=10):
             client = xrpl.clients.JsonRpcClient(self.mainnet_url) # Using a public server; adjust as necessary
         
             request = AccountTx(
@@ -514,50 +592,213 @@ class PostFiatTaskManager:
         
             return transactions
     
+    def get_account_transactions(self, account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n', 
+                                ledger_index_min=-1, 
+                                ledger_index_max=-1, 
+                                limit=10
+                                ):
+        logging.debug(f"Getting transactions for account {account_address} with ledger index min {ledger_index_min} and max {ledger_index_max} and limit {limit}")
+        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+        all_transactions = []
+        marker = None
+        previous_marker = None
+        max_iterations = 1000
+        iteration_count = 0
 
-    def get_memo_detail_df_for_account(self,account_address,transaction_limit=5000):
+        # Convert NumPy int64 to Python int
+        if isinstance(ledger_index_min, np.int64):
+            ledger_index_min = int(ledger_index_min)
+        if isinstance(ledger_index_max, np.int64):
+            ledger_index_max = int(ledger_index_max)
+
+        while iteration_count < max_iterations:
+            iteration_count += 1
+            logging.debug(f"Iteration {iteration_count}")
+            print(f"current marker: {marker}")
+
+            request = AccountTx(
+                account=account_address,
+                ledger_index_min=ledger_index_min, # Use -1 for the earliest ledger index
+                ledger_index_max=ledger_index_max, # Use -1 for the latest ledger index
+                limit=limit, # adjust as needed
+                marker=marker, # Used for pagination
+                forward=True # Set to True to return results in ascending order 
+            )
+
+            try:
+                # Convert the request to a dict and then to a JSON to check for serialization
+                request_dict = request.to_dict()
+                json.dumps(request_dict)  # This will raise an error if the request is not serializable
+            except TypeError as e:
+                logging.error(f"Request is not serializable: {e}")
+                logging.error(f"Problematic request data: {request_dict}")
+                break # stop if request is not serializable
+
+            try:
+                response = client.request(request)
+                if response.is_successful():
+                    transactions = response.result.get("transactions", [])
+                    logging.debug(f"Retrieved {len(transactions)} transactions")
+                    all_transactions.extend(transactions)
+                else:
+                    logging.error(f"Error in XRPL response: {response.status}")
+                    break
+            except Exception as e:
+                logging.error(f"Error making XRPL request: {e}")
+                break
+
+            if "marker" in response.result:
+                if response.result["marker"] == previous_marker:
+                    logging.warning("Marker not advancing, stopping iteration")
+                    break # stop if marker not advancing
+                previous_marker = marker
+                marker = response.result["marker"] # Update marker for next iteration
+                logging.debug("More transactions available. Fetching next batch...")
+            else:
+                logging.debug("No more transactions available")
+                break
+        
+        if iteration_count == max_iterations:
+            logging.warning("Reached maximum iteration count. Stopping loop...")
+
+        return all_transactions
+    
+    def get_account_transactions__exhaustive(self,account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
+                                ledger_index_min=-1,
+                                ledger_index_max=-1,
+                                max_attempts=3,
+                                retry_delay=.2):
+
+        client = xrpl.clients.JsonRpcClient(self.mainnet_url)  # Using a public server; adjust as necessary
+        all_transactions = []  # List to store all transactions
+
+        # Fetch transactions using marker pagination
+        marker = None
+        attempt = 0
+        while attempt < max_attempts:
+            try:
+                request = xrpl.models.requests.account_tx.AccountTx(
+                    account=account_address,
+                    ledger_index_min=ledger_index_min,
+                    ledger_index_max=ledger_index_max,
+                    limit=1000,
+                    marker=marker,
+                    forward=True
+                )
+                response = client.request(request)
+                transactions = response.result["transactions"]
+                all_transactions.extend(transactions)
+
+                if "marker" not in response.result:
+                    break
+                marker = response.result["marker"]
+
+            except Exception as e:
+                print(f"Error occurred while fetching transactions (attempt {attempt + 1}): {str(e)}")
+                attempt += 1
+                if attempt < max_attempts:
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    print("Max attempts reached. Transactions may be incomplete.")
+                    break
+
+        return all_transactions
+
+    def get_account_transactions__retry_version(self, account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
+                                ledger_index_min=-1,
+                                ledger_index_max=-1,
+                                max_attempts=3,
+                                retry_delay=.2,
+                                num_runs=5):
+        
+        longest_transactions = []
+        
+        for i in range(num_runs):
+            print(f"Run {i+1}/{num_runs}")
+            
+            transactions = self.get_account_transactions__exhaustive(
+                account_address=account_address,
+                ledger_index_min=ledger_index_min,
+                ledger_index_max=ledger_index_max,
+                max_attempts=max_attempts,
+                retry_delay=retry_delay
+            )
+            
+            num_transactions = len(transactions)
+            print(f"Number of transactions: {num_transactions}")
+            
+            if num_transactions > len(longest_transactions):
+                longest_transactions = transactions
+            
+            if i < num_runs - 1:
+                print(f"Waiting for {retry_delay} seconds before the next run...")
+                time.sleep(retry_delay)
+        
+        print(f"Longest list of transactions: {len(longest_transactions)} transactions")
+        return longest_transactions
+        
+    def get_memo_detail_df_for_account(self):
         """ This function gets all the memo details for a given account """
-        
-        full_transaction_history = self.get_account_transactions(account_address=account_address, 
-                                                                 limit=transaction_limit)
+        logging.debug(f"Getting memo details for account {self.user_wallet.classic_address}")
 
+        validated_tx = pd.DataFrame(self.transactions)
 
-        
-        validated_tx = pd.DataFrame(full_transaction_history).rename(columns={'tx_json':'tx'})
-        validated_tx['has_memos']=validated_tx['tx'].apply(lambda x: 'Memos' in x.keys())
+        validated_tx['has_memos']=validated_tx['tx_json'].apply(lambda x: 'Memos' in x)
+
+        # #DEBUGGING
+        # validated_tx.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"validated_tx.csv"))
+
         live_memo_tx = validated_tx[validated_tx['has_memos']== True].copy()
-        live_memo_tx['main_memo_data']=live_memo_tx['tx'].apply(lambda x: x['Memos'][0]['Memo'])
+
+        live_memo_tx['main_memo_data']=live_memo_tx['tx_json'].apply(lambda x: x['Memos'][0]['Memo'])
         live_memo_tx['converted_memos']=live_memo_tx['main_memo_data'].apply(lambda x: 
                                                                              self.convert_memo_dict(x))
-        live_memo_tx['account']= live_memo_tx['tx'].apply(lambda x: x['Account'])
-        live_memo_tx['destination']=live_memo_tx['tx'].apply(lambda x: x['Destination'])
+        live_memo_tx['account']= live_memo_tx['tx_json'].apply(lambda x: x['Account'])
+        live_memo_tx['destination']=live_memo_tx['tx_json'].apply(lambda x: x['Destination'])
         
-        live_memo_tx['message_type']=np.where(live_memo_tx['destination']==account_address, 'INCOMING','OUTGOING')
+        live_memo_tx['message_type']=np.where(live_memo_tx['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
         live_memo_tx['node_account']= live_memo_tx[['destination','account']].sum(1).apply(lambda x: 
-                                                         str(x).replace(account_address,''))
-        live_memo_tx['datetime']= live_memo_tx['tx'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
-        return live_memo_tx
-    
+                                                         str(x).replace(self.user_wallet.classic_address,''))
+        live_memo_tx['datetime']= live_memo_tx['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
+        live_memo_tx['ledger_index'] = live_memo_tx['tx_json'].apply(lambda x: x['ledger_index'])
 
+        # #DEBUGGING
+        # live_memo_tx.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"live_memo_tx.csv"))
+        return live_memo_tx
     
     def get_post_fiat_context_doc_for_address(self,all_account_info):
         """ This function gets the most recent google doc context link for a given account address
-        
-        operates by passing in memos for account
-        all_account_info =self.get_memo_detail_df_for_account(account_address=account_address, 
-        transaction_limit=5000)
-
-        Note that the context docs are linked to node addresses so the default node address is used
-        
         """
-        all_account_info['is_post_fiat']=all_account_info['tx'].apply(lambda x: self.check_if_tx_pft(x))
+
+        # # DEBUGGING
+        # all_account_info.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"all_account_info1.csv"))
+
+        all_account_info['is_post_fiat']=all_account_info['tx_json'].apply(lambda x: self.check_if_tx_pft(x))
+
+        # # DEBUGGING
+        # all_account_info.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"all_account_info2.csv"))
+
+        # Filter for transactions that are PFT and sent to the default node
         redux_tx_list = all_account_info[(all_account_info['is_post_fiat']== True)&
                                         (all_account_info['destination']==self.default_node)].copy()
+        
+        # # DEBUGGING
+        # redux_tx_list.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"redux_tx_list.csv"))
+
         outgoing_messages_only= redux_tx_list[redux_tx_list['message_type']=='OUTGOING'].copy()
+
+        # # DEBUGGING
+        # outgoing_messages_only.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"outgoing_messages_only.csv"))
+
         most_recent_context_link=''
         most_recent_context_link = outgoing_messages_only[outgoing_messages_only['converted_memos'].apply(lambda x: x['task_id']) 
         == 'google_doc_context_link'].tail(1)
         link= ''
+
+        # # DEBUGGING
+        # most_recent_context_link.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"most_recent_context_link.csv"))
+
         if len(most_recent_context_link) >0:
             link = list(most_recent_context_link['converted_memos'])[0]['full_output']
             
@@ -671,21 +912,19 @@ class PostFiatTaskManager:
         dataframe of task information with embedded classifications 
         
         Runs on all_account_info generated by
-        all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
-            transaction_limit=5000)
-        
+        all_account_info =self.get_memo_detail_df_for_account()
         """ 
-        #all_account_info['datetime']= all_account_info['tx'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
+
         simplified_task_frame = all_account_info[all_account_info['converted_memos'].apply(lambda x: 
                                                                 self.determine_if_map_is_task_id(x))].copy()
-        simplified_task_frame = simplified_task_frame[simplified_task_frame['tx'].apply(lambda 
-                                                                                        x: x['Amount']).apply(lambda x: 
+        simplified_task_frame = simplified_task_frame[simplified_task_frame['tx_json'].apply(lambda 
+                                                                                        x: x['DeliverMax']).apply(lambda x: 
                                                                                                                     "'currency': 'PFT'" in str(x))].copy()
         def add_field_to_map(xmap, field, field_value):
             xmap[field] = field_value
             return xmap
         
-        simplified_task_frame['pft_abs']= simplified_task_frame['tx'].apply(lambda x: x['Amount']['value']).astype(float)
+        simplified_task_frame['pft_abs']= simplified_task_frame['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)
         simplified_task_frame['directional_pft']=simplified_task_frame['message_type'].map({'INCOMING':1,
             'OUTGOING':-1}) * simplified_task_frame['pft_abs']
         
@@ -817,9 +1056,7 @@ class PostFiatTaskManager:
         all_account_info=all_account_info
 
         """
-        all_account_info =self.get_memo_detail_df_for_account(account_address
-            =self.user_wallet.classic_address,
-                    transaction_limit=5000)
+        all_account_info =self.get_memo_detail_df_for_account()
         
         all_account_info = all_account_info
         """ 
@@ -982,7 +1219,7 @@ class PostFiatTaskManager:
         # Apply the lambda function to prepend 'REWARD RESPONSE __' to each REWARD entry
         reward_df['REWARD'] = reward_df['REWARD'].astype(object).apply(lambda x: x.replace('REWARD RESPONSE __ ',''))
         reward_df.columns=['proposal','reward']
-        pft_only=all_account_info[all_account_info['tx'].apply(lambda x: "PFT" in str(x['Amount']))].copy()
+        pft_only=all_account_info[all_account_info['tx'].apply(lambda x: "PFT" in str(x['DeliverMax']))].copy()
         pft_only['pft_value']=pft_only['tx'].apply(lambda x: x['Amount']['value']).astype(float)*pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
         pft_only['task_id']=pft_only['converted_memos'].apply(lambda x: x['task_id'])
         task_id_hash = all_tasks[all_tasks['task_type']=='REWARD'].groupby('task_id').last()[['hash']]
@@ -1094,7 +1331,7 @@ class PostFiatTaskManager:
             status_constructor = 'successfully'
         non_hex_memo = self.convert_memo_dict(response.result['Memos'][0]['Memo'])
         user_string = non_hex_memo['full_output']
-        amount_of_pft_sent = response.result['Amount']['value']
+        amount_of_pft_sent = response.result['DeliverMax']['value']
         node_name = response.result['Destination']
         output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
         return output_string
