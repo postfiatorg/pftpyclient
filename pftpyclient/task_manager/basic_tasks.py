@@ -1213,8 +1213,13 @@ class PostFiatTaskManager:
         all_tasks = self.convert_all_account_info_into_simplified_task_frame(all_account_info=all_account_info)
 
         # Group by task_type and task_id, then take the last entry for each group and unstack
-        reward_df = all_tasks.groupby(['task_type', 'task_id']).last()['full_output'].unstack(0)[['PROPOSAL', 
-                                                                                                  'REWARD']].dropna().copy()
+        unstacked = all_tasks.groupby(['task_type', 'task_id']).last()['full_output'].unstack(0)
+
+        # Check if 'PROPOSAL' and 'REWARD' columns exist, if not, return empty df
+        if 'PROPOSAL' not in unstacked.columns or 'REWARD' not in unstacked.columns:
+            return pd.DataFrame()
+
+        reward_df = unstacked[['PROPOSAL', 'REWARD']].dropna().copy()
 
         # Apply the lambda function to prepend 'REWARD RESPONSE __' to each REWARD entry
         reward_df['REWARD'] = reward_df['REWARD'].astype(object).apply(lambda x: x.replace('REWARD RESPONSE __ ',''))

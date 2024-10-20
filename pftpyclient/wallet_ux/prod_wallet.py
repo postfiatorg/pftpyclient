@@ -649,69 +649,83 @@ class WalletApp(wx.Frame):
         self.accepted_grid.SetColSize(2, 300)  # Adjust width as needed
 
     def populate_rewards_grid(self, json_data):
-        data = json.loads(json_data)
-        proposals = data['proposal']
-        rewards = data['reward']
-        payouts = data.get('payout', {})  # Adding the payout data
-
-        self.rewards_grid.ClearGrid()
-        while self.rewards_grid.GetNumberRows() > 0:
-            self.rewards_grid.DeleteRows(0, 1, False)
-
-        for task_id, proposal in proposals.items():
-            reward = rewards.get(task_id, "")
-            payout = payouts.get(task_id, "")  # Getting the payout value
-            self.rewards_grid.AppendRows(1)
-            row = self.rewards_grid.GetNumberRows() - 1
-            self.rewards_grid.SetCellValue(row, 0, task_id)
-            self.rewards_grid.SetCellValue(row, 1, proposal)
-            self.rewards_grid.SetCellValue(row, 2, reward)
-            self.rewards_grid.SetCellValue(row, 3, str(payout))  # Setting the payout value
-
-            # Enable text wrapping in the 'proposal', 'reward', and 'payout' columns
-            self.rewards_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
-            self.rewards_grid.SetCellRenderer(row, 2, gridlib.GridCellAutoWrapStringRenderer())
-            self.rewards_grid.SetCellRenderer(row, 3, gridlib.GridCellAutoWrapStringRenderer())
+        logging.debug("Populating rewards grid")
+        try:
+            data = json.loads(json_data)
+            if not data: 
+                logging.debug("No data to populate rewards grid")
+                self.rewards_grid.ClearGrid()
+                return
             
-            # Manually set row height for better display
-            self.rewards_grid.SetRowSize(row, 65)  # Adjust the height as needed
+            proposals = data.get('proposal', {})
+            rewards = data.get('reward', {})
+            payouts = data.get('payout', {})
 
-        # Set column width to ensure proper wrapping
-        self.rewards_grid.SetColSize(0, 170)
-        self.rewards_grid.SetColSize(1, 400)  # Adjust width as needed
-        self.rewards_grid.SetColSize(2, 300)  # Adjust width as needed
-        self.rewards_grid.SetColSize(3, 100)  # Adjust width as needed for payout
+            self.rewards_grid.ClearGrid()
+            self.rewards_grid.DeleteRows(0, self.rewards_grid.GetNumberRows())
+
+            for task_id in proposals.key():
+                self.rewards_grid.AppendRows(1)
+                row = self.rewards_grid.GetNumberRows() - 1
+                self.rewards_grid.SetCellValue(row, 0, task_id)
+                self.rewards_grid.SetCellValue(row, 1, proposals.get(task_id, ""))
+                self.rewards_grid.SetCellValue(row, 2, rewards.get(task_id, ""))
+                self.rewards_grid.SetCellValue(row, 3, payouts.get(task_id, ""))
+
+                # Enable text wrapping in the 'proposal', 'reward', and 'payout' columns
+                self.rewards_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
+                self.rewards_grid.SetCellRenderer(row, 2, gridlib.GridCellAutoWrapStringRenderer())
+                self.rewards_grid.SetCellRenderer(row, 3, gridlib.GridCellAutoWrapStringRenderer())
+                
+                # Manually set row height for better display
+                self.rewards_grid.SetRowSize(row, 65)  # Adjust the height as needed
+
+            # Set column width to ensure proper wrapping
+            self.rewards_grid.SetColSize(0, 170)
+            self.rewards_grid.SetColSize(1, 400)  # Adjust width as needed
+            self.rewards_grid.SetColSize(2, 300)  # Adjust width as needed
+            self.rewards_grid.SetColSize(3, 100)  # Adjust width as needed for payout
+
+        except Exception as e:
+            logging.error(f"Error populating rewards grid: {e}")
 
     def populate_verification_grid(self, json_data):
-        data = json.loads(json_data)
-        task_ids = data['task_id']
-        original_tasks = data['original_task']
-        verifications = data['verification']
+        logging.debug("Updating verification grid")
+        try:
+            data = json.loads(json_data)
+            if not data:
+                logging.debug("No data to populate verification grid")
+                self.verification_grid.ClearGrid()
+                return
 
-        self.verification_grid.ClearGrid()
-        while self.verification_grid.GetNumberRows() > 0:
-            self.verification_grid.DeleteRows(0, 1, False)
+            task_ids = data.get('task_id', {})
+            original_tasks = data.get('original_task', {})
+            verifications = data.get('verification', {})
 
-        for idx, task_id in task_ids.items():
-            original_task = original_tasks.get(idx, "")
-            verification = verifications.get(idx, "")
-            self.verification_grid.AppendRows(1)
-            row = self.verification_grid.GetNumberRows() - 1
-            self.verification_grid.SetCellValue(row, 0, task_id)
-            self.verification_grid.SetCellValue(row, 1, original_task)
-            self.verification_grid.SetCellValue(row, 2, verification)
+            self.verification_grid.ClearGrid()
+            self.verification_grid.DeleteRows(0, self.verification_grid.GetNumberRows())
 
-            # Enable text wrapping in the 'original_task' and 'verification' columns
-            self.verification_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
-            self.verification_grid.SetCellRenderer(row, 2, gridlib.GridCellAutoWrapStringRenderer())
-            
-            # Manually set row height for better display
-            self.verification_grid.SetRowSize(row, 65)  # Adjust the height as needed
+            for idx, task_id in task_ids.items():
+                self.verification_grid.AppendRows(1)
+                row = self.verification_grid.GetNumberRows() - 1
+                self.verification_grid.SetCellValue(row, 0, task_ids.get(idx, ""))
+                self.verification_grid.SetCellValue(row, 1, original_tasks.get(task_id, ""))
+                self.verification_grid.SetCellValue(row, 2, verifications.get(task_id, ""))
 
-        # Set column width to ensure proper wrapping
-        self.verification_grid.SetColSize(0, 170)
-        self.verification_grid.SetColSize(1, 400)  # Adjust width as needed
-        self.verification_grid.SetColSize(2, 300)  # Adjust width as needed
+                # Enable text wrapping in the 'original_task' and 'verification' columns
+                self.verification_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
+                self.verification_grid.SetCellRenderer(row, 2, gridlib.GridCellAutoWrapStringRenderer())
+                
+                # Manually set row height for better display
+                self.verification_grid.SetRowSize(row, 65)  # Adjust the height as needed
+
+            # Set column width to ensure proper wrapping
+            self.verification_grid.SetColSize(0, 170)
+            self.verification_grid.SetColSize(1, 400)  # Adjust width as needed
+            self.verification_grid.SetColSize(2, 300)  # Adjust width as needed
+
+        except Exception as e:
+            logging.error(f"Error populating verification grid: {e}")
 
     def on_ask_for_task(self, event):
         dialog = CustomDialog("Ask For Task", ["Task Request"])
