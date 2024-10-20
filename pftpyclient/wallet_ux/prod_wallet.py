@@ -115,7 +115,7 @@ class CustomDialog(wx.Dialog):
 
 class WalletApp(wx.Frame):
     def __init__(self, url):
-        wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(800, 600))
+        wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(800, 700))
         self.url = url
         self.wallet = None
         self.build_ui()
@@ -127,68 +127,18 @@ class WalletApp(wx.Frame):
         self.panel = wx.Panel(self)
         self.sizer = wx.BoxSizer(wx.VERTICAL)
 
+        # Login panel
+        self.login_panel = self.create_login_panel()
+        self.sizer.Add(self.login_panel, 1, wx.EXPAND)
+
+        # create user details panel
+        self.user_details_panel = self.create_user_details_panel()
+        self.user_details_panel.Hide()
+        self.sizer.Add(self.user_details_panel, 1, wx.EXPAND)
+
+        # Tabs (hidden initially)
         self.tabs = wx.Notebook(self.panel)
-
-        # User Details tab
-        self.user_details_tab = wx.Panel(self.tabs)
-        self.tabs.AddPage(self.user_details_tab, "User Details")
-        self.user_details_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.user_details_tab.SetSizer(self.user_details_sizer)
-
-        self.lbl_username = wx.StaticText(self.user_details_tab, label="Username:")
-        self.user_details_sizer.Add(self.lbl_username, flag=wx.ALL, border=5)
-        self.txt_username = wx.TextCtrl(self.user_details_tab)
-        self.user_details_sizer.Add(self.txt_username, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_password = wx.StaticText(self.user_details_tab, label="Password:")
-        self.user_details_sizer.Add(self.lbl_password, flag=wx.ALL, border=5)
-        self.txt_password = wx.TextCtrl(self.user_details_tab, style=wx.TE_PASSWORD)
-        self.user_details_sizer.Add(self.txt_password, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_confirm_password = wx.StaticText(self.user_details_tab, label="Confirm Password:")
-        self.user_details_sizer.Add(self.lbl_confirm_password, flag=wx.ALL, border=5)
-        self.txt_confirm_password = wx.TextCtrl(self.user_details_tab, style=wx.TE_PASSWORD)
-        self.user_details_sizer.Add(self.txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
-
-
-        self.lbl_google_doc = wx.StaticText(self.user_details_tab, label="Google Doc Share Link:")
-        self.user_details_sizer.Add(self.lbl_google_doc, flag=wx.ALL, border=5)
-        self.txt_google_doc = wx.TextCtrl(self.user_details_tab)
-        self.user_details_sizer.Add(self.txt_google_doc, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_xrp_address = wx.StaticText(self.user_details_tab, label="XRP Address:")
-        self.user_details_sizer.Add(self.lbl_xrp_address, flag=wx.ALL, border=5)
-        self.txt_xrp_address = wx.TextCtrl(self.user_details_tab)
-        self.user_details_sizer.Add(self.txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_xrp_secret = wx.StaticText(self.user_details_tab, label="XRP Secret:")
-        self.user_details_sizer.Add(self.lbl_xrp_secret, flag=wx.ALL, border=5)
-        self.txt_xrp_secret = wx.TextCtrl(self.user_details_tab, style=wx.TE_PASSWORD)
-        self.user_details_sizer.Add(self.txt_xrp_secret, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_commitment = wx.StaticText(self.user_details_tab, label="Please write 1 sentence committing to a long term objective of your choosing:")
-        self.user_details_sizer.Add(self.lbl_commitment, flag=wx.ALL, border=5)
-        self.txt_commitment = wx.TextCtrl(self.user_details_tab)
-        self.user_details_sizer.Add(self.txt_commitment, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_info = wx.StaticText(self.user_details_tab, label="Paste Your XRP Address in the first line of your Google Doc and make sure that anyone who has the link can view Before Genesis")
-        self.user_details_sizer.Add(self.lbl_info, flag=wx.ALL, border=5)
-
-        self.btn_generate_wallet = wx.Button(self.user_details_tab, label="Generate New XRP Wallet")
-        self.user_details_sizer.Add(self.btn_generate_wallet, flag=wx.ALL, border=5)
-        self.btn_generate_wallet.Bind(wx.EVT_BUTTON, self.on_generate_wallet)
-
-        self.btn_genesis = wx.Button(self.user_details_tab, label="Genesis")
-        self.user_details_sizer.Add(self.btn_genesis, flag=wx.ALL, border=5)
-        self.btn_genesis.Bind(wx.EVT_BUTTON, self.on_genesis)
-
-        self.btn_existing_user = wx.Button(self.user_details_tab, label="Cache Existing User")
-        self.user_details_sizer.Add(self.btn_existing_user, flag=wx.ALL, border=5)
-        self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_existing_user)
-
-        self.btn_delete_user = wx.Button(self.user_details_tab, label="Delete Existing User")
-        self.user_details_sizer.Add(self.btn_delete_user, flag=wx.ALL, border=5)
-        self.btn_delete_user.Bind(wx.EVT_BUTTON, self.on_delete_user)
+        self.tabs.Hide()
 
         # Summary tab
         self.summary_tab = wx.Panel(self.tabs)
@@ -196,26 +146,17 @@ class WalletApp(wx.Frame):
         self.summary_sizer = wx.BoxSizer(wx.VERTICAL)
         self.summary_tab.SetSizer(self.summary_sizer)
 
-        self.lbl_user = wx.StaticText(self.summary_tab, label="Username:")
-        self.summary_sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
-        self.txt_user = wx.TextCtrl(self.summary_tab)
-        self.summary_sizer.Add(self.txt_user, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_pass = wx.StaticText(self.summary_tab, label="Password:")
-        self.summary_sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
-        self.txt_pass = wx.TextCtrl(self.summary_tab, style=wx.TE_PASSWORD)
-        self.summary_sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.btn_login = wx.Button(self.summary_tab, label="Login")
-        self.summary_sizer.Add(self.btn_login, flag=wx.EXPAND | wx.ALL, border=5)
-        self.btn_login.Bind(wx.EVT_BUTTON, self.on_login)
+        # Create Summary tab elements but don't add them to sizer yet
+        self.lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
+        self.lbl_xrp_balance = wx.StaticText(self.summary_tab, label="XRP Balance: ")
+        self.lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: ")
+        self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
 
         # Add grid for Key Account Details
         self.summary_grid = gridlib.Grid(self.summary_tab)
         self.summary_grid.CreateGrid(0, 2)  # 2 columns for Key and Value
         self.summary_grid.SetColLabelValue(0, "Key")
         self.summary_grid.SetColLabelValue(1, "Value")
-        self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
 
         # Accepted tab
         self.accepted_tab = wx.Panel(self.tabs)
@@ -365,6 +306,119 @@ class WalletApp(wx.Frame):
         # Populate Accepted tab grids
         self.populate_accepted_grid(json_data)
 
+    def create_login_panel(self):
+        panel = wx.Panel(self.panel)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Username
+        self.lbl_user = wx.StaticText(panel, label="Username:")
+        sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
+        self.txt_user = wx.TextCtrl(panel)
+        sizer.Add(self.txt_user, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Password
+        self.lbl_pass = wx.StaticText(panel, label="Password:")
+        sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
+        self.txt_pass = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Login button
+        self.btn_login = wx.Button(panel, label="Login")
+        sizer.Add(self.btn_login, flag=wx.EXPAND | wx.ALL, border=5)
+        self.btn_login.Bind(wx.EVT_BUTTON, self.on_login)
+
+        # Create New User button
+        self.btn_new_user = wx.Button(panel, label="Create New User")
+        sizer.Add(self.btn_new_user, flag=wx.EXPAND | wx.ALL, border=5)
+        self.btn_new_user.Bind(wx.EVT_BUTTON, self.on_create_new_user)
+
+        panel.SetSizer(sizer)
+
+        return panel
+    
+    def create_user_details_panel(self):
+        panel = wx.Panel(self.panel)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Return to Login button
+        return_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_return_to_login = wx.Button(panel, label="Return to Login")
+        return_btn_sizer.Add(self.btn_return_to_login, 0, wx.ALL | wx.ALIGN_CENTER, 5)
+        self.btn_return_to_login.Bind(wx.EVT_BUTTON, self.on_return_to_login)
+        sizer.Add(return_btn_sizer, 0, wx.ALIGN_CENTER | wx.TOP, 10)
+        sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.TOP, 5)
+        
+        user_details_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Username
+        self.lbl_username = wx.StaticText(panel, label="Username:")
+        user_details_sizer.Add(self.lbl_username, flag=wx.ALL, border=5)
+        self.txt_username = wx.TextCtrl(panel)
+        user_details_sizer.Add(self.txt_username, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Password
+        self.lbl_password = wx.StaticText(panel, label="Password:")
+        user_details_sizer.Add(self.lbl_password, flag=wx.ALL, border=5)
+        self.txt_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        user_details_sizer.Add(self.txt_password, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Confirm Password
+        self.lbl_confirm_password = wx.StaticText(panel, label="Confirm Password:")
+        user_details_sizer.Add(self.lbl_confirm_password, flag=wx.ALL, border=5)
+        self.txt_confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        user_details_sizer.Add(self.txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Google Doc Share Link
+        self.lbl_google_doc = wx.StaticText(panel, label="Google Doc Share Link:")
+        user_details_sizer.Add(self.lbl_google_doc, flag=wx.ALL, border=5)
+        self.txt_google_doc = wx.TextCtrl(panel)
+        user_details_sizer.Add(self.txt_google_doc, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # XRP Address
+        self.lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
+        user_details_sizer.Add(self.lbl_xrp_address, flag=wx.ALL, border=5)
+        self.txt_xrp_address = wx.TextCtrl(panel)
+        user_details_sizer.Add(self.txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # XRP Secret
+        self.lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
+        user_details_sizer.Add(self.lbl_xrp_secret, flag=wx.ALL, border=5)
+        self.txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        user_details_sizer.Add(self.txt_xrp_secret, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Commitment
+        self.lbl_commitment = wx.StaticText(panel, label="Please write 1 sentence committing to a long term objective of your choosing:")
+        user_details_sizer.Add(self.lbl_commitment, flag=wx.ALL, border=5)
+        self.txt_commitment = wx.TextCtrl(panel)
+        user_details_sizer.Add(self.txt_commitment, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Info
+        self.lbl_info = wx.StaticText(panel, label="Paste Your XRP Address in the first line of your Google Doc and make sure that anyone who has the link can view Before Genesis")
+        user_details_sizer.Add(self.lbl_info, flag=wx.ALL, border=5)
+
+        # Buttons
+        self.btn_generate_wallet = wx.Button(panel, label="Generate New XRP Wallet")
+        user_details_sizer.Add(self.btn_generate_wallet, flag=wx.ALL, border=5)
+        self.btn_generate_wallet.Bind(wx.EVT_BUTTON, self.on_generate_wallet)
+
+        self.btn_genesis = wx.Button(panel, label="Genesis")
+        user_details_sizer.Add(self.btn_genesis, flag=wx.ALL, border=5)
+        self.btn_genesis.Bind(wx.EVT_BUTTON, self.on_genesis)
+
+        self.btn_existing_user = wx.Button(panel, label="Cache Existing User")
+        user_details_sizer.Add(self.btn_existing_user, flag=wx.ALL, border=5)
+        self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_existing_user)
+
+        self.btn_delete_user = wx.Button(panel, label="Delete Existing User")
+        user_details_sizer.Add(self.btn_delete_user, flag=wx.ALL, border=5)
+        self.btn_delete_user.Bind(wx.EVT_BUTTON, self.on_delete_user)
+
+        sizer.Add(user_details_sizer, 1, wx.EXPAND | wx.ALL, 10)
+
+        panel.SetSizer(sizer)
+
+        return panel
+    
     def on_generate_wallet(self, event):
         # Generate a new XRP wallet
         self.wallet = Wallet.create()
@@ -434,30 +488,18 @@ class WalletApp(wx.Frame):
         self.wallet = self.task_manager.user_wallet
         classic_address = self.wallet.classic_address
 
-        logging.debug(f"Logged in as {username}")
+        logging.info(f"Logged in as {username}")
 
-        # Clear the summary tab
-        self.summary_sizer.Clear(True)
+        # Hide login panel and show tabs
+        self.login_panel.Hide()
+        self.tabs.Show()
 
-        # Display wallet information
-        self.lbl_balance = wx.StaticText(self.summary_tab, label="XRP Balance: N/A")
-        self.summary_sizer.Add(self.lbl_balance, flag=wx.ALL, border=5)
-        self.lbl_address = wx.StaticText(self.summary_tab, label=f"Classic Address: {classic_address}")
-        self.summary_sizer.Add(self.lbl_address, flag=wx.ALL, border=5)
+        self.populate_summary_tab(username, classic_address)
 
-        self.lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: N/A")
-        self.summary_sizer.Add(self.lbl_pft_balance, flag=wx.ALL, border=5)
-
-        # Create a heading for Key Account Details
-        self.lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
-        self.summary_sizer.Add(self.lbl_key_details, flag=wx.ALL, border=5)
-
-        # Grid for Key Account Details
-        self.summary_grid = gridlib.Grid(self.summary_tab)
-        self.summary_grid.CreateGrid(0, 2)
-        self.summary_grid.SetColLabelValue(0, "Key")
-        self.summary_grid.SetColLabelValue(1, "Value")
-        self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
+        # Update layout and ensure correct sizing
+        self.panel.Layout()
+        self.Layout()
+        self.Fit()
 
         # Fetch and display key account details
         all_account_info = self.task_manager.get_memo_detail_df_for_account()
@@ -479,6 +521,62 @@ class WalletApp(wx.Frame):
         self.start_pft_update_timer()
         self.start_transaction_update_timer()
 
+    def on_create_new_user(self, event):
+        self.login_panel.Hide()
+        self.user_details_panel.Show()
+        self.panel.Layout()
+        # self.Layout()
+        # self.Fit()
+        self.Refresh()
+
+    def on_return_to_login(self, event):
+        self.user_details_panel.Hide()
+        self.login_panel.Show()
+        self.panel.Layout()
+        # self.Layout()
+        # self.Fit()
+        self.Refresh()
+
+    def populate_summary_tab(self, username, classic_address):
+        # Clear existing content
+        self.summary_sizer.Clear(True)
+
+        # Add elements to sizer
+        self.summary_sizer.Add(self.lbl_username, flag=wx.ALL, border=5)
+        self.summary_sizer.Add(self.lbl_xrp_balance, flag=wx.ALL, border=5)
+        self.summary_sizer.Add(self.lbl_pft_balance, flag=wx.ALL, border=5)
+        self.summary_sizer.Add(self.lbl_address, flag=wx.ALL, border=5)
+
+        # Create a heading for Key Account Details
+        lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
+        self.summary_sizer.Add(lbl_key_details, flag=wx.ALL, border=5)
+
+        self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Update labels
+        self.lbl_username.SetLabel(f"Username: {username}")
+        self.lbl_address.SetLabel(f"XRP Address: {classic_address}")
+
+        # Update account info
+        self.update_account_info()
+
+    def update_account_info(self):
+        if self.task_manager:
+            xrp_balance = str(xrpl.utils.drops_to_xrp(self.task_manager.get_xrp_balance()))
+            self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
+
+            # PFT balance update (placeholder, as it's not streamed)
+            self.lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
+
+        # Update Key Account Details
+        self.update_key_account_details()
+
+    def update_key_account_details(self):
+        if self.task_manager:
+            all_account_info = self.task_manager.get_memo_detail_df_for_account()
+            key_account_details = self.task_manager.process_account_info(all_account_info)
+            self.populate_summary_grid(key_account_details)
+
     def run_bg_job(self, job):
         if self.worker.context:
             asyncio.run_coroutine_threadsafe(job, self.worker.loop)
@@ -488,7 +586,7 @@ class WalletApp(wx.Frame):
 
     def update_account(self, acct):
         xrp_balance = str(xrpl.utils.drops_to_xrp(acct["Balance"]))
-        self.lbl_balance.SetLabel(f"XRP Balance: {xrp_balance}")
+        self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
     def update_tokens(self, account_address):
         logging.debug(f"Fetching token balances for account: {account_address}")
@@ -598,20 +696,24 @@ class WalletApp(wx.Frame):
 
     def populate_summary_grid(self, key_account_details):
         self.summary_grid.ClearGrid()
-        while self.summary_grid.GetNumberRows() > 0:
-            self.summary_grid.DeleteRows(0, 1, False)
 
-        for key, value in key_account_details.items():
-            self.summary_grid.AppendRows(1)
-            row = self.summary_grid.GetNumberRows() - 1
-            self.summary_grid.SetCellValue(row, 0, key)
-            self.summary_grid.SetCellValue(row, 1, str(value))
+        current_rows = self.summary_grid.GetNumberRows()
+        needed_rows = len(key_account_details)
 
-            # Enable text wrapping in the 'Value' column
-            self.summary_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
-            
-            # Manually set row height for better display
-            self.summary_grid.SetRowSize(row, 300)  # Adjust the height as needed
+        if current_rows < needed_rows:
+            self.summary_grid.AppendRows(needed_rows - current_rows)
+        elif current_rows > needed_rows:
+            for row in range(needed_rows, current_rows):
+                self.summary_grid.SetCellValue(row, 0, "")
+                self.summary_grid.SetCellValue(row, 1, "")
+
+        for idx, (key, value) in enumerate(key_account_details.items()):
+            self.summary_grid.SetCellValue(idx, 0, str(key))
+            self.summary_grid.SetCellValue(idx, 1, str(value))
+            # enable text wrapping in the 'Value' column
+            self.summary_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
+            # manually set row height for better display
+            self.summary_grid.SetRowSize(idx, 300)  # Adjust the height as needed
 
         # Set column width to ensure proper wrapping
         self.summary_grid.SetColSize(0, 100)

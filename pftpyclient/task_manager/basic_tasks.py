@@ -230,6 +230,15 @@ class PostFiatTaskManager:
         # and also sends the node the google doc for the user 
         self.check_and_prompt_google_doc(all_account_info=all_account_info)
 
+    def get_xrp_balance(self):
+        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+        account_info = xrpl.models.requests.account_info.AccountInfo(
+            account=self.user_wallet.classic_address,
+            ledger_index="validated"
+        )
+        response = client.request(account_info)
+        return response.result['account_data']['Balance']
+
     ## GENERIC UTILITY FUNCTIONS 
 
     def save_transactions_to_csv(self):
@@ -768,36 +777,20 @@ class PostFiatTaskManager:
         return live_memo_tx
     
     def get_post_fiat_context_doc_for_address(self,all_account_info):
-        """ This function gets the most recent google doc context link for a given account address
-        """
-
-        # # DEBUGGING
-        # all_account_info.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"all_account_info1.csv"))
+        """ This function gets the most recent google doc context link for a given account address """
 
         all_account_info['is_post_fiat']=all_account_info['tx_json'].apply(lambda x: self.check_if_tx_pft(x))
-
-        # # DEBUGGING
-        # all_account_info.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"all_account_info2.csv"))
 
         # Filter for transactions that are PFT and sent to the default node
         redux_tx_list = all_account_info[(all_account_info['is_post_fiat']== True)&
                                         (all_account_info['destination']==self.default_node)].copy()
-        
-        # # DEBUGGING
-        # redux_tx_list.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"redux_tx_list.csv"))
 
         outgoing_messages_only= redux_tx_list[redux_tx_list['message_type']=='OUTGOING'].copy()
-
-        # # DEBUGGING
-        # outgoing_messages_only.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"outgoing_messages_only.csv"))
 
         most_recent_context_link=''
         most_recent_context_link = outgoing_messages_only[outgoing_messages_only['converted_memos'].apply(lambda x: x['task_id']) 
         == 'google_doc_context_link'].tail(1)
         link= ''
-
-        # # DEBUGGING
-        # most_recent_context_link.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"most_recent_context_link.csv"))
 
         if len(most_recent_context_link) >0:
             link = list(most_recent_context_link['converted_memos'])[0]['full_output']
