@@ -32,7 +32,6 @@ from pathlib import Path
 
 class WalletInitiationFunctions:
     def __init__(self):
-        print('no vars')
         self.mainnet_url="https://s2.ripple.com:51234"
         self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
 
@@ -117,10 +116,32 @@ class WalletInitiationFunctions:
         """
         balance = 0
         try:
-            wallet_at_front_of_doc =self.get_google_doc_text(google_url).split('\ufeff')[-1:][0][0:34]
-            balance = float(self.get_account_info(wallet_at_front_of_doc)['Balance'])
-        except:
-            pass
+            google_doc_text = self.get_google_doc_text(google_url)
+
+            # Split the text into lines
+            lines = google_doc_text.split('\n')
+
+            # Regular expression for XRP address
+            xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
+
+            wallet_at_front_of_doc = None
+            # look through the first 5 lines for an XRP address
+            for line in lines[:5]:
+                match = re.search(xrp_address_pattern, line)
+                if match:
+                    wallet_at_front_of_doc = match.group()
+                    break
+
+            if not wallet_at_front_of_doc:
+                logging.warning(f"No XRP address found in the first 5 lines of the document")
+                return balance
+
+            account_info = self.get_account_info(wallet_at_front_of_doc)
+            balance = Decimal(account_info['Balance'])
+
+        except Exception as e:
+            logging.error(f"Error: {e}")
+
         return balance
 
     def clear_credential_file(self):
@@ -144,6 +165,8 @@ class WalletInitiationFunctions:
         has_variables_defined = False
         zero_balance = True
         balance = self.check_if_there_is_funded_account_at_front_of_google_doc(google_url=input_map['Google Doc Share Link_Input'])
+        logging.debug(f"balance: {balance}")
+
         if balance > 0:
             zero_balance = False
         existing_keys= list(output_cred_map().keys())
@@ -158,6 +181,9 @@ class WalletInitiationFunctions:
             output_string=output_string+f""" 
         Variables are already defined in {CREDENTIAL_FILE_PATH}"""
         error_message = output_string.strip()
+
+        print(f"error_message: {error_message}")
+
         if error_message == '':
             print("CACHING CREDENTIALS")
             key_to_input1= f'{input_map['Username_Input']}__v1xrpaddress'
@@ -502,8 +528,13 @@ class PostFiatTaskManager:
         """ Sends PFT tokens to a destination address with optional memo """
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
 
-        # if memo is not empty and batch is true, memo is already pre-converted to hex and doesn't need to be converted again
-        memo_data = memo if (memo and batch) else str_to_hex(memo)
+        # Handle memo
+        if isinstance(memo, Memo):
+            memos = [memo]
+        elif isinstance(memo, str):
+            memos = [Memo(memo_data=str_to_hex(memo))]
+        else:
+            raise ValueError("Memo must be either a string or a Memo object")
 
         amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
             currency="PFT",
@@ -515,7 +546,7 @@ class PostFiatTaskManager:
             account=self.user_wallet.address,
             amount=amount_to_send,
             destination=destination,
-            memos=[Memo(memo_data=memo_data)] if memo else None,
+            memos=memos,
         )
 
         try:    
@@ -1058,6 +1089,9 @@ class PostFiatTaskManager:
                                                                task_id=task_id, full_output=request_message)
         # Send the memo to the default node
         response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
+
+        logging.debug(f"response: {response}")
+
         account = response.result['Account']
         destination = response.result['Destination']
         memo_map = response.result['Memos'][0]['Memo']
@@ -1198,8 +1232,8 @@ class PostFiatTaskManager:
         # Apply the lambda function to prepend 'REWARD RESPONSE __' to each REWARD entry
         reward_df['REWARD'] = reward_df['REWARD'].astype(object).apply(lambda x: x.replace('REWARD RESPONSE __ ',''))
         reward_df.columns=['proposal','reward']
-        pft_only=all_account_info[all_account_info['tx'].apply(lambda x: "PFT" in str(x['DeliverMax']))].copy()
-        pft_only['pft_value']=pft_only['tx'].apply(lambda x: x['Amount']['value']).astype(float)*pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
+        pft_only=all_account_info[all_account_info['tx_json'].apply(lambda x: "PFT" in str(x['DeliverMax']))].copy()
+        pft_only['pft_value']=pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)*pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
         pft_only['task_id']=pft_only['converted_memos'].apply(lambda x: x['task_id'])
         task_id_hash = all_tasks[all_tasks['task_type']=='REWARD'].groupby('task_id').last()[['hash']]
         pft_rewards_only = pft_only[pft_only['converted_memos'].apply(lambda x: 'REWARD RESPONSE __' in 

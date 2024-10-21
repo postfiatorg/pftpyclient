@@ -490,12 +490,14 @@ class WalletApp(wx.Frame):
             'Confirm Password_Input': self.txt_confirm_password.GetValue(),
         }
 
+        logging.debug(f"input_map: {input_map}")
+
         if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
             wx.MessageBox('Passwords Do Not Match Please Retry', 'Info', wx.OK | wx.ICON_INFORMATION)
 
-        if self.txt_password.GetValue() == self.txt_confirm_password.GetValue():
+        else:
             wallet_functions = WalletInitiationFunctions()
-            output_string = wallet_functions.given_input_map_cache_credentials_locally(input_map)
+            wallet_functions.given_input_map_cache_credentials_locally(input_map)
             wx.MessageBox('Existing User Information Cached. Please proceed to Log In', 'Info', wx.OK | wx.ICON_INFORMATION)
 
     def clear_credential_file(self):
