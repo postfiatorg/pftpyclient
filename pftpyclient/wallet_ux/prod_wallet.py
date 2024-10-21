@@ -14,6 +14,7 @@ from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust t
 from pftpyclient.task_manager.basic_tasks import WalletInitiationFunctions
 import webbrowser
 import os
+from pftpyclient.basic_utilities.create_shortcut import create_shortcut
 
 # Try to use the default browser
 if os.name == 'nt':
@@ -1086,12 +1087,17 @@ class SelectableMessageDialog(wx.Dialog):
         """
         self.html_window.SetPage(html_content)
 
-if __name__ == "__main__":
+def main():
     networks = {
         "mainnet": "wss://xrplcluster.com",
         "testnet": "wss://s.altnet.rippletest.net:51233",
     }
+
+    logging.info("Starting Post Fiat Wallet")
     app = wx.App()
     frame = WalletApp(networks["mainnet"])
     frame.Show()
     app.MainLoop()
+
+if __name__ == "__main__":
+    main()
