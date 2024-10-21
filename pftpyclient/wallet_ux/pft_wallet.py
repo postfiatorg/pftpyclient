@@ -788,7 +788,7 @@ class WalletApp(wx.Frame):
     def on_submit_xrp_payment(self, event):
         amount = self.txt_xrp_amount.GetValue()
         address = self.txt_xrp_address_payment.GetValue()
-        response = self.task_manager.send_xrp__no_memo(amount, address)
+        response = self.task_manager.send_xrp(amount, address)
         wx.MessageBox(str(response), 'XRP Payment Result', wx.OK | wx.ICON_INFORMATION)
 
     def on_submit_pft_payment(self, event):

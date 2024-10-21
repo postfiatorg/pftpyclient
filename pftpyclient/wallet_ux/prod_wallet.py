@@ -1,5 +1,7 @@
 import wx
+import wx.adv
 import wx.grid as gridlib
+import wx.html
 import xrpl
 from xrpl.wallet import Wallet
 import asyncio
@@ -10,7 +12,15 @@ import nest_asyncio
 import logging
 from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
 from pftpyclient.task_manager.basic_tasks import WalletInitiationFunctions
+import webbrowser
 import os
+
+# Try to use the default browser
+if os.name == 'nt':
+    try: 
+        webbrowser.get('windows-default')
+    except webbrowser.Error:
+        pass
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -273,6 +283,11 @@ class WalletApp(wx.Frame):
         self.txt_xrp_address_payment = wx.TextCtrl(self.payments_tab)
         self.payments_sizer.Add(self.txt_xrp_address_payment, flag=wx.EXPAND | wx.ALL, border=5)
 
+        self.lbl_xrp_memo = wx.StaticText(self.payments_tab, label="Memo (Optional):")
+        self.payments_sizer.Add(self.lbl_xrp_memo, flag=wx.ALL, border=5)
+        self.txt_xrp_memo = wx.TextCtrl(self.payments_tab)
+        self.payments_sizer.Add(self.txt_xrp_memo, flag=wx.EXPAND | wx.ALL, border=5)
+
         self.btn_submit_xrp_payment = wx.Button(self.payments_tab, label="Submit Payment")
         self.payments_sizer.Add(self.btn_submit_xrp_payment, flag=wx.ALL, border=5)
         self.btn_submit_xrp_payment.Bind(wx.EVT_BUTTON, self.on_submit_xrp_payment)
@@ -290,6 +305,11 @@ class WalletApp(wx.Frame):
         self.payments_sizer.Add(self.lbl_pft_address, flag=wx.ALL, border=5)
         self.txt_pft_address_payment = wx.TextCtrl(self.payments_tab)
         self.payments_sizer.Add(self.txt_pft_address_payment, flag=wx.EXPAND | wx.ALL, border=5)
+
+        self.lbl_pft_memo = wx.StaticText(self.payments_tab, label="Memo (Optional):")
+        self.payments_sizer.Add(self.lbl_pft_memo, flag=wx.ALL, border=5)
+        self.txt_pft_memo = wx.TextCtrl(self.payments_tab)
+        self.payments_sizer.Add(self.txt_pft_memo, flag=wx.EXPAND | wx.ALL, border=5)
 
         self.btn_submit_pft_payment = wx.Button(self.payments_tab, label="Submit Payment")
         self.payments_sizer.Add(self.btn_submit_pft_payment, flag=wx.ALL, border=5)
@@ -945,21 +965,126 @@ class WalletApp(wx.Frame):
         wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
 
     def on_submit_xrp_payment(self, event):
-        amount = self.txt_xrp_amount.GetValue()
-        address = self.txt_xrp_address_payment.GetValue()
-        response = self.task_manager.send_xrp__no_memo(amount, address)
-        wx.MessageBox(str(response), 'XRP Payment Result', wx.OK | wx.ICON_INFORMATION)
+        response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
+                                                destination=self.txt_xrp_address_payment.GetValue(), 
+                                                memo=self.txt_xrp_memo.GetValue()
+        )
+        formatted_response = self.format_response(response)
+
+        logging.info(f"XRP Payment Result: {formatted_response}")
+
+        dialog = SelectableMessageDialog(self, "XRP Payment Result", formatted_response)
+        dialog.ShowModal()
+        dialog.Destroy()
 
     def on_submit_pft_payment(self, event):
-        amount = self.txt_pft_amount.GetValue()
-        address = self.txt_pft_address_payment.GetValue()
-        response = self.task_manager.send_PFT_from_one_account_to_other(amount, address)
-        wx.MessageBox(str(response), 'PFT Payment Result', wx.OK | wx.ICON_INFORMATION)
+        response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
+                                                destination=self.txt_pft_address_payment.GetValue(), 
+                                                memo=self.txt_pft_memo.GetValue()
+        )
+
+        logging.debug(f"PFT Payment Response: {response}")
+
+        formatted_response = self.format_response(response)
+
+        logging.info(f"PFT Payment Result: {formatted_response}")
+
+        dialog = SelectableMessageDialog(self, "PFT Payment Result", formatted_response)
+        dialog.ShowModal()
+        dialog.Destroy()
 
     def on_show_secret(self, event):
         classic_address = self.wallet.classic_address
         secret = self.wallet.seed
         wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
+
+    def format_response(self, response):
+        if response.status == "success":
+            tx_json = response.result.get('tx_json', {})
+            meta = response.result.get('meta', {})
+            livenet_link = f"https://livenet.xrpl.org/transactions/{response.result.get('hash', 'N/A')}"
+
+            # Determine the currency and amount
+            deliver_max = tx_json.get('DeliverMax', '0')
+            if isinstance(deliver_max, dict):
+                currency = deliver_max.get('currency', 'N/A')
+                amount = deliver_max.get('value', '0')
+            else:
+                currency = 'XRP'
+                amount = xrpl.utils.drops_to_xrp(deliver_max or '0')
+            
+            formatted_response = (
+                f"Transaction Status: Success\n"
+                f"Transaction Type: {tx_json.get('TransactionType', 'N/A')}\n"
+                f"From: {tx_json.get('Account', 'N/A')}\n"
+                f"To: {tx_json.get('Destination', 'N/A')}\n"
+                f"Amount: {amount} {currency}\n"
+                f"Fee: {xrpl.utils.drops_to_xrp(tx_json.get('Fee', '0'))} XRP\n"
+                f"Ledger Index: {response.result.get('ledger_index', 'N/A')}\n"
+                f"Transaction Hash: {response.result.get('hash', 'N/A')}\n"
+                f"Date: {response.result.get('date', 'N/A')}\n"
+                f"See transaction details at: <a href='{livenet_link}'>{livenet_link}</a>\n\n"
+            )
+
+            logging.debug(f"Formatted Response: {formatted_response}")
+
+            # Add memo if present
+            if tx_json.get('Memos'):
+                memo_data = tx_json['Memos'][0]['Memo'].get('MemoData', '')
+                decoded_memo = bytes.fromhex(memo_data).decode('utf-8', errors='ignore')
+                formatted_response += f"Memo: {decoded_memo}\n"
+
+            # Add transaction result
+            if meta:
+                formatted_response += f"Transaction Result: {meta.get('TransactionResult', 'N/A')}\n"
+
+            return formatted_response
+        else:
+            return f"Transaction Failed\nError: {response.result.get('error message', 'Unknown error')}\n"
+        
+class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
+    def OnLinkClicked(self, link):
+        url = link.GetHref()
+        logging.debug(f"Link clicked: {url}")
+        try:
+            webbrowser.open(url, new=2)
+            logging.debug(f"Attempted to open URL: {url}")
+        except Exception as e:
+            logging.error(f"Failed to open URL {url}. Error: {str(e)}")
+
+class SelectableMessageDialog(wx.Dialog):
+    def __init__(self, parent, title, message):
+        super(SelectableMessageDialog, self).__init__(parent, title=title, size=(500, 400))
+
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        self.html_window = LinkOpeningHtmlWindow(panel, style=wx.html.HW_SCROLLBAR_AUTO)
+        sizer.Add(self.html_window, 1, wx.EXPAND | wx.ALL, 10)
+
+        ok_button = wx.Button(panel, wx.ID_OK, label="OK")
+        sizer.Add(ok_button, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+
+        panel.SetSizer(sizer)
+
+        self.SetContent(message)
+        self.Center()
+
+    def SetContent(self, message):
+        html_content = f"""
+        <html>
+        <head>
+            <style>
+                body {{ word-wrap: break-word; }}
+                pre {{ white-space: pre-wrap; }}
+            </style>
+        </head>
+        <body>
+            <pre>{message}</pre>
+        </body>
+        </html>
+        """
+        self.html_window.SetPage(html_content)
 
 if __name__ == "__main__":
     networks = {

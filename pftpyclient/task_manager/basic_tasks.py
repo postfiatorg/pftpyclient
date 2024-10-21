@@ -3,6 +3,7 @@ import xrpl
 from xrpl.wallet import Wallet
 from xrpl.models.requests import AccountTx
 from xrpl.models.transactions import Payment, Memo
+from xrpl.utils import str_to_hex
 from pftpyclient.basic_utilities.settings import *
 import asyncio
 import nest_asyncio
@@ -23,6 +24,7 @@ import logging
 import time
 import json
 import ast
+from decimal import Decimal
 
 nest_asyncio.apply()
 
@@ -57,7 +59,7 @@ class WalletInitiationFunctions:
             return f"Failed to retrieve the document. Status code: {response.status_code}"
 
     def send_xrp_with_info(self,wallet_seed, amount, destination, memo):
-        sending_wallet =sending_wallet = xrpl.wallet.Wallet.from_seed(wallet_seed)
+        sending_wallet = xrpl.wallet.Wallet.from_seed(wallet_seed)
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
         payment = xrpl.models.transactions.Payment(
             account=sending_wallet.address,
@@ -347,23 +349,22 @@ class PostFiatTaskManager:
         output= date_string+'__'+second_part
         output = output.replace(' ',"_")
         return output
-
-    def send_xrp__no_memo(self, amount, destination):
-        sending_wallet = self.user_wallet
+    
+    def send_xrp(self, amount, destination, memo=""):
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
         payment = xrpl.models.transactions.Payment(
-            account=sending_wallet.address,
-            amount=xrpl.utils.xrp_to_drops(int(amount)),
-        destination=destination,
+            account=self.user_wallet.address,
+            amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
+            destination=destination,
+            memos=[Memo(memo_data=str_to_hex(memo))] if memo else None,
         )
+
         try:    
-            response = xrpl.transaction.submit_and_wait(payment, client, sending_wallet)    
-        except xrpl.transaction.XRPLReliableSubmissionException as e:   
+            response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
+        except xrpl.transaction.XRPLReliableSubmissionException as e:    
             response = f"Submit failed: {e}"
     
         return response
-
-
 
     def classify_task_string(self,string):
         """ These are the canonical classifications for task strings 
@@ -497,52 +498,34 @@ class PostFiatTaskManager:
         else:
             print("Trust line already exists")
 
-    def send_PFT_from_one_account_to_other(self,amount, destination_address):
-        """ This sends PFT tokens to a destination address with no memo information"""
-        #destination = self.postfiatv1xrpaddress
-        
-        sending_wallet = self.user_wallet
-        
+    def send_pft(self, amount, destination, memo="", batch=False):
+        """ Sends PFT tokens to a destination address with optional memo """
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+
+        # if memo is not empty and batch is true, memo is already pre-converted to hex and doesn't need to be converted again
+        memo_data = memo if (memo and batch) else str_to_hex(memo)
+
         amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
             currency="PFT",
             issuer=self.pft_issuer,
             value=str(amount)
         )
-        payment = xrpl.models.transactions.Payment(
-            account=sending_wallet.address,
-            amount=amount_to_send,
-            destination=destination_address
-        )
-        response = xrpl.transaction.submit_and_wait(payment, client, sending_wallet)
-        return response
-    
-    def send_PFT_with_info(self,amount, memo,destination_address):
-        """ This sends PFT tokens to a destination address with memo information
-        memo should be 1kb or less in size and needs to be in hex format
-        """
-    
-        #destination = self.postfiatv1xrpaddress
-        
-        sending_wallet = self.user_wallet
-        
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
-        amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
-            currency="PFT",
-            issuer=self.pft_issuer,
-            value=str(amount)
-        )
-        payment = xrpl.models.transactions.Payment(
-            account=sending_wallet.address,
-            amount=amount_to_send,
-            destination=destination_address,
-            memos=[memo]
-        )
-        response = xrpl.transaction.submit_and_wait(payment, client, sending_wallet)
 
+        payment = xrpl.models.transactions.Payment(
+            account=self.user_wallet.address,
+            amount=amount_to_send,
+            destination=destination,
+            memos=[Memo(memo_data=memo_data)] if memo else None,
+        )
+
+        try:    
+            response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
+        except xrpl.transaction.XRPLReliableSubmissionException as e:    
+            response = f"Submit failed: {e}"
+    
         return response
 
-    def send_PFT_with_info_batch(self, amount, memo, destination_address):
+    def send_PFT_with_info_batch(self, amount, destination, memo):
         """ 
         Sends PFT tokens to a destination address with memo information split into multiple batches.
         The memo is split into chunks that fit within the 1 KB limit.
@@ -566,7 +549,8 @@ class PostFiatTaskManager:
                 memo_type=self.to_hex(f'part_{index + 1}_of_{len(memo_chunks)}'),
                 memo_format=self.to_hex('text/plain')
             )
-            self.send_PFT_with_info(amount, memo_obj, destination_address)
+            
+            self.send_pft(amount, destination, memo_obj, batch=True)
     
 ## MEMO FORMATTING AND MEMO CREATION TOOLS
     def construct_basic_postfiat_memo(self, user, task_id, full_output):
@@ -843,7 +827,7 @@ class PostFiatTaskManager:
         genesis_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username,
                                         task_id=task_id, 
                                         full_output=full_output)
-        self.send_PFT_with_info(amount=7, memo=genesis_memo, destination_address=self.default_node)
+        self.send_pft(amount=7, destination=self.default_node, memo=genesis_memo)
 
     def send_genesis_to_default_node_if_not_sent(self, all_account_info):
         """ Pulls in the memo details and sends the genesis to the default node if 
@@ -875,7 +859,7 @@ class PostFiatTaskManager:
                                                                     google_doc_link=google_doc_link)
             
             # Send the memo to the default node
-            self.send_PFT_with_info(amount=1, memo=google_doc_memo, destination_address=self.default_node)
+            self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
             print("Google Doc context link sent.")
 
     def check_and_prompt_google_doc(self, all_account_info):
@@ -987,8 +971,7 @@ class PostFiatTaskManager:
                 acceptance_string='ACCEPTANCE REASON ___ '+acceptance_string
             constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                        task_id=task_id, full_output=acceptance_string)
-            response = self.send_PFT_with_info(amount=1, memo=constructed_memo, 
-                destination_address=node_account)
+            response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
             account = response.result['Account']
             destination = response.result['Destination']
             memo_map = response.result['Memos'][0]['Memo']
@@ -1031,8 +1014,7 @@ class PostFiatTaskManager:
             refusal_reason = 'REFUSAL REASON ___ ' + refusal_reason
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, full_output=refusal_reason)
-        response = self.send_PFT_with_info(amount=1, memo=constructed_memo, 
-            destination_address=node_account)
+        response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
         account = response.result['Account']
         destination = response.result['Destination']
         memo_map = response.result['Memos'][0]['Memo']
@@ -1075,8 +1057,7 @@ class PostFiatTaskManager:
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, full_output=request_message)
         # Send the memo to the default node
-        response = self.send_PFT_with_info(amount=1, memo=constructed_memo, 
-            destination_address=self.default_node)
+        response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
         account = response.result['Account']
         destination = response.result['Destination']
         memo_map = response.result['Memos'][0]['Memo']
@@ -1118,7 +1099,7 @@ class PostFiatTaskManager:
         print(acceptance_string)
         print('converted to memo')
 
-        response = self.send_PFT_with_info(amount=1, memo=constructed_memo, destination_address=source_of_command)
+        response = self.send_pft(amount=1, destination=source_of_command, memo=constructed_memo)
         account = response.result['Account']
         destination = response.result['Destination']
         memo_map = response.result['Memos'][0]['Memo']
@@ -1192,7 +1173,7 @@ class PostFiatTaskManager:
         print(verification_response)
         print('converted to memo')
 
-        response = self.send_PFT_with_info(amount=1, memo=constructed_memo, destination_address=source_of_command)
+        response = self.send_pft(amount=1, destination=source_of_command, memo=constructed_memo)
         account = response.result['Account']
         destination = response.result['Destination']
         memo_map = response.result['Memos'][0]['Memo']
@@ -1338,7 +1319,7 @@ class PostFiatTaskManager:
         pomodoro_id = task_id.replace('__','==')
         memo_to_send = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username,
                                            task_id=pomodoro_id, full_output=pomodoro_text)
-        response = self.send_PFT_with_info(amount=1, memo=memo_to_send, destination_address=self.default_node)
+        response = self.send_pft(amount=1, destination=self.default_node, memo=memo_to_send)
         return response
 
     def get_all_pomodoros(self, all_account_info):
