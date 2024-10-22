@@ -232,31 +232,40 @@ class WalletInitiationFunctions:
 
 
 class PostFiatTaskManager:
+    
     def __init__(self,username,password):
-        self.credential_manager=CredentialManager(username=username,password=password)
-        self.pw_map = self.credential_manager.output_fully_decrypted_cred_map(pw_decryptor=
-                                                   self.credential_manager.pw_initiator)
+        self.credential_manager=CredentialManager(username,password)
+        self.pw_map = self.credential_manager.output_fully_decrypted_cred_map(self.credential_manager.pw_initiator)
         self.mainnet_url= "https://s2.ripple.com:51234"
         self.treasury_wallet_address = 'r46SUhCzyGE4KwBnKQ6LmDmJcECCqdKy4q'
         self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
         self.trust_line_default = '100000000'
         self.user_wallet = self.spawn_user_wallet()
-        self.establish_trust_line_if_needed()
-        self.user_google_doc = self.pw_map[self.credential_manager.google_doc_name]
-        self.csv_file_path = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.csv")
+
+        # TODO: Find a use for this or delete
+        # self.user_google_doc = self.pw_map[self.credential_manager.google_doc_name]
+
+        self.tx_history_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.csv")
+        self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
 
         self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
 
         self.transactions = pd.DataFrame()
-        self.update_transactions()
-        
-        # to-do: see if all_account_info needs to be initialized in this way
-        all_account_info = self.get_memo_detail_df_for_account()
+        self.memos = pd.DataFrame()
 
-        # this initializes the user to the node 
-        self.send_genesis_to_default_node_if_not_sent(all_account_info=all_account_info)
-        # and also sends the node the google doc for the user 
-        self.check_and_prompt_google_doc(all_account_info=all_account_info)
+        self.sync_transactions()
+
+        # CHECKS
+        # checks if the user has a trust line to the PFT token, and creates one if not
+        self.handle_trust_line()
+
+        # check if the user has sent a genesis to the node, and sends one if not
+        self.handle_genesis()
+
+        # TODO: Prompt user for google doc through the UI, not through the code
+        # check if the user has sent a google doc to the node, and sends one if not
+        # self.handle_google_doc()
+
 
     def get_xrp_balance(self):
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
@@ -270,16 +279,20 @@ class PostFiatTaskManager:
     ## GENERIC UTILITY FUNCTIONS 
 
     def save_transactions_to_csv(self):
-        self.transactions.to_csv(self.csv_file_path, index=False)
-        logging.debug(f"Saved {len(self.transactions)} transactions to {self.csv_file_path}")
+        self.transactions.to_csv(self.tx_history_csv_filepath, index=False)
+        logging.debug(f"Saved {len(self.transactions)} transactions to {self.tx_history_csv_filepath}")
+
+    def save_memos_to_csv(self):
+        self.memos.to_csv(self.tx_history_csv_filepath, index=False)
+        logging.debug(f"Saved {len(self.memos)} memos to {self.memos_csv_filepath}")
 
     def load_transactions_from_csv(self):
         """ Loads the transactions from the CSV file into a dataframe, and deserializes some columns"""
         tx_df = None
-        if os.path.exists(self.csv_file_path):
-            logging.debug(f"Loading transactions from {self.csv_file_path}")
+        if os.path.exists(self.tx_history_csv_filepath):
+            logging.debug(f"Loading transactions from {self.tx_history_csv_filepath}")
             try:
-                tx_df = pd.read_csv(self.csv_file_path)
+                tx_df = pd.read_csv(self.tx_history_csv_filepath)
 
                 # deserialize columns
                 for col in ['meta', 'tx_json']:
@@ -287,13 +300,13 @@ class PostFiatTaskManager:
                         tx_df[col] = tx_df[col].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else x)
 
             except Exception as e:
-                logging.error(f"Error loading transactions from {self.csv_file_path}: {e}")
-                os.remove(self.csv_file_path) # delete the file, it's corrupt or empty
+                logging.error(f"Error loading transactions from {self.tx_history_csv_filepath}: {e}")
+                os.remove(self.tx_history_csv_filepath) # delete the file, it's corrupt or empty
                 return pd.DataFrame()
             else:
                 return tx_df
 
-        logging.debug(f"No existing transaction history file found at {self.csv_file_path}")
+        logging.debug(f"No existing transaction history file found at {self.tx_history_csv_filepath}")
         return pd.DataFrame() # empty dataframe if file does not exist
 
     def get_new_transactions(self, last_known_ledger_index):
@@ -306,37 +319,74 @@ class PostFiatTaskManager:
             limit=1000  # adjust as needed
         )
 
-    def update_transactions(self):
-        """ Checks for new transactions and caches them locally """
+    def sync_transactions(self):
+        """ Checks for new transactions and caches them locally. Also triggers memo update"""
         logging.debug("Updating transactions")
-        
-        # if the transactions dataframe is empty, attempt to load from local csv
-        if self.transactions.empty: 
-            self.transactions = self.load_transactions_from_csv()
 
-        # if the transactions dataframe is still empty, use ledger index of -1 to fetch all transactions
+        # Attempt to load transactions from local csv
+        if self.transactions.empty: 
+            new_tx_df = self.load_transactions_from_csv()
+            self.transactions = new_tx_df
+            self.sync_memos(new_tx_df)
+
+        # Choose ledger index to start sync from
         if self.transactions.empty:
             last_known_ledger_index = -1
-
-        # otherwise, use the last known ledger index from the transactions dataframe
-        else:
-            last_known_ledger_index = self.transactions['ledger_index'].max()
+        else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
+            last_known_ledger_index = self.transactions['ledger_index'].max() + 1
             logging.debug(f"Last known ledger index: {last_known_ledger_index}")
 
         # fetch new transactions from the node
         new_tx_list = self.get_new_transactions(last_known_ledger_index)
 
-        # # DEBUGGING
-        # logging.debug(f"New transactions: {new_tx_list}")
-
+        # Add new transactions to the dataframe
         if new_tx_list:
             logging.debug(f"Adding {len(new_tx_list)} new transactions...")
-            self.transactions = pd.concat([self.transactions, pd.DataFrame(new_tx_list)], ignore_index=True).drop_duplicates(subset=['hash'])
+            new_tx_df = pd.DataFrame(new_tx_list)
+            self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
             self.save_transactions_to_csv()
-            logging.debug("Added new transactions")
+            self.sync_memos(new_tx_df)
         else:
             logging.debug("No new transactions found. Finished updating local tx history")
+        
+    def sync_memos(self, new_tx_df):
+        """ Updates the memos dataframe with new memos from the new transactions. Memos are serialized into dicts"""
+        # flag rows with memos
+        new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x)
 
+        # filter for rows with memos and convert to dataframe
+        new_memo_df = new_tx_df[new_tx_df['has_memos']== True].copy()
+
+        # Extract first memo into a new column, serialize to dict
+        # Any additional memos are ignored
+        new_memo_df['memo_data']=new_memo_df['tx_json'].apply(lambda x: self.convert_memo_dict(x['Memos'][0]['Memo']))
+        
+        # Extract account and destination from tx_json into new columns
+        new_memo_df['account']= new_memo_df['tx_json'].apply(lambda x: x['Account'])
+        new_memo_df['destination']=new_memo_df['tx_json'].apply(lambda x: x['Destination'])
+        
+        # Determine message type
+        new_memo_df['message_type']=np.where(new_memo_df['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
+        
+        # Derive node account
+        new_memo_df['node_account']= new_memo_df[['destination','account']].sum(1).apply(lambda x: 
+                                                         str(x).replace(self.user_wallet.classic_address,''))
+        
+        # Convert ripple timestamp to datetime
+        new_memo_df['datetime']= new_memo_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
+        
+        # Extract ledger index
+        new_memo_df['ledger_index'] = new_memo_df['tx_json'].apply(lambda x: x['ledger_index'])
+
+        # Flag rows with PFT
+        new_memo_df['is_pft'] = new_memo_df['tx_json'].apply(lambda x: self.check_if_tx_pft(x))
+
+        # Concatenate new memos to existing memos and drop duplicates
+        self.memos = pd.concat([self.memos, new_memo_df], ignore_index=True).drop_duplicates(subset=['hash'])
+
+        self.save_memos_to_csv()
+
+        logging.debug(f"Added {len(new_memo_df)} new memos")
 
     def to_hex(self,string):
         return binascii.hexlify(string.encode()).decode()
@@ -349,8 +399,6 @@ class PostFiatTaskManager:
         date_object = datetime.datetime.fromtimestamp(unix_timestamp)
         return date_object
 
-
-    
     def hex_to_text(self,hex_string):
         bytes_object = bytes.fromhex(hex_string)
         ascii_string = bytes_object.decode("utf-8")
@@ -414,24 +462,22 @@ class PostFiatTaskManager:
     
         return 'UNKNOWN'
 
-       
-
-
     def determine_if_map_is_task_id(self,memo_dict):
         """ Note that technically only the task ID recognition is needed
         at a later date might want to implement forced user and output delineators 
         if someone spams the system with task IDs
         """
-        full_memo_string = str(memo_dict)
+        memo_string = str(memo_dict)
+
+        # Check for task ID pattern
         task_id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
-        has_task_id = False
-        if re.search(task_id_pattern, full_memo_string):
+        if re.search(task_id_pattern, memo_string):
             return True
-        has_user_identified = 'user:' in full_memo_string
-        has_full_output_identified = 'full_output:' in full_memo_string
-        if (has_user_identified) and (has_full_output_identified) and has_task_id:
-            return True
-        return False
+        
+        # Check for required fields
+        required_fields = ['user:', 'full_output:']
+        return all(field in memo_string for field in required_fields)
+
 
     def convert_memo_dict(self, memo_dict):
         """Constructs a memo object with user, task_id, and full_output from hex-encoded values."""
@@ -470,13 +516,9 @@ class PostFiatTaskManager:
         line for the PFT Token so the holder DF should be checked 
         before this is run
         """ 
-        
-        wallet_to_link =self.user_wallet
-        
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
-        #currency_code = "PFT"
         trust_set_tx = xrpl.models.transactions.TrustSet(
-                        account=wallet_to_link.classic_address,
+                        account=self.user_wallet.classic_address,
                     limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
                             currency="PFT",
                             issuer=self.pft_issuer,
@@ -485,7 +527,7 @@ class PostFiatTaskManager:
                     )
         print("Creating trust line from chosen seed to issuer...")
         
-        response = xrpl.transaction.submit_and_wait(trust_set_tx, client, wallet_to_link)
+        response = xrpl.transaction.submit_and_wait(trust_set_tx, client, self.user_wallet)
         return response
     
     def output_post_fiat_holder_df(self):
@@ -495,7 +537,7 @@ class PostFiatTaskManager:
         are reverse signed.
         """
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
-        print("Getting all accounts holding PFT tokens...")
+        logging.debug("Getting all accounts holding PFT tokens...")
         response = client.request(xrpl.models.requests.AccountLines(
             account=self.pft_issuer,
             ledger_index="validated",
@@ -507,22 +549,22 @@ class PostFiatTaskManager:
         full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
         return full_post_fiat_holder_df
     
-    def check_if_user_has_trust_line(self):
+    def has_trust_line(self):
         """ This function checks if the user has a trust line to the PFT token"""
         pft_holders = self.output_post_fiat_holder_df()
         existing_pft_accounts = list(pft_holders['account'])
         user_is_in_pft_accounts = self.user_wallet.classic_address in existing_pft_accounts
         return user_is_in_pft_accounts
 
-    def establish_trust_line_if_needed(self):
+    def handle_trust_line(self):
         """ This function checks if the user has a trust line to the PFT token
         and if not establishes one"""
-        print("Checking if trust line exists...")
-        if not self.check_if_user_has_trust_line():
+        logging.debug("Checking if trust line exists...")
+        if not self.has_trust_line():
             self.generate_trust_line_to_pft_token()
-            print("Trust line created")
+            logging.debug("Trust line created")
         else:
-            print("Trust line already exists")
+            logging.debug("Trust line already exists")
 
     def send_pft(self, amount, destination, memo="", batch=False):
         """ Sends PFT tokens to a destination address with optional memo """
@@ -762,169 +804,172 @@ class PostFiatTaskManager:
         print(f"Longest list of transactions: {len(longest_transactions)} transactions")
         return longest_transactions
         
-    def get_memo_detail_df_for_account(self):
-        """ This function gets all the memo details for a given account """
-        logging.debug(f"Getting memo details for account {self.user_wallet.classic_address}")
+    # def get_memo_detail_df_for_account(self):
+    #     """ This function gets all the memo details for a given account """
+    #     logging.debug(f"Getting memo details for account {self.user_wallet.classic_address}")
 
-        validated_tx = pd.DataFrame(self.transactions)
+    #     validated_tx = pd.DataFrame(self.transactions)
 
-        validated_tx['has_memos']=validated_tx['tx_json'].apply(lambda x: 'Memos' in x)
+    #     validated_tx['has_memos']=validated_tx['tx_json'].apply(lambda x: 'Memos' in x)
 
-        # #DEBUGGING
-        # validated_tx.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"validated_tx.csv"))
+    #     # #DEBUGGING
+    #     # validated_tx.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"validated_tx.csv"))
 
-        live_memo_tx = validated_tx[validated_tx['has_memos']== True].copy()
+    #     live_memo_tx = validated_tx[validated_tx['has_memos']== True].copy()
 
-        live_memo_tx['main_memo_data']=live_memo_tx['tx_json'].apply(lambda x: x['Memos'][0]['Memo'])
-        live_memo_tx['converted_memos']=live_memo_tx['main_memo_data'].apply(lambda x: 
-                                                                             self.convert_memo_dict(x))
-        live_memo_tx['account']= live_memo_tx['tx_json'].apply(lambda x: x['Account'])
-        live_memo_tx['destination']=live_memo_tx['tx_json'].apply(lambda x: x['Destination'])
+    #     live_memo_tx['main_memo_data']=live_memo_tx['tx_json'].apply(lambda x: x['Memos'][0]['Memo'])
+    #     live_memo_tx['converted_memos']=live_memo_tx['main_memo_data'].apply(lambda x: 
+    #                                                                          self.convert_memo_dict(x))
+    #     live_memo_tx['account']= live_memo_tx['tx_json'].apply(lambda x: x['Account'])
+    #     live_memo_tx['destination']=live_memo_tx['tx_json'].apply(lambda x: x['Destination'])
         
-        live_memo_tx['message_type']=np.where(live_memo_tx['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
-        live_memo_tx['node_account']= live_memo_tx[['destination','account']].sum(1).apply(lambda x: 
-                                                         str(x).replace(self.user_wallet.classic_address,''))
-        live_memo_tx['datetime']= live_memo_tx['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
-        live_memo_tx['ledger_index'] = live_memo_tx['tx_json'].apply(lambda x: x['ledger_index'])
+    #     live_memo_tx['message_type']=np.where(live_memo_tx['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
+    #     live_memo_tx['node_account']= live_memo_tx[['destination','account']].sum(1).apply(lambda x: 
+    #                                                      str(x).replace(self.user_wallet.classic_address,''))
+    #     live_memo_tx['datetime']= live_memo_tx['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
+    #     live_memo_tx['ledger_index'] = live_memo_tx['tx_json'].apply(lambda x: x['ledger_index'])
 
-        # #DEBUGGING
-        # live_memo_tx.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"live_memo_tx.csv"))
-        return live_memo_tx
+    #     # #DEBUGGING
+    #     # live_memo_tx.to_csv(os.path.join(DATADUMP_DIRECTORY_PATH, f"live_memo_tx.csv"))
+    #     return live_memo_tx
     
-    def get_post_fiat_context_doc_for_address(self,all_account_info):
+    def retrieve_context_doc(self):
         """ This function gets the most recent google doc context link for a given account address """
 
-        all_account_info['is_post_fiat']=all_account_info['tx_json'].apply(lambda x: self.check_if_tx_pft(x))
-
-        # Filter for transactions that are PFT and sent to the default node
-        redux_tx_list = all_account_info[(all_account_info['is_post_fiat']== True)&
-                                        (all_account_info['destination']==self.default_node)].copy()
-
-        outgoing_messages_only= redux_tx_list[redux_tx_list['message_type']=='OUTGOING'].copy()
-
         most_recent_context_link=''
-        most_recent_context_link = outgoing_messages_only[outgoing_messages_only['converted_memos'].apply(lambda x: x['task_id']) 
-        == 'google_doc_context_link'].tail(1)
-        link= ''
 
-        if len(most_recent_context_link) >0:
-            link = list(most_recent_context_link['converted_memos'])[0]['full_output']
-            
-        if len(most_recent_context_link) == 0:
-            print("NO GOOGLE DOC CONTEXT")
+        # Filter for memos that are PFT-related, sent to the default node, outgoing, and are google doc context links
+        redux_tx_list = self.memos[
+            self.memos['is_pft'] & 
+            (self.memos['destination']==self.default_node) &
+            (self.memos['message_type']=='OUTGOING') & 
+            (self.memos['task_id']=='google_doc_context_link')
+            ]
+        
+        if len(redux_tx_list) == 0:
+            logging.warning("No Google Doc context link found")
+            return None
+        
+        # Get the most recent google doc context link
+        most_recent_context_link = redux_tx_list.tail(1)
+        # Get the full output from the most recent google doc context link
+        link = most_recent_context_link['memo_data'].apply(lambda x: x['full_output'])[0]
+
         return link
     
-    def generate_google_doc_context_memo(self,user,google_doc_link):
-                                                 
-        user_hex = self.to_hex(user)
-        task_id_hex = self.to_hex('google_doc_context_link')
-        full_output_hex = self.to_hex(google_doc_link)
-        memo = Memo(
-        memo_data=full_output_hex,
-        memo_type=task_id_hex,
-        memo_format=user_hex)  
-        return memo
-        #self.wallet_google_doc_map[account_address]=most_recent_context_link
+    def generate_google_doc_context_memo(self,user,google_doc_link):                  
+        return Memo(memo_data=self.to_hex(google_doc_link),
+                    memo_type=self.to_hex('google_doc_context_link'),
+                    memo_format=self.to_hex(user)) 
 
-    #user_memos= self.get_memo_detail_df_for_account(transaction_limit=5000)
-    def output_account_address_node_association(self, all_account_info):
+    def output_account_address_node_association(self):
         """this takes the account info frame and figures out what nodes
          the account is associating with and returns them in a dataframe """
-        all_account_info['valid_task_id']=all_account_info['converted_memos'].apply(lambda x:self.determine_if_map_is_task_id(x))
-        node_output_df = all_account_info[all_account_info['message_type']=='INCOMING'][['valid_task_id',
-                                                            'account']].groupby('account').sum()
+        self.memos['valid_task_id']=self.memos['memo_data'].apply(lambda x:self.determine_if_map_is_task_id(x))
+        node_output_df = self.memos[self.memos['message_type']=='INCOMING'][['valid_task_id','account']].groupby('account').sum()
+   
         return node_output_df[node_output_df['valid_task_id']>0]
     
-    def get_user_genesis_destinations(self, all_account_info):
+    def get_user_genesis_destinations(self):
         """ Returns all the addresses that have received a user genesis transaction"""
-        all_user_genesis_transactions = all_account_info[all_account_info['converted_memos'].apply(lambda x: 
-                                                                'USER GENESIS __' in str(x))]
+        all_user_genesis_transactions = self.memos[self.memos['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
         all_user_genesis_destinations = list(all_user_genesis_transactions['destination'])
-        return {'destinations': all_user_genesis_destinations,
-                'raw_details': all_user_genesis_transactions}
+        return {'destinations': all_user_genesis_destinations, 'raw_details': all_user_genesis_transactions}
     
-    def send_user_genesis_to_default_node(self):
-        """ this takes the user default node and sends a user genesis transaction to it
-        
-        note should check that the user genesis transaction has not already been sent
-        """
-        print("Initializing Node Genesis Transaction...")
-        print("minimum 7 PFT tokens required for user genesis")
-        task_id = self.generate_custom_id()
-        user_name_to_send = self.credential_manager.postfiat_username
+    def handle_genesis(self):
+        """ Checks if the user has sent a genesis to the node, and sends one if not """
+        if not self.genesis_sent():
+            logging.debug("User has not sent genesis, sending...")
+            self.send_genesis()
+        else:
+            logging.debug("User has already sent genesis, skipping...")
 
-        full_output = f'USER GENESIS __ user: {user_name_to_send}'
-        
-        genesis_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username,
-                                        task_id=task_id, 
-                                        full_output=full_output)
+    def genesis_sent(self):
+        logging.debug("Checking if user has sent genesis...")
+        user_genesis = self.get_user_genesis_destinations()
+        return self.default_node in user_genesis['destinations']
+    
+    def send_genesis(self):
+        """ Sends a user genesis transaction to the default node 
+        Currently requires 7 PFT
+        """
+        logging.debug("Initializing Node Genesis Transaction...")
+        genesis_memo = self.construct_basic_postfiat_memo(
+            user=self.credential_manager.postfiat_username,
+            task_id=self.generate_custom_id(), 
+            full_output=f'USER GENESIS __ user: {self.credential_manager.postfiat_username}'
+            )
         self.send_pft(amount=7, destination=self.default_node, memo=genesis_memo)
 
-    def send_genesis_to_default_node_if_not_sent(self, all_account_info):
-        """ Pulls in the memo details and sends the genesis to the default node if 
-        it has not already been sent"""
-        user_genesis = self.get_user_genesis_destinations(all_account_info=all_account_info)
-        if self.default_node in user_genesis['destinations']:
-            print("User Genesis already sent to default node")
-        if self.default_node not in user_genesis['destinations']:
-            self.send_user_genesis_to_default_node()
+    # def handle_google_doc(self):
+    #     """Checks for google doc and prompts user to send if not found"""
+    #     if not self.google_doc_sent():
+    #         logging.debug("Google Doc not found.")
+    #         self.send_google_doc()
+    #     else:
+    #         logging.debug("Google Doc already sent, skipping...")
 
-    def send_google_doc_to_node_if_not_sent(self, all_account_info, user_google_doc):
-        """
-        Sends the Google Doc context link to the node if it hasn't been sent already.
-        """
-        print("Checking if Google Doc context link has already been sent...")
+    # def google_doc_sent(self):
+    #     return self.default_node in self.retrieve_context_doc()
+    
+    # def send_google_doc(self, user_google_doc):
+    #     """ Sends the Google Doc context link to the node """
+    #     google_doc_memo = self.generate_google_doc_context_memo(user=self.credential_manager.postfiat_username,
+    #                                                                 google_doc_link=user_google_doc)
+    #     self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
+
+    # def send_google_doc_to_node_if_not_sent(self, user_google_doc):
+    #     """
+    #     Sends the Google Doc context link to the node if it hasn't been sent already.
+    #     """
+    #     print("Checking if Google Doc context link has already been sent...")
         
-        # Check if the Google Doc context link has been sent
-        existing_link = self.get_post_fiat_context_doc_for_address(all_account_info)
+    #     # Check if the Google Doc context link has been sent
+    #     existing_link = self.retrieve_context_doc()
         
-        if existing_link:
-            print("Google Doc context link already sent:", existing_link)
-        else:
-            print("Google Doc context link not found. Sending now...")
-            google_doc_link = user_google_doc
-            user_name_to_send = self.credential_manager.postfiat_username
+    #     if existing_link:
+    #         print("Google Doc context link already sent:", existing_link)
+    #     else:
+    #         print("Google Doc context link not found. Sending now...")
+    #         google_doc_link = user_google_doc
+    #         user_name_to_send = self.credential_manager.postfiat_username
             
-            # Construct the memo
-            google_doc_memo = self.generate_google_doc_context_memo(user=user_name_to_send,
-                                                                    google_doc_link=google_doc_link)
+    #         # Construct the memo
+    #         google_doc_memo = self.generate_google_doc_context_memo(user=user_name_to_send,
+    #                                                                 google_doc_link=google_doc_link)
             
-            # Send the memo to the default node
-            self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
-            print("Google Doc context link sent.")
+    #         # Send the memo to the default node
+    #         self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
+    #         print("Google Doc context link sent.")
 
-    def check_and_prompt_google_doc(self, all_account_info):
-        """
-        Checks if the Google Doc context link exists for the account on the chain.
-        If it doesn't exist, prompts the user to enter the Google Doc string and sends it.
-        """
-        # Get memo details for the user's account
+    # def check_and_prompt_google_doc(self):
+    #     """
+    #     Checks if the Google Doc context link exists for the account on the chain.
+    #     If it doesn't exist, prompts the user to enter the Google Doc string and sends it.
+    #     """
+    #     # Get memo details for the user's account
         
 
-        # Check if the Google Doc context link exists
-        existing_link = self.get_post_fiat_context_doc_for_address(all_account_info)
+    #     # Check if the Google Doc context link exists
+    #     existing_link = self.retrieve_context_doc()
 
-        if existing_link:
-            print("Google Doc context link already exists:", existing_link)
-        else:
-            # Prompt the user to enter the Google Doc string
-            user_google_doc = input("Enter the Google Doc string: ")
+    #     if existing_link:
+    #         print("Google Doc context link already exists:", existing_link)
+    #     else:
+    #         # Prompt the user to enter the Google Doc string
+    #         user_google_doc = input("Enter the Google Doc string: ")
             
-            # Send the Google Doc context link to the default node
-            self.send_google_doc_to_node_if_not_sent(all_account_info =all_account_info, user_google_doc = user_google_doc)
+    #         # Send the Google Doc context link to the default node
+    #         self.send_google_doc_to_node_if_not_sent(user_google_doc = user_google_doc)
 
 
 
-    def convert_all_account_info_into_simplified_task_frame(self, all_account_info):
+    def convert_all_account_info_into_simplified_task_frame(self):
         """ This takes all the Post Fiat Tasks and outputs them into a simplified
         dataframe of task information with embedded classifications 
-        
-        Runs on all_account_info generated by
-        all_account_info =self.get_memo_detail_df_for_account()
         """ 
 
-        simplified_task_frame = all_account_info[all_account_info['converted_memos'].apply(lambda x: 
-                                                                self.determine_if_map_is_task_id(x))].copy()
+        simplified_task_frame = self.memos[self.memos['memo_data'].apply(lambda x: self.determine_if_map_is_task_id(x))].copy()
         simplified_task_frame = simplified_task_frame[simplified_task_frame['tx_json'].apply(lambda 
                                                                                         x: x['DeliverMax']).apply(lambda x: 
                                                                                                                     "'currency': 'PFT'" in str(x))].copy()
@@ -937,20 +982,20 @@ class PostFiatTaskManager:
             'OUTGOING':-1}) * simplified_task_frame['pft_abs']
         
         for xfield in ['hash','node_account','datetime']:
-            simplified_task_frame['converted_memos'] = simplified_task_frame.apply(lambda x: add_field_to_map(x['converted_memos'],
+            simplified_task_frame['memo_data'] = simplified_task_frame.apply(lambda x: add_field_to_map(x['memo_data'],
                 xfield,x[xfield]),1)
             
-        core_task_df = pd.DataFrame(list(simplified_task_frame['converted_memos'])).copy()
+        core_task_df = pd.DataFrame(list(simplified_task_frame['memo_data'])).copy()
         core_task_df['task_type']=core_task_df['full_output'].apply(lambda x: self.classify_task_string(x))
         
 
         return core_task_df
 
 
-    def convert_all_account_info_into_outstanding_task_df(self, all_account_info):
+    def convert_all_account_info_into_outstanding_task_df(self):
         """ This reduces all account info into a simplified dataframe of proposed 
         and accepted tasks """ 
-        task_frame = self.convert_all_account_info_into_simplified_task_frame(all_account_info=all_account_info)
+        task_frame = self.convert_all_account_info_into_simplified_task_frame()
         task_type_map = task_frame.groupby('task_id').last()[['task_type']].copy()
         task_id_to_proposal = task_frame[task_frame['task_type']
         =='PROPOSAL'].groupby('task_id').first()['full_output']
@@ -969,7 +1014,7 @@ class PostFiatTaskManager:
         op= raw_proposals_and_acceptances[raw_proposals_and_acceptances.index.get_level_values(0).isin(proposed_or_accepted_only)]
         return op
 
-    def send_acceptance_for_task_id(self, task_id, acceptance_string, all_account_info):
+    def send_acceptance_for_task_id(self, task_id, acceptance_string):
         """ 
         This function accepts a task. The function will not work 
 
@@ -979,8 +1024,7 @@ class PostFiatTaskManager:
         all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                 transaction_limit=5000)
         """
-        all_account_info = all_account_info
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame(all_account_info=all_account_info)
+        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
         all_task_types = simplified_task_frame[simplified_task_frame['task_id']
          == task_id]['task_type'].unique()
         if (('REFUSAL' in all_task_types) 
@@ -1011,7 +1055,7 @@ class PostFiatTaskManager:
             print(self.convert_memo_dict(memo_map))
         return response
 
-    def send_refusal_for_task(self, task_id, refusal_reason, all_account_info):
+    def send_refusal_for_task(self, task_id, refusal_reason):
         """ 
         This function refuses a task. The function will not work if the task has already 
         been accepted, refused, or completed. 
@@ -1022,8 +1066,7 @@ class PostFiatTaskManager:
         all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                 transaction_limit=5000)
         """
-        all_account_info = all_account_info
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame(all_account_info=all_account_info)
+        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
         task_statuses = simplified_task_frame[simplified_task_frame['task_id'] 
         == task_id]['task_type'].unique()
 
@@ -1053,19 +1096,13 @@ class PostFiatTaskManager:
         print(self.convert_memo_dict(memo_map))
         return response
 
-    def request_post_fiat(self, request_message, 
-                          all_account_info):
+    def request_post_fiat(self, request_message ):
         """ 
         This requests a task known as a Post Fiat from the default node you are on
         
         request_message = 'I would like a new task related to the creation of my public facing wallet', 
         all_account_info=all_account_info
 
-        """
-        all_account_info =self.get_memo_detail_df_for_account()
-        
-        all_account_info = all_account_info
-        """ 
         This function sends a request for post-fiat tasks to the node.
         
         EXAMPLE PARAMETERS
@@ -1073,9 +1110,7 @@ class PostFiatTaskManager:
         all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                 transaction_limit=5000)
         """
-        all_account_info = all_account_info
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame(all_account_info=
-            all_account_info)
+        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
         
         # Ensure the message has the correct prefix
         if 'REQUEST_POST_FIAT ___' not in request_message:
@@ -1099,7 +1134,7 @@ class PostFiatTaskManager:
         print(self.convert_memo_dict(memo_map))
         return response
 
-    def send_post_fiat_initial_completion(self, completion_string, task_id, all_account_info):
+    def send_post_fiat_initial_completion(self, completion_string, task_id):
         """
         This function sends an initial completion for a given task back to a node.
         The most recent task status must be 'ACCEPTANCE' to trigger the initial completion.
@@ -1110,9 +1145,7 @@ class PostFiatTaskManager:
         all_account_info = self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                                                                 transaction_limit=5000)
         """
-        all_account_info = all_account_info
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame(all_account_info
-            =all_account_info)
+        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
         matching_task = simplified_task_frame[simplified_task_frame['task_id'] == task_id]#
         
         if matching_task.empty:
@@ -1141,7 +1174,7 @@ class PostFiatTaskManager:
         print(self.convert_memo_dict(memo_map))
         return response
 
-    def convert_all_account_info_into_required_verification_df(self,all_account_info):
+    def convert_all_account_info_into_required_verification_df(self):
         """ 
         This function pulls in all account info and converts it into a list
 
@@ -1149,7 +1182,7 @@ class PostFiatTaskManager:
                                                                 transaction_limit=5000)
 
         """ 
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame(all_account_info=all_account_info)
+        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
         verification_frame = simplified_task_frame[simplified_task_frame['full_output'].apply(lambda x: 
                                                                          'VERIFICATION PROMPT ___' in x)].groupby('task_id').last()[['full_output']]
         if len(verification_frame) == 0:
@@ -1166,7 +1199,7 @@ class PostFiatTaskManager:
 
         return outstanding_verification
         
-    def send_post_fiat_verification_response(self, response_string, task_id, all_account_info):
+    def send_post_fiat_verification_response(self, response_string, task_id):
         """
         This function sends a verification response for a given task back to a node.
         The most recent task status must be 'VERIFICATION_PROMPT' to trigger the verification response.
@@ -1185,8 +1218,7 @@ class PostFiatTaskManager:
             ___x TASK VERIFICATION SECTION END x___
 
             """ )
-        all_account_info = all_account_info
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame(all_account_info=all_account_info)
+        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
         matching_task = simplified_task_frame[simplified_task_frame['task_id'] == task_id]
         
         if matching_task.empty:
@@ -1216,9 +1248,9 @@ class PostFiatTaskManager:
         return response
 
 
-    def convert_all_account_info_into_rewarded_task_df(self, all_account_info):
+    def convert_all_account_info_into_rewarded_task_df(self):
         """ outputs all reward df""" 
-        all_tasks = self.convert_all_account_info_into_simplified_task_frame(all_account_info=all_account_info)
+        all_tasks = self.convert_all_account_info_into_simplified_task_frame()
 
         # Group by task_type and task_id, then take the last entry for each group and unstack
         unstacked = all_tasks.groupby(['task_type', 'task_id']).last()['full_output'].unstack(0)
@@ -1232,11 +1264,11 @@ class PostFiatTaskManager:
         # Apply the lambda function to prepend 'REWARD RESPONSE __' to each REWARD entry
         reward_df['REWARD'] = reward_df['REWARD'].astype(object).apply(lambda x: x.replace('REWARD RESPONSE __ ',''))
         reward_df.columns=['proposal','reward']
-        pft_only=all_account_info[all_account_info['tx_json'].apply(lambda x: "PFT" in str(x['DeliverMax']))].copy()
+        pft_only=self.memos[self.memos['tx_json'].apply(lambda x: "PFT" in str(x['DeliverMax']))].copy()
         pft_only['pft_value']=pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)*pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
-        pft_only['task_id']=pft_only['converted_memos'].apply(lambda x: x['task_id'])
+        pft_only['task_id']=pft_only['memo_data'].apply(lambda x: x['task_id'])
         task_id_hash = all_tasks[all_tasks['task_type']=='REWARD'].groupby('task_id').last()[['hash']]
-        pft_rewards_only = pft_only[pft_only['converted_memos'].apply(lambda x: 'REWARD RESPONSE __' in 
+        pft_rewards_only = pft_only[pft_only['memo'].apply(lambda x: 'REWARD RESPONSE __' in 
                                                    x['full_output'])].copy()
         task_id_to_payout = pft_rewards_only.groupby('task_id').last()['pft_value']
         reward_df['payout']=task_id_to_payout
@@ -1260,27 +1292,27 @@ class PostFiatTaskManager:
 
 
 
-    def process_account_info(self, all_account_info):
+    def process_account_info(self):
         user_default_node = self.default_node
         # Slicing data based on conditions
-        google_doc_slice = all_account_info[all_account_info['converted_memos'].apply(lambda x: 
+        google_doc_slice = self.memos[self.memos['memo_data'].apply(lambda x: 
                                                                    'google_doc_context_link' in str(x))].copy()
 
-        genesis_slice = all_account_info[all_account_info['converted_memos'].apply(lambda x: 
+        genesis_slice = self.memos[self.memos['memo_data'].apply(lambda x: 
                                                                    'USER GENESIS __' in str(x))].copy()
         
         # Extract genesis username
         genesis_username = "Unknown"
         if not genesis_slice.empty:
-            genesis_username = list(genesis_slice['converted_memos'])[0]['full_output'].split(' __')[-1].split('user:')[-1].strip()
+            genesis_username = list(genesis_slice['memo_data'])[0]['full_output'].split(' __')[-1].split('user:')[-1].strip()
         
         # Extract Google Doc key
         key_google_doc = "No Google Doc available."
         if not google_doc_slice.empty:
-            key_google_doc = list(google_doc_slice['converted_memos'])[0]['full_output']
+            key_google_doc = list(google_doc_slice['memo_data'])[0]['full_output']
 
         # Sorting account info by datetime
-        sorted_account_info = all_account_info.sort_values('datetime', ascending=True).copy()
+        sorted_account_info = self.memos.sort_values('datetime', ascending=True).copy()
 
         def extract_latest_message(message_type, node, is_outgoing):
             """
@@ -1305,8 +1337,8 @@ class PostFiatTaskManager:
         def format_dict(data):
             if data:
                 standard_format = f"https://livenet.xrpl.org/transactions/{data.get('hash', '')}/detailed"
-                full_output = data.get('converted_memos', {}).get('full_output', 'N/A')
-                task_id = data.get('converted_memos', {}).get('task_id', 'N/A')
+                full_output = data.get('memo_data', {}).get('full_output', 'N/A')
+                task_id = data.get('memo_data', {}).get('task_id', 'N/A')
                 formatted_string = (
                     f"Task ID: {task_id}\n"
                     f"Full Output: {full_output}\n"
@@ -1356,10 +1388,10 @@ class PostFiatTaskManager:
         response = self.send_pft(amount=1, destination=self.default_node, memo=memo_to_send)
         return response
 
-    def get_all_pomodoros(self, all_account_info):
-        task_id_only = all_account_info[all_account_info['converted_memos'].apply(lambda x: 'task_id' in str(x))].copy()
-        pomodoros_only = task_id_only[task_id_only['converted_memos'].apply(lambda x: '==' in x['task_id'])].copy()
-        pomodoros_only['parent_task_id']=pomodoros_only['converted_memos'].apply(lambda x: x['task_id'].replace('==','__'))
+    def get_all_pomodoros(self):
+        task_id_only = self.memos[self.memos['memo_data'].apply(lambda x: 'task_id' in str(x))].copy()
+        pomodoros_only = task_id_only[task_id_only['memo_data'].apply(lambda x: '==' in x['task_id'])].copy()
+        pomodoros_only['parent_task_id']=pomodoros_only['memo_data'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
 
 

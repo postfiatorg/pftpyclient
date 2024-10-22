@@ -343,6 +343,10 @@ class WalletApp(wx.Frame):
         self.txt_pass = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
         sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
 
+        # enter username and password for debug purposes
+        self.txt_user.SetValue('windowstestuser1')
+        self.txt_pass.SetValue('W2g@Y79KD52*fl')
+
         # Login button
         self.btn_login = wx.Button(panel, label="Login")
         sizer.Add(self.btn_login, flag=wx.EXPAND | wx.ALL, border=5)
@@ -525,8 +529,7 @@ class WalletApp(wx.Frame):
         self.Fit()
 
         # Fetch and display key account details
-        all_account_info = self.task_manager.get_memo_detail_df_for_account()
-        key_account_details = self.task_manager.process_account_info(all_account_info)
+        key_account_details = self.task_manager.process_account_info()
 
         self.populate_summary_grid(key_account_details)
 
@@ -596,8 +599,7 @@ class WalletApp(wx.Frame):
 
     def update_key_account_details(self):
         if self.task_manager:
-            all_account_info = self.task_manager.get_memo_detail_df_for_account()
-            key_account_details = self.task_manager.process_account_info(all_account_info)
+            key_account_details = self.task_manager.process_account_info()
             self.populate_summary_grid(key_account_details)
 
     def run_bg_job(self, job):
@@ -669,30 +671,22 @@ class WalletApp(wx.Frame):
 
     def on_transaction_update_timer(self, _):
         logging.debug("Transaction update timer triggered")
-        self.task_manager.update_transactions()
+        self.task_manager.sync_transactions()
 
     def update_json_data(self, event):
         try:
-            all_account_info = self.task_manager.get_memo_detail_df_for_account()
-
             # Update Accepted tab
-            json_data = self.task_manager.convert_all_account_info_into_outstanding_task_df(
-                all_account_info=all_account_info
-            ).to_json()
+            json_data = self.task_manager.convert_all_account_info_into_outstanding_task_df().to_json()
             logging.debug(f"Updating Accepted tab with JSON data: {json_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=json_data, target="accepted"))
 
             # Update Rewards tab
-            rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df(
-                all_account_info=all_account_info
-            ).to_json()
+            rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df().to_json()
             logging.debug(f"Updating Rewards tab with JSON data: {rewards_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=rewards_data, target="rewards"))
 
             # Update Verification tab
-            verification_data = self.task_manager.convert_all_account_info_into_required_verification_df(
-                all_account_info=all_account_info
-            ).to_json()
+            verification_data = self.task_manager.convert_all_account_info_into_required_verification_df().to_json()
             logging.debug(f"Updating Verification tab with JSON data: {verification_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=verification_data, target="verification"))
             logging.debug("UpdateGridEvent posted for verification")
@@ -856,7 +850,7 @@ class WalletApp(wx.Frame):
         dialog = CustomDialog("Ask For Task", ["Task Request"])
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account()
+            all_account_info = self.task_manager.memos
             response = self.task_manager.request_post_fiat(request_message=request_message, all_account_info=all_account_info)
             message = self.task_manager.ux__convert_response_object_to_status_message(response)
             wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
@@ -869,7 +863,7 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             acceptance_string = values["Acceptance String"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account()
+            all_account_info = self.task_manager.memos
             response = self.task_manager.send_acceptance_for_task_id(
                 task_id=task_id,
                 acceptance_string=acceptance_string,
@@ -886,7 +880,7 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             refusal_reason = values["Refusal Reason"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account()
+            all_account_info = self.task_manager.memos
             response = self.task_manager.send_refusal_for_task(
                 task_id=task_id,
                 refusal_reason=refusal_reason,
@@ -903,7 +897,7 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             completion_string = values["Completion String"]
-            all_account_info = self.task_manager.get_memo_detail_df_for_account()
+            all_account_info = self.task_manager.memos
             response = self.task_manager.send_post_fiat_initial_completion(
                 completion_string=completion_string,
                 task_id=task_id,
@@ -916,7 +910,7 @@ class WalletApp(wx.Frame):
 
     def on_force_update(self, event):
         logging.info("Kicking off Force Update")
-        all_account_info = self.task_manager.get_memo_detail_df_for_account()
+        all_account_info = self.task_manager.memos
 
         try:
             verification_data = self.task_manager.convert_all_account_info_into_required_verification_df(
@@ -951,7 +945,7 @@ class WalletApp(wx.Frame):
     def on_submit_verification_details(self, event):
         task_id = self.txt_task_id.GetValue()
         response_string = self.txt_verification_details.GetValue()
-        all_account_info = self.task_manager.get_memo_detail_df_for_account()
+        all_account_info = self.task_manager.memos
         response = self.task_manager.send_post_fiat_verification_response(
             response_string=response_string,
             task_id=task_id,
