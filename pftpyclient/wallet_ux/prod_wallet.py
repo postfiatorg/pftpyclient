@@ -9,12 +9,21 @@ from threading import Thread
 import json
 import wx.lib.newevent
 import nest_asyncio
-import logging
 from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
 from pftpyclient.task_manager.basic_tasks import WalletInitiationFunctions
 import webbrowser
 import os
-from pftpyclient.basic_utilities.create_shortcut import create_shortcut
+from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
+from loguru import logger
+from pathlib import Path
+
+# Configure the logger at module level
+wx_sink = configure_logger(
+    log_to_file=True,
+    output_directory=Path.cwd() / "pftpyclient",
+    log_filename="prod_wallet.log",
+    level="DEBUG"
+)
 
 # Try to use the default browser
 if os.name == 'nt':
@@ -22,9 +31,6 @@ if os.name == 'nt':
         webbrowser.get('windows-default')
     except webbrowser.Error:
         pass
-
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Apply the nest_asyncio patch
 nest_asyncio.apply()
@@ -130,6 +136,10 @@ class WalletApp(wx.Frame):
         self.url = url
         self.wallet = None
         self.build_ui()
+
+        # Add the wx handler to the logger after UI is built
+        update_wx_sink(self.log_text)
+
         self.worker = None
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.Bind(EVT_UPDATE_GRID, self.on_update_grid)
@@ -324,6 +334,16 @@ class WalletApp(wx.Frame):
         self.sizer.Add(self.tabs, 1, wx.EXPAND)
         self.panel.SetSizer(self.sizer)
 
+        # Log tab
+        self.log_tab = wx.Panel(self.tabs)
+        self.tabs.AddPage(self.log_tab, "Log")
+        self.log_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.log_tab.SetSizer(self.log_sizer)
+
+        # Create a text control for logs
+        self.log_text = wx.TextCtrl(self.log_tab, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        self.log_sizer.Add(self.log_text, 1, wx.EXPAND | wx.ALL, 5)
+
         # Populate Accepted tab grids
         self.populate_accepted_grid(json_data)
 
@@ -494,7 +514,7 @@ class WalletApp(wx.Frame):
             'Confirm Password_Input': self.txt_confirm_password.GetValue(),
         }
 
-        logging.debug(f"input_map: {input_map}")
+        logger.debug(f"input_map: {input_map}")
 
         if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
             wx.MessageBox('Passwords Do Not Match Please Retry', 'Info', wx.OK | wx.ICON_INFORMATION)
@@ -515,7 +535,7 @@ class WalletApp(wx.Frame):
         self.wallet = self.task_manager.user_wallet
         classic_address = self.wallet.classic_address
 
-        logging.info(f"Logged in as {username}")
+        logger.info(f"Logged in as {username}")
 
         # Hide login panel and show tabs
         self.login_panel.Hide()
@@ -614,7 +634,7 @@ class WalletApp(wx.Frame):
         self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
     def update_tokens(self, account_address):
-        logging.debug(f"Fetching token balances for account: {account_address}")
+        logger.debug(f"Fetching token balances for account: {account_address}")
         try:
             client = xrpl.clients.JsonRpcClient("https://s2.ripple.com:51234")
             account_lines = xrpl.models.requests.AccountLines(
@@ -622,27 +642,27 @@ class WalletApp(wx.Frame):
                 ledger_index="validated"
             )
             response = client.request(account_lines)
-            logging.debug(f"AccountLines response: {response.result}")
+            logger.debug(f"AccountLines response: {response.result}")
 
             if not response.is_successful():
-                logging.error(f"Error fetching AccountLines: {response}")
+                logger.error(f"Error fetching AccountLines: {response}")
                 return
 
             lines = response.result.get('lines', [])
-            logging.debug(f"Account lines: {lines}")
+            logger.debug(f"Account lines: {lines}")
 
             pft_balance = 0.0
             issuer_address = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
             for line in lines:
-                logging.debug(f"Processing line: {line}")
+                logger.debug(f"Processing line: {line}")
                 if line['currency'] == 'PFT' and line['account'] == issuer_address:
                     pft_balance = float(line['balance'])
-                    logging.debug(f"Found PFT balance: {pft_balance}")
+                    logger.debug(f"Found PFT balance: {pft_balance}")
 
             self.lbl_pft_balance.SetLabel(f"PFT Balance: {pft_balance}")
 
         except Exception as e:
-            logging.exception(f"Exception in update_tokens: {e}")
+            logger.exception(f"Exception in update_tokens: {e}")
 
     def on_close(self, event):
         if self.worker:
@@ -670,37 +690,37 @@ class WalletApp(wx.Frame):
         self.tx_update_timer.Start(60000)  # Update every 60 seconds (adjust as needed)
 
     def on_transaction_update_timer(self, _):
-        logging.debug("Transaction update timer triggered")
+        logger.debug("Transaction update timer triggered")
         self.task_manager.sync_transactions()
 
     def update_json_data(self, event):
         try:
             # Update Accepted tab
             json_data = self.task_manager.convert_all_account_info_into_outstanding_task_df().to_json()
-            logging.debug(f"Updating Accepted tab with JSON data: {json_data}")
+            logger.debug(f"Updating Accepted tab with JSON data: {json_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=json_data, target="accepted"))
 
             # Update Rewards tab
             rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df().to_json()
-            logging.debug(f"Updating Rewards tab with JSON data: {rewards_data}")
+            logger.debug(f"Updating Rewards tab with JSON data: {rewards_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=rewards_data, target="rewards"))
 
             # Update Verification tab
             verification_data = self.task_manager.convert_all_account_info_into_required_verification_df().to_json()
-            logging.debug(f"Updating Verification tab with JSON data: {verification_data}")
+            logger.debug(f"Updating Verification tab with JSON data: {verification_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=verification_data, target="verification"))
-            logging.debug("UpdateGridEvent posted for verification")
+            logger.debug("UpdateGridEvent posted for verification")
 
         except Exception as e:
-            logging.exception(f"Error updating JSON data: {e}")
+            logger.exception(f"Error updating JSON data: {e}")
 
     def on_update_grid(self, event):
-        logging.debug(f"Updating grid with target: {getattr(event, 'target', 'accepted')}")
+        logger.debug(f"Updating grid with target: {getattr(event, 'target', 'accepted')}")
         if hasattr(event, 'target'):
             if event.target == "rewards":
                 self.populate_rewards_grid(event.json_data)
             elif event.target == "verification":
-                logging.debug("Updating verification grid")
+                logger.debug("Updating verification grid")
                 self.populate_verification_grid(event.json_data)
             else:
                 self.populate_accepted_grid(event.json_data)
@@ -768,11 +788,11 @@ class WalletApp(wx.Frame):
         self.accepted_grid.SetColSize(2, 300)  # Adjust width as needed
 
     def populate_rewards_grid(self, json_data):
-        logging.debug("Populating rewards grid")
+        logger.debug("Populating rewards grid")
         try:
             data = json.loads(json_data)
             if not data: 
-                logging.debug("No data to populate rewards grid")
+                logger.debug("No data to populate rewards grid")
                 self.rewards_grid.ClearGrid()
                 return
             
@@ -806,14 +826,14 @@ class WalletApp(wx.Frame):
             self.rewards_grid.SetColSize(3, 100)  # Adjust width as needed for payout
 
         except Exception as e:
-            logging.error(f"Error populating rewards grid: {e}")
+            logger.error(f"Error populating rewards grid: {e}")
 
     def populate_verification_grid(self, json_data):
-        logging.debug("Updating verification grid")
+        logger.debug("Updating verification grid")
         try:
             data = json.loads(json_data)
             if not data:
-                logging.debug("No data to populate verification grid")
+                logger.debug("No data to populate verification grid")
                 self.verification_grid.ClearGrid()
                 return
 
@@ -844,7 +864,7 @@ class WalletApp(wx.Frame):
             self.verification_grid.SetColSize(2, 300)  # Adjust width as needed
 
         except Exception as e:
-            logging.error(f"Error populating verification grid: {e}")
+            logger.error(f"Error populating verification grid: {e}")
 
     def on_ask_for_task(self, event):
         dialog = CustomDialog("Ask For Task", ["Task Request"])
@@ -909,7 +929,7 @@ class WalletApp(wx.Frame):
         dialog.Destroy()
 
     def on_force_update(self, event):
-        logging.info("Kicking off Force Update")
+        logger.info("Kicking off Force Update")
         all_account_info = self.task_manager.memos
 
         try:
@@ -918,13 +938,13 @@ class WalletApp(wx.Frame):
             ).to_json()
             self.populate_verification_grid(verification_data)
         except:
-            logging.error("FAILED VERIFICATION UPDATE")
+            logger.error("FAILED VERIFICATION UPDATE")
 
         try:
             key_account_details = self.task_manager.process_account_info(all_account_info)
             self.populate_summary_grid(key_account_details)
         except:
-            logging.error("FAILED UPDATING SUMMARY DATA")
+            logger.error("FAILED UPDATING SUMMARY DATA")
 
         try:
             rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df(
@@ -932,7 +952,7 @@ class WalletApp(wx.Frame):
             ).to_json()
             self.populate_rewards_grid(rewards_data)
         except:
-            logging.error("FAILED UPDATING REWARDS DATA")
+            logger.error("FAILED UPDATING REWARDS DATA")
 
         try:
             acceptance_data = self.task_manager.convert_all_account_info_into_outstanding_task_df(
@@ -940,7 +960,7 @@ class WalletApp(wx.Frame):
             ).to_json()
             self.populate_accepted_grid(acceptance_data)
         except:
-            logging.error("FAILED UPDATING ACCEPTANCE DATA")
+            logger.error("FAILED UPDATING ACCEPTANCE DATA")
 
     def on_submit_verification_details(self, event):
         task_id = self.txt_task_id.GetValue()
@@ -968,7 +988,7 @@ class WalletApp(wx.Frame):
         )
         formatted_response = self.format_response(response)
 
-        logging.info(f"XRP Payment Result: {formatted_response}")
+        logger.info(f"XRP Payment Result: {formatted_response}")
 
         dialog = SelectableMessageDialog(self, "XRP Payment Result", formatted_response)
         dialog.ShowModal()
@@ -980,11 +1000,11 @@ class WalletApp(wx.Frame):
                                                 memo=self.txt_pft_memo.GetValue()
         )
 
-        logging.debug(f"PFT Payment Response: {response}")
+        logger.debug(f"PFT Payment Response: {response}")
 
         formatted_response = self.format_response(response)
 
-        logging.info(f"PFT Payment Result: {formatted_response}")
+        logger.info(f"PFT Payment Result: {formatted_response}")
 
         dialog = SelectableMessageDialog(self, "PFT Payment Result", formatted_response)
         dialog.ShowModal()
@@ -1023,7 +1043,7 @@ class WalletApp(wx.Frame):
                 f"See transaction details at: <a href='{livenet_link}'>{livenet_link}</a>\n\n"
             )
 
-            logging.debug(f"Formatted Response: {formatted_response}")
+            logger.debug(f"Formatted Response: {formatted_response}")
 
             # Add memo if present
             if tx_json.get('Memos'):
@@ -1042,12 +1062,12 @@ class WalletApp(wx.Frame):
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
         url = link.GetHref()
-        logging.debug(f"Link clicked: {url}")
+        logger.debug(f"Link clicked: {url}")
         try:
             webbrowser.open(url, new=2)
-            logging.debug(f"Attempted to open URL: {url}")
+            logger.debug(f"Attempted to open URL: {url}")
         except Exception as e:
-            logging.error(f"Failed to open URL {url}. Error: {str(e)}")
+            logger.error(f"Failed to open URL {url}. Error: {str(e)}")
 
 class SelectableMessageDialog(wx.Dialog):
     def __init__(self, parent, title, message):
@@ -1089,7 +1109,7 @@ def main():
         "testnet": "wss://s.altnet.rippletest.net:51233",
     }
 
-    logging.info("Starting Post Fiat Wallet")
+    logger.info("Starting Post Fiat Wallet")
     app = wx.App()
     frame = WalletApp(networks["mainnet"])
     frame.Show()

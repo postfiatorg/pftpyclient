@@ -20,7 +20,7 @@ from sec_cik_mapper import StockMapper
 import datetime
 import os 
 from pftpyclient.basic_utilities.settings import DATADUMP_DIRECTORY_PATH
-import logging
+from loguru import logger
 import time
 import json
 import ast
@@ -133,14 +133,14 @@ class WalletInitiationFunctions:
                     break
 
             if not wallet_at_front_of_doc:
-                logging.warning(f"No XRP address found in the first 5 lines of the document")
+                logger.warning(f"No XRP address found in the first 5 lines of the document")
                 return balance
 
             account_info = self.get_account_info(wallet_at_front_of_doc)
             balance = Decimal(account_info['Balance'])
 
         except Exception as e:
-            logging.error(f"Error: {e}")
+            logger.error(f"Error: {e}")
 
         return balance
 
@@ -165,7 +165,7 @@ class WalletInitiationFunctions:
         has_variables_defined = False
         zero_balance = True
         balance = self.check_if_there_is_funded_account_at_front_of_google_doc(google_url=input_map['Google Doc Share Link_Input'])
-        logging.debug(f"balance: {balance}")
+        logger.debug(f"balance: {balance}")
 
         if balance > 0:
             zero_balance = False
@@ -278,40 +278,68 @@ class PostFiatTaskManager:
 
     ## GENERIC UTILITY FUNCTIONS 
 
-    def save_transactions_to_csv(self):
-        self.transactions.to_csv(self.tx_history_csv_filepath, index=False)
-        logging.debug(f"Saved {len(self.transactions)} transactions to {self.tx_history_csv_filepath}")
+    def save_dataframe_to_csv(self, df, filepath, description):
+        """
+        Generic method to save a dataframe to a CSV file with error handling and logging
+        
+        :param dataframe: pandas Dataframe to save
+        :param filepath: str, path to the CSV file
+        :param description: str, description of the data being saved (i.e. "transactions" or "memos")
+        """
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-    def save_memos_to_csv(self):
-        self.memos.to_csv(self.tx_history_csv_filepath, index=False)
-        logging.debug(f"Saved {len(self.memos)} memos to {self.memos_csv_filepath}")
+            # save to a temporary file first, and then replace the existing file if successful
+            temp_filepath = f"{filepath}.tmp"
+            df.to_csv(temp_filepath, index=False)
+            os.replace(temp_filepath, filepath)
+
+            logger.info(f"Successfully saved {description} to {filepath}")
+        except PermissionError:
+            logger.error(f"Permission denied when trying to save {description} to {filepath}")
+        except IOError as e:
+            logger.error(f"IOError when trying to save {description} to {filepath}: {e}")
+        except pd.errors.EmptyDataError:
+            logger.warning(f"No {description} to save. The dataframe is empty.")
+        except Exception as e:
+            logger.error(f"Unexpected error saving {description} to {filepath}: {e}")
+
+    def save_transactions_to_csv(self):
+        self.save_dataframe_to_csv(self.transactions, self.tx_history_csv_filepath, "transactions")
 
     def load_transactions_from_csv(self):
         """ Loads the transactions from the CSV file into a dataframe, and deserializes some columns"""
         tx_df = None
-        if os.path.exists(self.tx_history_csv_filepath):
-            logging.debug(f"Loading transactions from {self.tx_history_csv_filepath}")
+        file_path = self.tx_history_csv_filepath
+        if os.path.exists(file_path):
+            logger.debug(f"Loading transactions from {file_path}")
             try:
-                tx_df = pd.read_csv(self.tx_history_csv_filepath)
+                tx_df = pd.read_csv(file_path)
 
                 # deserialize columns
                 for col in ['meta', 'tx_json']:
                     if col in tx_df.columns:
                         tx_df[col] = tx_df[col].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else x)
 
+            except pd.errors.EmptyDataError:
+                logger.warning(f"The file {file_path} is empty. Creating a new DataFrame.")
+                return pd.DataFrame()
+            except (IOError, pd.errors.ParserError) as e:
+                logger.error(f"Error reading {file_path}: {e}. Deleting and creating a new DataFrame.")
+                os.remove(file_path)
+                return pd.DataFrame()
             except Exception as e:
-                logging.error(f"Error loading transactions from {self.tx_history_csv_filepath}: {e}")
-                os.remove(self.tx_history_csv_filepath) # delete the file, it's corrupt or empty
+                logger.error(f"Unexpected error loading transactions from {file_path}: {e}")
                 return pd.DataFrame()
             else:
                 return tx_df
 
-        logging.debug(f"No existing transaction history file found at {self.tx_history_csv_filepath}")
+        logger.warning(f"No existing transaction history file found at {self.tx_history_csv_filepath}")
         return pd.DataFrame() # empty dataframe if file does not exist
-
+    
     def get_new_transactions(self, last_known_ledger_index):
         """Retrieves new transactions from the node after the last known transaction date"""
-        logging.debug(f"Getting new transactions after ledger index {last_known_ledger_index}")
+        logger.debug(f"Getting new transactions after ledger index {last_known_ledger_index}")
         return self.get_account_transactions(
             account_address=self.user_wallet.classic_address,
             ledger_index_min=last_known_ledger_index,
@@ -321,7 +349,7 @@ class PostFiatTaskManager:
 
     def sync_transactions(self):
         """ Checks for new transactions and caches them locally. Also triggers memo update"""
-        logging.debug("Updating transactions")
+        logger.debug("Updating transactions")
 
         # Attempt to load transactions from local csv
         if self.transactions.empty: 
@@ -334,20 +362,20 @@ class PostFiatTaskManager:
             last_known_ledger_index = -1
         else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
             last_known_ledger_index = self.transactions['ledger_index'].max() + 1
-            logging.debug(f"Last known ledger index: {last_known_ledger_index}")
+            logger.debug(f"Last known ledger index: {last_known_ledger_index}")
 
         # fetch new transactions from the node
         new_tx_list = self.get_new_transactions(last_known_ledger_index)
 
         # Add new transactions to the dataframe
         if new_tx_list:
-            logging.debug(f"Adding {len(new_tx_list)} new transactions...")
+            logger.debug(f"Adding {len(new_tx_list)} new transactions...")
             new_tx_df = pd.DataFrame(new_tx_list)
             self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
             self.save_transactions_to_csv()
             self.sync_memos(new_tx_df)
         else:
-            logging.debug("No new transactions found. Finished updating local tx history")
+            logger.debug("No new transactions found. Finished updating local tx history")
         
     def sync_memos(self, new_tx_df):
         """ Updates the memos dataframe with new memos from the new transactions. Memos are serialized into dicts"""
@@ -384,9 +412,7 @@ class PostFiatTaskManager:
         # Concatenate new memos to existing memos and drop duplicates
         self.memos = pd.concat([self.memos, new_memo_df], ignore_index=True).drop_duplicates(subset=['hash'])
 
-        self.save_memos_to_csv()
-
-        logging.debug(f"Added {len(new_memo_df)} new memos")
+        logger.debug(f"Added {len(new_memo_df)} new memos")
 
     def to_hex(self,string):
         return binascii.hexlify(string.encode()).decode()
@@ -537,7 +563,7 @@ class PostFiatTaskManager:
         are reverse signed.
         """
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
-        logging.debug("Getting all accounts holding PFT tokens...")
+        logger.debug("Getting all accounts holding PFT tokens...")
         response = client.request(xrpl.models.requests.AccountLines(
             account=self.pft_issuer,
             ledger_index="validated",
@@ -559,12 +585,12 @@ class PostFiatTaskManager:
     def handle_trust_line(self):
         """ This function checks if the user has a trust line to the PFT token
         and if not establishes one"""
-        logging.debug("Checking if trust line exists...")
+        logger.debug("Checking if trust line exists...")
         if not self.has_trust_line():
             self.generate_trust_line_to_pft_token()
-            logging.debug("Trust line created")
+            logger.debug("Trust line created")
         else:
-            logging.debug("Trust line already exists")
+            logger.debug("Trust line already exists")
 
     def send_pft(self, amount, destination, memo="", batch=False):
         """ Sends PFT tokens to a destination address with optional memo """
@@ -663,7 +689,7 @@ class PostFiatTaskManager:
                                 ledger_index_max=-1, 
                                 limit=10
                                 ):
-        logging.debug(f"Getting transactions for account {account_address} with ledger index min {ledger_index_min} and max {ledger_index_max} and limit {limit}")
+        logger.debug(f"Getting transactions for account {account_address} with ledger index min {ledger_index_min} and max {ledger_index_max} and limit {limit}")
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
         all_transactions = []
         marker = None
@@ -679,7 +705,7 @@ class PostFiatTaskManager:
 
         while iteration_count < max_iterations:
             iteration_count += 1
-            logging.debug(f"Iteration {iteration_count}")
+            logger.debug(f"Iteration {iteration_count}")
             print(f"current marker: {marker}")
 
             request = AccountTx(
@@ -696,36 +722,36 @@ class PostFiatTaskManager:
                 request_dict = request.to_dict()
                 json.dumps(request_dict)  # This will raise an error if the request is not serializable
             except TypeError as e:
-                logging.error(f"Request is not serializable: {e}")
-                logging.error(f"Problematic request data: {request_dict}")
+                logger.error(f"Request is not serializable: {e}")
+                logger.error(f"Problematic request data: {request_dict}")
                 break # stop if request is not serializable
 
             try:
                 response = client.request(request)
                 if response.is_successful():
                     transactions = response.result.get("transactions", [])
-                    logging.debug(f"Retrieved {len(transactions)} transactions")
+                    logger.debug(f"Retrieved {len(transactions)} transactions")
                     all_transactions.extend(transactions)
                 else:
-                    logging.error(f"Error in XRPL response: {response.status}")
+                    logger.error(f"Error in XRPL response: {response.status}")
                     break
             except Exception as e:
-                logging.error(f"Error making XRPL request: {e}")
+                logger.error(f"Error making XRPL request: {e}")
                 break
 
             if "marker" in response.result:
                 if response.result["marker"] == previous_marker:
-                    logging.warning("Marker not advancing, stopping iteration")
+                    logger.warning("Marker not advancing, stopping iteration")
                     break # stop if marker not advancing
                 previous_marker = marker
                 marker = response.result["marker"] # Update marker for next iteration
-                logging.debug("More transactions available. Fetching next batch...")
+                logger.debug("More transactions available. Fetching next batch...")
             else:
-                logging.debug("No more transactions available")
+                logger.debug("No more transactions available")
                 break
         
         if iteration_count == max_iterations:
-            logging.warning("Reached maximum iteration count. Stopping loop...")
+            logger.warning("Reached maximum iteration count. Stopping loop...")
 
         return all_transactions
     
@@ -806,7 +832,7 @@ class PostFiatTaskManager:
         
     # def get_memo_detail_df_for_account(self):
     #     """ This function gets all the memo details for a given account """
-    #     logging.debug(f"Getting memo details for account {self.user_wallet.classic_address}")
+    #     logger.debug(f"Getting memo details for account {self.user_wallet.classic_address}")
 
     #     validated_tx = pd.DataFrame(self.transactions)
 
@@ -847,7 +873,7 @@ class PostFiatTaskManager:
             ]
         
         if len(redux_tx_list) == 0:
-            logging.warning("No Google Doc context link found")
+            logger.warning("No Google Doc context link found")
             return None
         
         # Get the most recent google doc context link
@@ -879,13 +905,13 @@ class PostFiatTaskManager:
     def handle_genesis(self):
         """ Checks if the user has sent a genesis to the node, and sends one if not """
         if not self.genesis_sent():
-            logging.debug("User has not sent genesis, sending...")
+            logger.debug("User has not sent genesis, sending...")
             self.send_genesis()
         else:
-            logging.debug("User has already sent genesis, skipping...")
+            logger.debug("User has already sent genesis, skipping...")
 
     def genesis_sent(self):
-        logging.debug("Checking if user has sent genesis...")
+        logger.debug("Checking if user has sent genesis...")
         user_genesis = self.get_user_genesis_destinations()
         return self.default_node in user_genesis['destinations']
     
@@ -893,7 +919,7 @@ class PostFiatTaskManager:
         """ Sends a user genesis transaction to the default node 
         Currently requires 7 PFT
         """
-        logging.debug("Initializing Node Genesis Transaction...")
+        logger.debug("Initializing Node Genesis Transaction...")
         genesis_memo = self.construct_basic_postfiat_memo(
             user=self.credential_manager.postfiat_username,
             task_id=self.generate_custom_id(), 
@@ -904,10 +930,10 @@ class PostFiatTaskManager:
     # def handle_google_doc(self):
     #     """Checks for google doc and prompts user to send if not found"""
     #     if not self.google_doc_sent():
-    #         logging.debug("Google Doc not found.")
+    #         logger.debug("Google Doc not found.")
     #         self.send_google_doc()
     #     else:
-    #         logging.debug("Google Doc already sent, skipping...")
+    #         logger.debug("Google Doc already sent, skipping...")
 
     # def google_doc_sent(self):
     #     return self.default_node in self.retrieve_context_doc()
@@ -1125,7 +1151,7 @@ class PostFiatTaskManager:
         # Send the memo to the default node
         response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
 
-        logging.debug(f"response: {response}")
+        logger.debug(f"response: {response}")
 
         account = response.result['Account']
         destination = response.result['Destination']
