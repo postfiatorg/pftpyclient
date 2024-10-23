@@ -316,8 +316,6 @@ class PostFiatTaskManager:
         # Attempt to load transactions from local csv
         if self.transactions.empty: 
             new_tx_df = self.load_transactions_from_csv()
-            self.transactions = new_tx_df
-            self.sync_memos(new_tx_df)
 
         # Choose ledger index to start sync from
         if self.transactions.empty:
@@ -369,7 +367,7 @@ class PostFiatTaskManager:
         new_memo_df['ledger_index'] = new_memo_df['tx_json'].apply(lambda x: x['ledger_index'])
 
         # Flag rows with PFT
-        new_memo_df['is_pft'] = new_memo_df['tx_json'].apply(lambda x: self.check_if_tx_pft(x))
+        new_memo_df['is_pft'] = new_memo_df['tx_json'].apply(is_pft_transaction)
 
         # Concatenate new memos to existing memos and drop duplicates
         self.memos = pd.concat([self.memos, new_memo_df], ignore_index=True).drop_duplicates(subset=['hash'])
@@ -392,15 +390,6 @@ class PostFiatTaskManager:
         ascii_string = bytes_object.decode("utf-8")
         return ascii_string
     
-    def check_if_tx_pft(self,tx):
-        ret= False
-        try:
-            if tx['DeliverMax']['currency'] == "PFT":
-                ret = True
-        except:
-            pass
-        return ret
-    
     def generate_custom_id(self):
         """ These are the custom IDs generated for each task that is generated
         in a Post Fiat Node """ 
@@ -414,45 +403,6 @@ class PostFiatTaskManager:
     
     def send_xrp(self, amount, destination, memo=""):
         return send_xrp(self.mainnet_url, self.user_wallet, amount, destination, memo)
-
-    def classify_task_string(self,string):
-        """ These are the canonical classifications for task strings 
-        on a Post Fiat Node
-        """ 
-        categories = {
-                'ACCEPTANCE': ['ACCEPTANCE REASON ___'],
-                'PROPOSAL': [' .. ','PROPOSED PF ___'],
-                'REFUSAL': ['REFUSAL REASON ___'],
-                'VERIFICATION_PROMPT': ['VERIFICATION PROMPT ___'],
-                'VERIFICATION_RESPONSE': ['VERIFICATION RESPONSE ___'],
-                'REWARD': ['REWARD RESPONSE __'],
-                'TASK_OUTPUT': ['COMPLETION JUSTIFICATION ___'],
-                'USER_GENESIS': ['USER GENESIS __'],
-                'REQUEST_POST_FIAT ':['REQUEST_POST_FIAT ___']
-            }
-    
-        for category, keywords in categories.items():
-            if any(keyword in string for keyword in keywords):
-                return category
-    
-        return 'UNKNOWN'
-
-    def determine_if_map_is_task_id(self,memo_dict):
-        """ Note that technically only the task ID recognition is needed
-        at a later date might want to implement forced user and output delineators 
-        if someone spams the system with task IDs
-        """
-        memo_string = str(memo_dict)
-
-        # Check for task ID pattern
-        task_id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
-        if re.search(task_id_pattern, memo_string):
-            return True
-        
-        # Check for required fields
-        required_fields = ['user:', 'full_output:']
-        return all(field in memo_string for field in required_fields)
-
 
     def convert_memo_dict(self, memo_dict):
         """Constructs a memo object with user, task_id, and full_output from hex-encoded values."""
@@ -759,7 +709,7 @@ class PostFiatTaskManager:
     def output_account_address_node_association(self):
         """this takes the account info frame and figures out what nodes
          the account is associating with and returns them in a dataframe """
-        self.memos['valid_task_id']=self.memos['memo_data'].apply(lambda x:self.determine_if_map_is_task_id(x))
+        self.memos['valid_task_id']=self.memos['memo_data'].apply(is_task_id)
         node_output_df = self.memos[self.memos['message_type']=='INCOMING'][['valid_task_id','account']].groupby('account').sum()
    
         return node_output_df[node_output_df['valid_task_id']>0]
@@ -856,57 +806,122 @@ class PostFiatTaskManager:
     #         # Send the Google Doc context link to the default node
     #         self.send_google_doc_to_node_if_not_sent(user_google_doc = user_google_doc)
 
-
-
-    def convert_all_account_info_into_simplified_task_frame(self):
-        """ This takes all the Post Fiat Tasks and outputs them into a simplified
-        dataframe of task information with embedded classifications 
+    def get_core_task_df(self):
+        """ This takes all the Post Fiat memos and outputs them into a simplified
+        dataframe of task information with embedded classifications, with columns:
+        user,task_id,full_output,hash,node_account,datetime,task_type 
         """ 
 
-        simplified_task_frame = self.memos[self.memos['memo_data'].apply(lambda x: self.determine_if_map_is_task_id(x))].copy()
-        simplified_task_frame = simplified_task_frame[simplified_task_frame['tx_json'].apply(lambda 
-                                                                                        x: x['DeliverMax']).apply(lambda x: 
-                                                                                                                    "'currency': 'PFT'" in str(x))].copy()
-        def add_field_to_map(xmap, field, field_value):
-            xmap[field] = field_value
-            return xmap
+        # Filter for memos that are task IDs and PFT transactions
+        filtered_df = self.memos[
+            self.memos['memo_data'].apply(is_task_id) & 
+            self.memos['tx_json'].apply(is_pft_transaction)
+        ]
         
-        simplified_task_frame['pft_abs']= simplified_task_frame['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)
-        simplified_task_frame['directional_pft']=simplified_task_frame['message_type'].map({'INCOMING':1,
-            'OUTGOING':-1}) * simplified_task_frame['pft_abs']
+        # Add the transaction hash, node account, and datetime to the dataframe
+        fields_to_add = ['hash','node_account','datetime']
+        filtered_df['memo_data'] = filtered_df.apply(
+            lambda row: {**row['memo_data'], **{field: row[field] for field in fields_to_add}} # ** is used to unpack the dictionaries
+            , axis=1
+        )
         
-        for xfield in ['hash','node_account','datetime']:
-            simplified_task_frame['memo_data'] = simplified_task_frame.apply(lambda x: add_field_to_map(x['memo_data'],
-                xfield,x[xfield]),1)
-            
-        core_task_df = pd.DataFrame(list(simplified_task_frame['memo_data'])).copy()
-        core_task_df['task_type']=core_task_df['full_output'].apply(lambda x: self.classify_task_string(x))
-        
+        # Convert the memo_data column to a dataframe and add the task type
+        core_task_df = pd.DataFrame(filtered_df['memo_data'].tolist())
+        core_task_df['task_type'] = core_task_df['full_output'].apply(classify_task_string)
 
         return core_task_df
 
+    def get_proposals_df(self):
+        """ This reduces memos dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
-    def convert_all_account_info_into_outstanding_task_df(self):
-        """ This reduces all account info into a simplified dataframe of proposed 
-        and accepted tasks """ 
-        task_frame = self.convert_all_account_info_into_simplified_task_frame()
-        task_type_map = task_frame.groupby('task_id').last()[['task_type']].copy()
-        task_id_to_proposal = task_frame[task_frame['task_type']
-        =='PROPOSAL'].groupby('task_id').first()['full_output']
+        # Get the core task dataframe
+        task_df = self.get_core_task_df()
+
+        # Filter for only PROPOSAL, ACCEPTANCE, and REFUSAL rows
+        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','ACCEPTANCE','REFUSAL'])]
+
+        # Create new 'RESPONSE' column to combine acceptance and refusal
+        filtered_df['response_type'] = filtered_df['task_type'].apply(lambda x: 'RESPONSE' if x in ['ACCEPTANCE','REFUSAL'] else x)
+
+        # Pivot the dataframe to get proposals and responses side by side and reset index to make task_id a column
+        pivoted_df = filtered_df.pivot_table(index='task_id', columns='response_type', values='full_output', aggfunc='first').reset_index()
+
+        # Rename the columns for clarity
+        pivoted_df.rename(columns={'PROPOSAL':'proposal', 'RESPONSE':'response'}, inplace=True)
+
+        # Clean up the proposal and response columns
+        pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('ACCEPTANCE REASON ___ ','ACCEPTED: ').replace('nan',''))
+        pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('REFUSAL REASON ___ ','REFUSED: ').replace('nan',''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
+
+        # Reverse order to get the most recent proposals first
+        result_df = pivoted_df.iloc[::-1].reset_index(drop=True)
+
+        return result_df
+    
+    def get_verification_df(self):
+        """ This reduces memos dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
+
+        # Get the core task dataframe
+        task_df = self.get_core_task_df()
+
+        # Filter for PROPOSAL and VERIFICATION_PROMPT rows
+        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','VERIFICATION_PROMPT'])]
+
+        # Pivot the dataframe to get proposals and verification prompts side by side and reset index to make task_id a column
+        pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index()
+
+        # Rename columns for clarity
+        pivoted_df.rename(columns={'PROPOSAL':'proposal', 'VERIFICATION_PROMPT':'verification'}, inplace=True)
+
+        # clean up the proposal and verification columns
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___',''))
+        pivoted_df['verification'] = pivoted_df['verification'].apply(lambda x: str(x).replace('VERIFICATION PROMPT ___',''))
+
+        # Reverse order to get the most recent proposals first
+        result_df = pivoted_df.iloc[::-1].reset_index(drop=True)
+
+        # Remove rows where verification is "nan"
+        result_df = result_df[result_df['verification'] != 'nan'].reset_index(drop=True)
+
+        return result_df
+    
+    def get_rewards_df(self):
+        """ This reduces memos dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
+
+        # Get the core task dataframe
+        task_df = self.get_core_task_df()
+
+        # Filter for only PROPOSAL and REWARD rows
+        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','REWARD'])]
+
+        # Pivot the dataframe to get proposals and rewards side by side and reset index to make task_id a column
+        pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index()
+
+        # Rename the columns for clarity
+        pivoted_df.rename(columns={'PROPOSAL':'proposal', 'REWARD':'reward'}, inplace=True)
+
+        # Clean up the proposal and reward columns
+        pivoted_df['reward'] = pivoted_df['reward'].apply(lambda x: str(x).replace('REWARD RESPONSE __ ',''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
+
+        # Reverse order to get the most recent proposals first
+        result_df = pivoted_df.iloc[::-1].reset_index(drop=True)
+
+        # Add PFT value information
+        pft_only = self.memos[self.memos['tx_json'].apply(is_pft_transaction)].copy()
+        pft_only['pft_value'] = pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float) * pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
+        pft_only['task_id'] = pft_only['memo_data'].apply(lambda x: x['task_id'])
         
-        task_id_to_acceptance = task_frame[task_frame['task_type']
-        =='ACCEPTANCE'].groupby('task_id').first()['full_output']
-        acceptance_frame = pd.concat([task_id_to_proposal,task_id_to_acceptance],axis=1)
-        acceptance_frame.columns=['proposal','acceptance_raw']
-        acceptance_frame['acceptance']=acceptance_frame['acceptance_raw'].apply(lambda x: str(x).replace('ACCEPTANCE REASON ___ ',
-                                                                                                         '').replace('nan',''))
-        acceptance_frame['proposal']=acceptance_frame['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ',
-                                                                                                         '').replace('nan',''))
-        raw_proposals_and_acceptances = acceptance_frame[['proposal','acceptance']].copy()
-        proposed_or_accepted_only = list(task_type_map[(task_type_map['task_type']=='ACCEPTANCE')|
-        (task_type_map['task_type']=='PROPOSAL')].index)
-        op= raw_proposals_and_acceptances[raw_proposals_and_acceptances.index.get_level_values(0).isin(proposed_or_accepted_only)]
-        return op
+        pft_rewards_only = pft_only[pft_only['memo_data'].apply(lambda x: 'REWARD RESPONSE __' in x['full_output'])].copy()
+        task_id_to_payout = pft_rewards_only.groupby('task_id').last()['pft_value']
+        
+        result_df['payout'] = result_df['task_id'].map(task_id_to_payout)
+
+        # Remove rows where payout is NaN
+        result_df = result_df[result_df['payout'].notna()].reset_index(drop=True)
+
+        return result_df
 
     def send_acceptance_for_task_id(self, task_id, acceptance_string):
         """ 
@@ -918,7 +933,7 @@ class PostFiatTaskManager:
         all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                 transaction_limit=5000)
         """
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
+        simplified_task_frame = self.get_core_task_df()
         all_task_types = simplified_task_frame[simplified_task_frame['task_id']
          == task_id]['task_type'].unique()
         if (('REFUSAL' in all_task_types) 
@@ -960,7 +975,7 @@ class PostFiatTaskManager:
         all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                 transaction_limit=5000)
         """
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
+        simplified_task_frame = self.get_core_task_df()
         task_statuses = simplified_task_frame[simplified_task_frame['task_id'] 
         == task_id]['task_type'].unique()
 
@@ -1004,7 +1019,7 @@ class PostFiatTaskManager:
         all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                 transaction_limit=5000)
         """
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
+        simplified_task_frame = self.get_core_task_df()
         
         # Ensure the message has the correct prefix
         if 'REQUEST_POST_FIAT ___' not in request_message:
@@ -1039,7 +1054,7 @@ class PostFiatTaskManager:
         all_account_info = self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                                                                 transaction_limit=5000)
         """
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
+        simplified_task_frame = self.get_core_task_df()
         matching_task = simplified_task_frame[simplified_task_frame['task_id'] == task_id]#
         
         if matching_task.empty:
@@ -1067,31 +1082,6 @@ class PostFiatTaskManager:
         print(f"{account} sent 1 PFT to {destination} with memo")
         print(self.convert_memo_dict(memo_map))
         return response
-
-    def convert_all_account_info_into_required_verification_df(self):
-        """ 
-        This function pulls in all account info and converts it into a list
-
-        all_account_info = self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
-                                                                transaction_limit=5000)
-
-        """ 
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
-        verification_frame = simplified_task_frame[simplified_task_frame['full_output'].apply(lambda x: 
-                                                                         'VERIFICATION PROMPT ___' in x)].groupby('task_id').last()[['full_output']]
-        if len(verification_frame) == 0:
-            return verification_frame
-
-        if len(verification_frame)> 0:
-            verification_frame['verification']=verification_frame['full_output'].apply(lambda x: x.replace('VERIFICATION PROMPT ___',''))
-            verification_frame['original_task']=simplified_task_frame[simplified_task_frame['task_type'] == 'PROPOSAL'].groupby('task_id').first()['full_output']
-            verification_frame[['original_task','verification']].copy()
-            last_task_status=simplified_task_frame.sort_values('datetime').groupby('task_id').last()['task_type']
-            verification_frame['last_task_status']=last_task_status
-            outstanding_verification = verification_frame[verification_frame['last_task_status']=='VERIFICATION_PROMPT'].copy()
-            outstanding_verification= outstanding_verification[['original_task','verification']].reset_index().copy()
-
-        return outstanding_verification
         
     def send_post_fiat_verification_response(self, response_string, task_id):
         """
@@ -1112,7 +1102,7 @@ class PostFiatTaskManager:
             ___x TASK VERIFICATION SECTION END x___
 
             """ )
-        simplified_task_frame = self.convert_all_account_info_into_simplified_task_frame()
+        simplified_task_frame = self.get_core_task_df()
         matching_task = simplified_task_frame[simplified_task_frame['task_id'] == task_id]
         
         if matching_task.empty:
@@ -1140,34 +1130,6 @@ class PostFiatTaskManager:
         print(f"{account} sent 1 PFT to {destination} with memo")
         print(self.convert_memo_dict(memo_map))
         return response
-
-
-    def convert_all_account_info_into_rewarded_task_df(self):
-        """ outputs all reward df""" 
-        all_tasks = self.convert_all_account_info_into_simplified_task_frame()
-
-        # Group by task_type and task_id, then take the last entry for each group and unstack
-        unstacked = all_tasks.groupby(['task_type', 'task_id']).last()['full_output'].unstack(0)
-
-        # Check if 'PROPOSAL' and 'REWARD' columns exist, if not, return empty df
-        if 'PROPOSAL' not in unstacked.columns or 'REWARD' not in unstacked.columns:
-            return pd.DataFrame()
-
-        reward_df = unstacked[['PROPOSAL', 'REWARD']].dropna().copy()
-
-        # Apply the lambda function to prepend 'REWARD RESPONSE __' to each REWARD entry
-        reward_df['REWARD'] = reward_df['REWARD'].astype(object).apply(lambda x: x.replace('REWARD RESPONSE __ ',''))
-        reward_df.columns=['proposal','reward']
-        pft_only=self.memos[self.memos['tx_json'].apply(lambda x: "PFT" in str(x['DeliverMax']))].copy()
-        pft_only['pft_value']=pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float)*pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
-        pft_only['task_id']=pft_only['memo_data'].apply(lambda x: x['task_id'])
-        task_id_hash = all_tasks[all_tasks['task_type']=='REWARD'].groupby('task_id').last()[['hash']]
-        pft_rewards_only = pft_only[pft_only['memo'].apply(lambda x: 'REWARD RESPONSE __' in 
-                                                   x['full_output'])].copy()
-        task_id_to_payout = pft_rewards_only.groupby('task_id').last()['pft_value']
-        reward_df['payout']=task_id_to_payout
-        reward_df = reward_df.tail(15)
-        return reward_df
 
     ## WALLET UX POPULATION 
     def ux__1_get_user_pft_balance(self):
@@ -1305,6 +1267,46 @@ def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
         logger.error(response)
 
     return response
+
+def is_task_id(memo_dict) -> bool:
+    """ This function checks if a memo dictionary contains a task ID or the required fields
+    for a task ID """
+    memo_string = str(memo_dict)
+
+    # Check for task ID pattern
+    task_id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
+    if re.search(task_id_pattern, memo_string):
+        return True
+    
+    # Check for required fields
+    required_fields = ['user:', 'full_output:']
+    return all(field in memo_string for field in required_fields)
+
+def classify_task_string(string):
+    """ These are the canonical classifications for task strings 
+    on a Post Fiat Node
+    """ 
+    categories = {
+            'ACCEPTANCE': ['ACCEPTANCE REASON ___'],
+            'PROPOSAL': [' .. ','PROPOSED PF ___'],
+            'REFUSAL': ['REFUSAL REASON ___'],
+            'VERIFICATION_PROMPT': ['VERIFICATION PROMPT ___'],
+            'VERIFICATION_RESPONSE': ['VERIFICATION RESPONSE ___'],
+            'REWARD': ['REWARD RESPONSE __'],
+            'TASK_OUTPUT': ['COMPLETION JUSTIFICATION ___'],
+            'USER_GENESIS': ['USER GENESIS __'],
+            'REQUEST_POST_FIAT ':['REQUEST_POST_FIAT ___']
+        }
+
+    for category, keywords in categories.items():
+        if any(keyword in string for keyword in keywords):
+            return category
+
+    return 'UNKNOWN'
+
+def is_pft_transaction(tx) -> bool:
+    deliver_max = tx.get('DeliverMax', {})
+    return isinstance(deliver_max, dict) and deliver_max.get('currency') == 'PFT'
 
 def get_pft_holder_df(mainnet_url, pft_issuer):
     """ This function outputs a detail of all accounts holding PFT tokens

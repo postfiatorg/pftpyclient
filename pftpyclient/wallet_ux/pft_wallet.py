@@ -507,21 +507,21 @@ class WalletApp(wx.Frame):
             )
 
             # Update Accepted tab
-            json_data = self.task_manager.convert_all_account_info_into_outstanding_task_df(
+            json_data = self.task_manager.get_proposals_df(
                 all_account_info=all_account_info
             ).to_json()
             logging.debug(f"Updating Accepted tab with JSON data: {json_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=json_data, target="accepted"))
 
             # Update Rewards tab
-            rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df(
+            rewards_data = self.task_manager.get_rewards_df(
                 all_account_info=all_account_info
             ).to_json()
             logging.debug(f"Updating Rewards tab with JSON data: {rewards_data}")
             wx.PostEvent(self, UpdateGridEvent(json_data=rewards_data, target="rewards"))
 
             # Update Verification tab
-            verification_data = self.task_manager.convert_all_account_info_into_required_verification_df(
+            verification_data = self.task_manager.get_verification_df(
                 all_account_info=all_account_info
             ).to_json()
             logging.debug(f"Updating Verification tab with JSON data: {verification_data}")
@@ -736,7 +736,7 @@ class WalletApp(wx.Frame):
         )
 
         try:
-            verification_data = self.task_manager.convert_all_account_info_into_required_verification_df(
+            verification_data = self.task_manager.get_verification_df(
                 all_account_info=all_account_info
             ).to_json()
             self.populate_verification_grid(verification_data)
@@ -750,7 +750,7 @@ class WalletApp(wx.Frame):
             logging.error("FAILED UPDATING SUMMARY DATA")
 
         try:
-            rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df(
+            rewards_data = self.task_manager.get_rewards_df(
                 all_account_info=all_account_info
             ).to_json()
             self.populate_rewards_grid(rewards_data)
@@ -758,7 +758,7 @@ class WalletApp(wx.Frame):
             logging.error("FAILED UPDATING REWARDS DATA")
 
         try:
-            acceptance_data = self.task_manager.convert_all_account_info_into_outstanding_task_df(
+            acceptance_data = self.task_manager.get_proposals_df(
                 all_account_info=all_account_info
             ).to_json()
             self.populate_accepted_grid(acceptance_data)

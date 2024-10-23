@@ -36,9 +36,6 @@ if os.name == 'nt':
 # Apply the nest_asyncio patch
 nest_asyncio.apply()
 
-# JSON data to be rendered in the table
-json_data = '{"proposal":{"2024-05-09_23:55__CF24":"Sample task .. 850"},"acceptance":{"2024-05-09_23:55__CF24":"I agree that net income and fcf extraction are important and urgent and will work the weekend doing this"}}'
-
 UpdateGridEvent, EVT_UPDATE_GRID = wx.lib.newevent.NewEvent()
 
 class XRPLMonitorThread(Thread):
@@ -133,7 +130,7 @@ class CustomDialog(wx.Dialog):
 
 class WalletApp(wx.Frame):
     def __init__(self, url):
-        wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(800, 700))
+        wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
         self.url = url
         self.wallet = None
         self.build_ui()
@@ -180,42 +177,42 @@ class WalletApp(wx.Frame):
         self.summary_grid.SetColLabelValue(0, "Key")
         self.summary_grid.SetColLabelValue(1, "Value")
 
-        # Accepted tab
-        self.accepted_tab = wx.Panel(self.tabs)
-        self.tabs.AddPage(self.accepted_tab, "Accepted")
-        self.accepted_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.accepted_tab.SetSizer(self.accepted_sizer)
+        # Proposals tab
+        self.proposals_tab = wx.Panel(self.tabs)
+        self.tabs.AddPage(self.proposals_tab, "Proposals")
+        self.proposals_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.proposals_tab.SetSizer(self.proposals_sizer)
 
         # Add the task management buttons in the Accepted tab
         self.button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_ask_for_task = wx.Button(self.accepted_tab, label="Ask For Task")
+        self.btn_ask_for_task = wx.Button(self.proposals_tab, label="Ask For Task")
         self.button_sizer.Add(self.btn_ask_for_task, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_ask_for_task.Bind(wx.EVT_BUTTON, self.on_ask_for_task)
 
-        self.btn_accept_task = wx.Button(self.accepted_tab, label="Accept Task")
+        self.btn_accept_task = wx.Button(self.proposals_tab, label="Accept Task")
         self.button_sizer.Add(self.btn_accept_task, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_accept_task.Bind(wx.EVT_BUTTON, self.on_accept_task)
 
-        self.accepted_sizer.Add(self.button_sizer, 0, wx.EXPAND)
+        self.proposals_sizer.Add(self.button_sizer, 0, wx.EXPAND)
 
         self.button_sizer2 = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_refuse_task = wx.Button(self.accepted_tab, label="Refuse Task")
+        self.btn_refuse_task = wx.Button(self.proposals_tab, label="Refuse Task")
         self.button_sizer2.Add(self.btn_refuse_task, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_refuse_task.Bind(wx.EVT_BUTTON, self.on_refuse_task)
 
-        self.btn_submit_for_verification = wx.Button(self.accepted_tab, label="Submit for Verification")
+        self.btn_submit_for_verification = wx.Button(self.proposals_tab, label="Submit for Verification")
         self.button_sizer2.Add(self.btn_submit_for_verification, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_submit_for_verification.Bind(wx.EVT_BUTTON, self.on_submit_for_verification)
 
-        self.accepted_sizer.Add(self.button_sizer2, 0, wx.EXPAND)
+        self.proposals_sizer.Add(self.button_sizer2, 0, wx.EXPAND)
 
-        # Add grid to Accepted tab
-        self.accepted_grid = gridlib.Grid(self.accepted_tab)
-        self.accepted_grid.CreateGrid(0, 3)
-        self.accepted_grid.SetColLabelValue(0, "task_id")
-        self.accepted_grid.SetColLabelValue(1, "proposal")
-        self.accepted_grid.SetColLabelValue(2, "acceptance")
-        self.accepted_sizer.Add(self.accepted_grid, 1, wx.EXPAND | wx.ALL, 5)
+        # Add grid to Proposals tab
+        self.proposals_grid = gridlib.Grid(self.proposals_tab)
+        self.proposals_grid.CreateGrid(0, 3)
+        self.proposals_grid.SetColLabelValue(0, "task_id")
+        self.proposals_grid.SetColLabelValue(1, "proposal")
+        self.proposals_grid.SetColLabelValue(2, "response")
+        self.proposals_sizer.Add(self.proposals_grid, 1, wx.EXPAND | wx.ALL, 5)
 
         # Verification tab
         self.verification_tab = wx.Panel(self.tabs)
@@ -345,9 +342,6 @@ class WalletApp(wx.Frame):
         self.log_text = wx.TextCtrl(self.log_tab, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
         self.log_sizer.Add(self.log_text, 1, wx.EXPAND | wx.ALL, 5)
 
-        # Populate Accepted tab grids
-        self.populate_accepted_grid(json_data)
-
     def create_login_panel(self):
         panel = wx.Panel(self.panel)
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -365,8 +359,8 @@ class WalletApp(wx.Frame):
         sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
 
         # enter username and password for debug purposes
-        self.txt_user.SetValue('windowstestuser1')
-        self.txt_pass.SetValue('W2g@Y79KD52*fl')
+        # self.txt_user.SetValue('windowstestuser1')
+        # self.txt_pass.SetValue('W2g@Y79KD52*fl')
 
         # Error label
         self.error_label = wx.StaticText(panel, label="")
@@ -545,6 +539,10 @@ class WalletApp(wx.Frame):
         try:
             self.task_manager = PostFiatTaskManager(username=username, password=password)
         except (ValueError, InvalidToken, KeyError) as e:
+            logger.error(f"Login failed: {e}")
+            self.show_error("Invalid username or password")
+            return
+        except Exception as e:
             logger.error(f"Login failed: {e}")
             self.show_error("Invalid username or password")
             return
@@ -729,36 +727,33 @@ class WalletApp(wx.Frame):
     def update_json_data(self, event):
         try:
             # Update Accepted tab
-            json_data = self.task_manager.convert_all_account_info_into_outstanding_task_df().to_json()
-            logger.debug(f"Updating Accepted tab with JSON data: {json_data}")
-            wx.PostEvent(self, UpdateGridEvent(json_data=json_data, target="accepted"))
+            accepted_df = self.task_manager.get_proposals_df()
+            wx.PostEvent(self, UpdateGridEvent(data=accepted_df, target="accepted"))
 
             # Update Rewards tab
-            rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df().to_json()
-            logger.debug(f"Updating Rewards tab with JSON data: {rewards_data}")
-            wx.PostEvent(self, UpdateGridEvent(json_data=rewards_data, target="rewards"))
+            rewards_data = self.task_manager.get_rewards_df()
+            wx.PostEvent(self, UpdateGridEvent(data=rewards_data, target="rewards"))
 
             # Update Verification tab
-            verification_data = self.task_manager.convert_all_account_info_into_required_verification_df().to_json()
-            logger.debug(f"Updating Verification tab with JSON data: {verification_data}")
-            wx.PostEvent(self, UpdateGridEvent(json_data=verification_data, target="verification"))
-            logger.debug("UpdateGridEvent posted for verification")
+            verification_df = self.task_manager.get_verification_df()
+            wx.PostEvent(self, UpdateGridEvent(data=verification_df, target="verification"))
 
         except Exception as e:
-            logger.exception(f"Error updating JSON data: {e}")
+            logger.exception(f"Error updating data: {e}")
 
     def on_update_grid(self, event):
         logger.debug(f"Updating grid with target: {getattr(event, 'target', 'accepted')}")
+        #TODO: This is a bit messy, but it works for now
         if hasattr(event, 'target'):
             if event.target == "rewards":
-                self.populate_rewards_grid(event.json_data)
+                self.populate_rewards_grid(event.data)
             elif event.target == "verification":
                 logger.debug("Updating verification grid")
-                self.populate_verification_grid(event.json_data)
+                self.populate_verification_grid(event.data)
             else:
-                self.populate_accepted_grid(event.json_data)
+                self.populate_proposals_grid(event.data)
         else:
-            self.populate_accepted_grid(event.json_data)
+            self.populate_proposals_grid(event.json_data)
 
     def on_pft_update_timer(self, event):
         if self.wallet:
@@ -791,113 +786,113 @@ class WalletApp(wx.Frame):
         self.summary_grid.AutoSizeRows()
         self.summary_grid.ForceRefresh()
 
-    def populate_accepted_grid(self, json_data):
-        data = json.loads(json_data)
-        proposals = data['proposal']
-        acceptances = data['acceptance']
+    def populate_proposals_grid(self, proposals_df):
+        """
+        Populate the proposals grid with the given dataframe.
+        proposals_df is a dataframe with the following columns: task_id, proposal, acceptance
+        """
+        if proposals_df.empty:
+            logger.debug("No data to populate accepted grid")
+            self.proposals_grid.ClearGrid()
+            return
 
-        self.accepted_grid.ClearGrid()
-        while self.accepted_grid.GetNumberRows() > 0:
-            self.accepted_grid.DeleteRows(0, 1, False)
+        # Clear existing grid content and pre-allocate rows
+        self.proposals_grid.ClearGrid()
+        if self.proposals_grid.GetNumberRows() > 0:
+            self.proposals_grid.DeleteRows(0, self.proposals_grid.GetNumberRows())
+        self.proposals_grid.AppendRows(len(proposals_df))
 
-        for task_id, proposal in proposals.items():
-            acceptance = acceptances.get(task_id, "")
-            self.accepted_grid.AppendRows(1)
-            row = self.accepted_grid.GetNumberRows() - 1
-            self.accepted_grid.SetCellValue(row, 0, task_id)
-            self.accepted_grid.SetCellValue(row, 1, proposal)
-            self.accepted_grid.SetCellValue(row, 2, acceptance)
+        # Iterate over the dataframe
+        for idx, df_row in proposals_df.iterrows():
+            self.proposals_grid.SetCellValue(idx, 0, str(df_row['task_id']))
+            self.proposals_grid.SetCellValue(idx, 1, str(df_row['proposal']))
+            self.proposals_grid.SetCellValue(idx, 2, str(df_row['response']))
 
             # Enable text wrapping in the 'proposal' and 'acceptance' columns
-            self.accepted_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
-            self.accepted_grid.SetCellRenderer(row, 2, gridlib.GridCellAutoWrapStringRenderer())
+            self.proposals_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
+            self.proposals_grid.SetCellRenderer(idx, 2, gridlib.GridCellAutoWrapStringRenderer())
             
             # Manually set row height for better display
-            self.accepted_grid.SetRowSize(row, 65)  # Adjust the height as needed
+            self.proposals_grid.SetRowSize(idx, 65)  # Adjust the height as needed
 
         # Set column width to ensure proper wrapping
-        self.accepted_grid.SetColSize(0, 170)
-        self.accepted_grid.SetColSize(1, 400)  # Adjust width as needed
-        self.accepted_grid.SetColSize(2, 300)  # Adjust width as needed
+        self.proposals_grid.SetColSize(0, 170)
+        self.proposals_grid.SetColSize(1, 400)  # Adjust width as needed
+        self.proposals_grid.SetColSize(2, 300)  # Adjust width as needed
 
-    def populate_rewards_grid(self, json_data):
-        logger.debug("Populating rewards grid")
-        try:
-            data = json.loads(json_data)
-            if not data: 
-                logger.debug("No data to populate rewards grid")
-                self.rewards_grid.ClearGrid()
-                return
-            
-            proposals = data.get('proposal', {})
-            rewards = data.get('reward', {})
-            payouts = data.get('payout', {})
+    def populate_rewards_grid(self, rewards_df):
+        """
+        Populate the rewards grid with the given dataframe.
+        rewards_df is a dataframe with the following columns: task_id, proposal, reward, payout
+        """
 
+        if rewards_df.empty: 
+            logger.debug("No data to populate rewards grid")
             self.rewards_grid.ClearGrid()
+            return
+        
+        rewards_df.to_csv('rewards_df.csv', index=False)
+
+        # Clear existing grid content and pre-allocate rows
+        self.rewards_grid.ClearGrid()
+        if self.rewards_grid.GetNumberRows() > 0:
             self.rewards_grid.DeleteRows(0, self.rewards_grid.GetNumberRows())
+        self.rewards_grid.AppendRows(len(rewards_df))
 
-            for task_id in proposals.key():
-                self.rewards_grid.AppendRows(1)
-                row = self.rewards_grid.GetNumberRows() - 1
-                self.rewards_grid.SetCellValue(row, 0, task_id)
-                self.rewards_grid.SetCellValue(row, 1, proposals.get(task_id, ""))
-                self.rewards_grid.SetCellValue(row, 2, rewards.get(task_id, ""))
-                self.rewards_grid.SetCellValue(row, 3, payouts.get(task_id, ""))
+        for idx, df_row in rewards_df.iterrows():
+            self.rewards_grid.SetCellValue(idx, 0, str(df_row['task_id']))
+            self.rewards_grid.SetCellValue(idx, 1, str(df_row['proposal']))
+            self.rewards_grid.SetCellValue(idx, 2, str(df_row['reward']))
+            self.rewards_grid.SetCellValue(idx, 3, str(df_row['payout']))
 
-                # Enable text wrapping in the 'proposal', 'reward', and 'payout' columns
-                self.rewards_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
-                self.rewards_grid.SetCellRenderer(row, 2, gridlib.GridCellAutoWrapStringRenderer())
-                self.rewards_grid.SetCellRenderer(row, 3, gridlib.GridCellAutoWrapStringRenderer())
-                
-                # Manually set row height for better display
-                self.rewards_grid.SetRowSize(row, 65)  # Adjust the height as needed
+            # Enable text wrapping in the 'proposal', 'reward', and 'payout' columns
+            self.rewards_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
+            self.rewards_grid.SetCellRenderer(idx, 2, gridlib.GridCellAutoWrapStringRenderer())
+            self.rewards_grid.SetCellRenderer(idx, 3, gridlib.GridCellAutoWrapStringRenderer())
+            
+            # Manually set row height for better display
+            self.rewards_grid.SetRowSize(idx, 65)  # Adjust the height as needed
 
-            # Set column width to ensure proper wrapping
-            self.rewards_grid.SetColSize(0, 170)
-            self.rewards_grid.SetColSize(1, 400)  # Adjust width as needed
-            self.rewards_grid.SetColSize(2, 300)  # Adjust width as needed
-            self.rewards_grid.SetColSize(3, 100)  # Adjust width as needed for payout
+        # Set column width to ensure proper wrapping
+        self.rewards_grid.SetColSize(0, 170)
+        self.rewards_grid.SetColSize(1, 400)  # Adjust width as needed
+        self.rewards_grid.SetColSize(2, 300)  # Adjust width as needed
+        self.rewards_grid.SetColSize(3, 100)  # Adjust width as needed for payout
 
-        except Exception as e:
-            logger.error(f"Error populating rewards grid: {e}")
+    def populate_verification_grid(self, verification_df):
+        """
+        Populate the verification grid with the given dataframe.
+        verification_df is a dataframe with the following columns: task_id, proposal, verification
+        """
 
-    def populate_verification_grid(self, json_data):
-        logger.debug("Updating verification grid")
-        try:
-            data = json.loads(json_data)
-            if not data:
-                logger.debug("No data to populate verification grid")
-                self.verification_grid.ClearGrid()
-                return
-
-            task_ids = data.get('task_id', {})
-            original_tasks = data.get('original_task', {})
-            verifications = data.get('verification', {})
-
+        if verification_df.empty:
+            logger.debug("No data to populate verification grid")
             self.verification_grid.ClearGrid()
+            return
+
+        # Clear existing grid content and pre-allocate rows
+        self.verification_grid.ClearGrid()
+        if self.verification_grid.GetNumberRows() > 0:
             self.verification_grid.DeleteRows(0, self.verification_grid.GetNumberRows())
+        self.verification_grid.AppendRows(len(verification_df))
 
-            for idx, task_id in task_ids.items():
-                self.verification_grid.AppendRows(1)
-                row = self.verification_grid.GetNumberRows() - 1
-                self.verification_grid.SetCellValue(row, 0, task_ids.get(idx, ""))
-                self.verification_grid.SetCellValue(row, 1, original_tasks.get(task_id, ""))
-                self.verification_grid.SetCellValue(row, 2, verifications.get(task_id, ""))
 
-                # Enable text wrapping in the 'original_task' and 'verification' columns
-                self.verification_grid.SetCellRenderer(row, 1, gridlib.GridCellAutoWrapStringRenderer())
-                self.verification_grid.SetCellRenderer(row, 2, gridlib.GridCellAutoWrapStringRenderer())
-                
-                # Manually set row height for better display
-                self.verification_grid.SetRowSize(row, 65)  # Adjust the height as needed
+        for idx, df_row in verification_df.iterrows():
+            self.verification_grid.SetCellValue(idx, 0, str(df_row['task_id']))
+            self.verification_grid.SetCellValue(idx, 1, str(df_row['proposal']))
+            self.verification_grid.SetCellValue(idx, 2, str(df_row['verification']))
 
-            # Set column width to ensure proper wrapping
-            self.verification_grid.SetColSize(0, 170)
-            self.verification_grid.SetColSize(1, 400)  # Adjust width as needed
-            self.verification_grid.SetColSize(2, 300)  # Adjust width as needed
+            # Enable text wrapping in the 'original_task' and 'verification' columns
+            self.verification_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
+            self.verification_grid.SetCellRenderer(idx, 2, gridlib.GridCellAutoWrapStringRenderer())
+            
+            # Manually set row height for better display
+            self.verification_grid.SetRowSize(idx, 65)  # Adjust the height as needed
 
-        except Exception as e:
-            logger.error(f"Error populating verification grid: {e}")
+        # Set column width to ensure proper wrapping
+        self.verification_grid.SetColSize(0, 170)
+        self.verification_grid.SetColSize(1, 400)  # Adjust width as needed
+        self.verification_grid.SetColSize(2, 300)  # Adjust width as needed
 
     def on_ask_for_task(self, event):
         dialog = CustomDialog("Ask For Task", ["Task Request"])
@@ -963,35 +958,28 @@ class WalletApp(wx.Frame):
 
     def on_force_update(self, event):
         logger.info("Kicking off Force Update")
-        all_account_info = self.task_manager.memos
 
         try:
-            verification_data = self.task_manager.convert_all_account_info_into_required_verification_df(
-                all_account_info=all_account_info
-            ).to_json()
+            verification_data = self.task_manager.get_verification_df()
             self.populate_verification_grid(verification_data)
         except:
             logger.error("FAILED VERIFICATION UPDATE")
 
         try:
-            key_account_details = self.task_manager.process_account_info(all_account_info)
+            key_account_details = self.task_manager.process_account_info()
             self.populate_summary_grid(key_account_details)
         except:
             logger.error("FAILED UPDATING SUMMARY DATA")
 
         try:
-            rewards_data = self.task_manager.convert_all_account_info_into_rewarded_task_df(
-                all_account_info=all_account_info
-            ).to_json()
+            rewards_data = self.task_manager.get_rewards_df()
             self.populate_rewards_grid(rewards_data)
         except:
             logger.error("FAILED UPDATING REWARDS DATA")
 
         try:
-            acceptance_data = self.task_manager.convert_all_account_info_into_outstanding_task_df(
-                all_account_info=all_account_info
-            ).to_json()
-            self.populate_accepted_grid(acceptance_data)
+            proposals_df = self.task_manager.get_proposals_df()
+            self.populate_proposals_grid(proposals_df)
         except:
             logger.error("FAILED UPDATING ACCEPTANCE DATA")
 
