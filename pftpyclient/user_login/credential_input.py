@@ -1,6 +1,7 @@
 from pftpyclient.basic_utilities import settings as gvst
 import getpass
 from pftpyclient.basic_utilities.settings import *
+from cryptography.fernet import InvalidToken
 
 
 class CredentialManager:
@@ -11,7 +12,12 @@ class CredentialManager:
         self.google_doc_name = f'{self.postfiat_username}__googledoc'
         self.key_variables = [self.wallet_address_name, self.wallet_secret_name, 'postfiatusername']
         self.pw_initiator = password
-        self.PW_MAP = self.output_fully_decrypted_cred_map(pw_decryptor=self.pw_initiator)
+
+        try:
+            self.PW_MAP = self.output_fully_decrypted_cred_map(pw_decryptor=self.pw_initiator)
+        except InvalidToken:
+            raise ValueError("Invalid username or password")
+
         self.fields_that_need_definition = [i for i in self.key_variables if i not in self.PW_MAP.keys()]
 
     def output_fully_decrypted_cred_map(self, pw_decryptor):

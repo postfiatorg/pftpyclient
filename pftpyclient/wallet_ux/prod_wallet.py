@@ -16,6 +16,7 @@ import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from loguru import logger
 from pathlib import Path
+from cryptography.fernet import InvalidToken
 
 # Configure the logger at module level
 wx_sink = configure_logger(
@@ -367,6 +368,12 @@ class WalletApp(wx.Frame):
         self.txt_user.SetValue('windowstestuser1')
         self.txt_pass.SetValue('W2g@Y79KD52*fl')
 
+        # Error label
+        self.error_label = wx.StaticText(panel, label="")
+        self.error_label.SetForegroundColour(wx.RED)
+        sizer.Add(self.error_label, flag=wx.EXPAND |wx.ALL, border=5)
+        self.error_label.Hide()
+
         # Login button
         self.btn_login = wx.Button(panel, label="Login")
         sizer.Add(self.btn_login, flag=wx.EXPAND | wx.ALL, border=5)
@@ -378,6 +385,10 @@ class WalletApp(wx.Frame):
         self.btn_new_user.Bind(wx.EVT_BUTTON, self.on_create_new_user)
 
         panel.SetSizer(sizer)
+
+        # Bind text events to clear error message
+        self.txt_user.Bind(wx.EVT_TEXT, self.on_clear_error)
+        self.txt_pass.Bind(wx.EVT_TEXT, self.on_clear_error)
 
         return panel
     
@@ -483,22 +494,21 @@ class WalletApp(wx.Frame):
 
         if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
             wx.MessageBox('Passwords Do Not Match Please Retry', 'Info', wx.OK | wx.ICON_INFORMATION)
-
-        if self.txt_password.GetValue() == self.txt_confirm_password.GetValue():
+        else:
             # Call the caching function
-            wallet_functions = WalletInitiationFunctions()
             output_string = wallet_functions.given_input_map_cache_credentials_locally(input_map)
 
-
-            # Display the output string in a message box
+            # TODO: Why is this output_string labeled Genesis Result?
             wx.MessageBox(output_string, 'Genesis Result', wx.OK | wx.ICON_INFORMATION)
 
+            # initialize "pre-wallet" that helps with initiation
+            wallet_functions = WalletInitiationFunctions(input_map, commitment)
+
+            # generate trust line to PFT token
+            wallet_functions.handle_trust_line()
+
             # Call send_initiation_rite with the gathered data
-            wallet_functions.send_initiation_rite(
-                wallet_seed=self.txt_xrp_secret.GetValue(),
-                user=self.txt_username.GetValue(),
-                user_response=commitment
-            )
+            wallet_functions.send_initiation_rite()
 
     def on_delete_user(self, event):
         self.clear_credential_file()
@@ -531,7 +541,14 @@ class WalletApp(wx.Frame):
     def on_login(self, event):
         username = self.txt_user.GetValue()
         password = self.txt_pass.GetValue()
-        self.task_manager = PostFiatTaskManager(username=username, password=password)
+
+        try:
+            self.task_manager = PostFiatTaskManager(username=username, password=password)
+        except (ValueError, InvalidToken, KeyError) as e:
+            logger.error(f"Login failed: {e}")
+            self.show_error("Invalid username or password")
+            return
+        
         self.wallet = self.task_manager.user_wallet
         classic_address = self.wallet.classic_address
 
@@ -571,17 +588,33 @@ class WalletApp(wx.Frame):
         self.login_panel.Hide()
         self.user_details_panel.Show()
         self.panel.Layout()
-        # self.Layout()
-        # self.Fit()
         self.Refresh()
 
     def on_return_to_login(self, event):
         self.user_details_panel.Hide()
         self.login_panel.Show()
         self.panel.Layout()
-        # self.Layout()
-        # self.Fit()
         self.Refresh()
+
+    def show_error(self, message):
+        self.error_label.SetLabel(message)
+        self.error_label.Show()
+
+        # Simple shake animation
+        original_pos = self.error_label.GetPosition()
+        for i in range(5):
+            self.error_label.Move(original_pos.x + 2, original_pos.y)
+            wx.MilliSleep(40)
+            self.error_label.Move(original_pos.x - 2, original_pos.y)
+            wx.MilliSleep(40)
+        self.error_label.Move(original_pos)
+
+        self.login_panel.Layout()
+
+    def on_clear_error(self, event):
+        self.error_label.SetLabel("")
+        self.error_label.Hide()
+        event.Skip()
 
     def populate_summary_tab(self, username, classic_address):
         # Clear existing content
