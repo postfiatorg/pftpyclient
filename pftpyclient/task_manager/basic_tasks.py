@@ -51,9 +51,6 @@ class WalletInitiationFunctions:
     def handle_trust_line(self):
         return has_trust_line(self.mainnet_url, self.pft_issuer, self.wallet)
 
-    def to_hex(self,string):
-        return binascii.hexlify(string.encode()).decode()
-
     def get_google_doc_text(self,share_link):
         """ Gets the Google Doc Text """ 
         # Extract the document ID from the share link
@@ -74,7 +71,7 @@ class WalletInitiationFunctions:
             return f"Failed to retrieve the document. Status code: {response.status_code}"
 
     def send_initiation_rite(self):
-        memo = Memo(memo_data=self.user_commitment, memo_type='INITIATION_RITE', memo_format=self.to_hex(self.username))
+        memo = Memo(memo_data=self.user_commitment, memo_type='INITIATION_RITE', memo_format=to_hex(self.username))
         return send_xrp(mainnet_url=self.mainnet_url,
                         sending_wallet=self.wallet, 
                         amount=1, 
@@ -208,14 +205,20 @@ class PostFiatTaskManager:
         # self.user_google_doc = self.pw_map[self.credential_manager.google_doc_name]
 
         self.tx_history_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.csv")
-        self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
 
         self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
 
         self.transactions = pd.DataFrame()
         self.memos = pd.DataFrame()
+        self.tasks = pd.DataFrame()
 
         self.sync_transactions()
+
+        # for debugging purposes only
+        self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
+        self.tasks_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.csv")
+        self.save_memos_to_csv()
+        self.save_tasks_to_csv()
 
         # CHECKS
         # checks if the user has a trust line to the PFT token, and creates one if not
@@ -268,6 +271,12 @@ class PostFiatTaskManager:
 
     def save_transactions_to_csv(self):
         self.save_dataframe_to_csv(self.transactions, self.tx_history_csv_filepath, "transactions")
+
+    def save_memos_to_csv(self):
+        self.save_dataframe_to_csv(self.memos, self.memos_csv_filepath, "memos")
+
+    def save_tasks_to_csv(self):
+        self.save_dataframe_to_csv(self.tasks, self.tasks_csv_filepath, "tasks")
 
     def load_transactions_from_csv(self):
         """ Loads the transactions from the CSV file into a dataframe, and deserializes some columns"""
@@ -374,8 +383,34 @@ class PostFiatTaskManager:
 
         logger.debug(f"Added {len(new_memo_df)} memos to local memos dataframe")
 
-    def to_hex(self,string):
-        return binascii.hexlify(string.encode()).decode()
+        self.sync_tasks(new_memo_df)
+
+    def sync_tasks(self, new_memo_df):
+        """ Updates the tasks dataframe with new tasks from the new memos.
+        Task dataframe contains columns: user,task_id,full_output,hash,node_account,datetime,task_type"""
+
+        # Filter for memos that are task IDs and PFT transactions
+        new_task_df = new_memo_df[
+            new_memo_df['memo_data'].apply(is_task_id) & 
+            new_memo_df['tx_json'].apply(is_pft_transaction)
+        ]
+
+        if not new_task_df.empty:
+            # Add the transaction hash, node account, and datetime to the dataframe
+            fields_to_add = ['hash','node_account','datetime']
+            new_task_df['memo_data'] = new_task_df.apply(
+            lambda row: {**row['memo_data'], **{field: row[field] for field in fields_to_add if field in row}} # ** is used to unpack the dictionaries
+                , axis=1
+            )
+
+            # Convert the memo_data to a dataframe and add the task type
+            new_task_df = pd.DataFrame(new_task_df['memo_data'].tolist())
+            new_task_df['task_type'] = new_task_df['full_output'].apply(classify_task_string)
+
+            # Concatenate new tasks to existing tasks and drop duplicates
+            self.tasks = pd.concat([self.tasks, new_task_df], ignore_index=True).drop_duplicates(subset=['hash'])
+        else:
+            logger.debug("No new tasks to sync")
 
     def convert_ripple_timestamp_to_datetime(self, ripple_timestamp = 768602652):
         ripple_epoch_offset = 946684800  # January 1, 2000 (00:00 UTC)
@@ -406,26 +441,15 @@ class PostFiatTaskManager:
 
     def convert_memo_dict(self, memo_dict):
         """Constructs a memo object with user, task_id, and full_output from hex-encoded values."""
-        user= ''
-        task_id=''
-        full_output=''
-        try:
-            user = self.hex_to_text(memo_dict['MemoFormat'])
-        except:
-            pass
-        try:
-            task_id = self.hex_to_text(memo_dict['MemoType'])
-        except:
-            pass
-        try:
-            full_output = self.hex_to_text(memo_dict['MemoData'])
-        except:
-            pass
+        fields = {
+            'user': 'MemoFormat',
+            'task_id': 'MemoType',
+            'full_output': 'MemoData'
+        }
         
         return {
-            'user': user,
-            'task_id': task_id,
-            'full_output': full_output
+            key: self.hex_to_text(memo_dict.get(value, ''))
+            for key, value in fields.items()
         }
     ## BLOCKCHAIN FUNCTIONS
 
@@ -481,7 +505,7 @@ class PostFiatTaskManager:
             return [string[i:i + chunk_size] for i in range(0, len(string), chunk_size)]
 
         # Convert the memo to a hex string
-        memo_hex = self.to_hex(memo)
+        memo_hex = to_hex(memo)
         # Define the chunk size (1 KB in bytes, then converted to hex characters)
         chunk_size = 1024 * 2  # 1 KB in bytes is 1024, and each byte is 2 hex characters
 
@@ -492,17 +516,17 @@ class PostFiatTaskManager:
         for index, chunk in enumerate(memo_chunks):
             memo_obj = Memo(
                 memo_data=chunk,
-                memo_type=self.to_hex(f'part_{index + 1}_of_{len(memo_chunks)}'),
-                memo_format=self.to_hex('text/plain')
+                memo_type=to_hex(f'part_{index + 1}_of_{len(memo_chunks)}'),
+                memo_format=to_hex('text/plain')
             )
             
             self.send_pft(amount, destination, memo_obj, batch=True)
     
 ## MEMO FORMATTING AND MEMO CREATION TOOLS
     def construct_basic_postfiat_memo(self, user, task_id, full_output):
-        user_hex = self.to_hex(user)
-        task_id_hex = self.to_hex(task_id)
-        full_output_hex = self.to_hex(full_output)
+        user_hex = to_hex(user)
+        task_id_hex = to_hex(task_id)
+        full_output_hex = to_hex(full_output)
         memo = Memo(
         memo_data=full_output_hex,
         memo_type=task_id_hex,
@@ -702,9 +726,7 @@ class PostFiatTaskManager:
         return link
     
     def generate_google_doc_context_memo(self,user,google_doc_link):                  
-        return Memo(memo_data=self.to_hex(google_doc_link),
-                    memo_type=self.to_hex('google_doc_context_link'),
-                    memo_format=self.to_hex(user)) 
+        return construct_memo(user, 'google_doc_context_link', google_doc_link) 
 
     def output_account_address_node_association(self):
         """this takes the account info frame and figures out what nodes
@@ -806,45 +828,28 @@ class PostFiatTaskManager:
     #         # Send the Google Doc context link to the default node
     #         self.send_google_doc_to_node_if_not_sent(user_google_doc = user_google_doc)
 
-    def get_core_task_df(self):
-        """ This takes all the Post Fiat memos and outputs them into a simplified
-        dataframe of task information with embedded classifications, with columns:
-        user,task_id,full_output,hash,node_account,datetime,task_type 
-        """ 
-
-        # Filter for memos that are task IDs and PFT transactions
-        filtered_df = self.memos[
-            self.memos['memo_data'].apply(is_task_id) & 
-            self.memos['tx_json'].apply(is_pft_transaction)
-        ]
-        
-        # Add the transaction hash, node account, and datetime to the dataframe
-        fields_to_add = ['hash','node_account','datetime']
-        filtered_df['memo_data'] = filtered_df.apply(
-            lambda row: {**row['memo_data'], **{field: row[field] for field in fields_to_add}} # ** is used to unpack the dictionaries
-            , axis=1
-        )
-        
-        # Convert the memo_data column to a dataframe and add the task type
-        core_task_df = pd.DataFrame(filtered_df['memo_data'].tolist())
-        core_task_df['task_type'] = core_task_df['full_output'].apply(classify_task_string)
-
-        return core_task_df
 
     def get_proposals_df(self):
         """ This reduces memos dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
         # Get the core task dataframe
-        task_df = self.get_core_task_df()
+        task_df = self.tasks
 
-        # Filter for only PROPOSAL, ACCEPTANCE, and REFUSAL rows
-        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','ACCEPTANCE','REFUSAL'])]
+        # Filter for only PROPOSAL, ACCEPTANCE rows
+        # Exclude tasks that have been refused, pending verification, verified, or rewarded
+        filtered_df = task_df[
+            (task_df['task_type'].isin(['PROPOSAL','ACCEPTANCE'])) &
+            (~task_df['task_id'].isin(task_df[task_df['task_type'].isin(['VERIFICATION_PROMPT', 'REWARD', 'REFUSAL'])]['task_id']))
+        ].copy()
+
+        if filtered_df.empty:
+            return pd.DataFrame()
 
         # Create new 'RESPONSE' column to combine acceptance and refusal
         filtered_df['response_type'] = filtered_df['task_type'].apply(lambda x: 'RESPONSE' if x in ['ACCEPTANCE','REFUSAL'] else x)
 
         # Pivot the dataframe to get proposals and responses side by side and reset index to make task_id a column
-        pivoted_df = filtered_df.pivot_table(index='task_id', columns='response_type', values='full_output', aggfunc='first').reset_index()
+        pivoted_df = filtered_df.pivot_table(index='task_id', columns='response_type', values='full_output', aggfunc='first').reset_index().copy()
 
         # Rename the columns for clarity
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'RESPONSE':'response'}, inplace=True)
@@ -855,7 +860,7 @@ class PostFiatTaskManager:
         pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
 
         # Reverse order to get the most recent proposals first
-        result_df = pivoted_df.iloc[::-1].reset_index(drop=True)
+        result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
         return result_df
     
@@ -863,13 +868,20 @@ class PostFiatTaskManager:
         """ This reduces memos dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
         # Get the core task dataframe
-        task_df = self.get_core_task_df()
+        task_df = self.tasks
 
-        # Filter for PROPOSAL and VERIFICATION_PROMPT rows
-        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','VERIFICATION_PROMPT'])]
+        # Filter for VERIFICATION_PROMPT rows
+        # Exclude tasks that have been rewarded
+        filtered_df = task_df[
+            (task_df['task_type'].isin(['VERIFICATION_PROMPT'])) &
+            (~task_df['task_id'].isin(task_df[task_df['task_type'] == 'REWARD']['task_id']))
+        ].copy()
+
+        if filtered_df.empty:
+            return pd.DataFrame()
 
         # Pivot the dataframe to get proposals and verification prompts side by side and reset index to make task_id a column
-        pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index()
+        pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index().copy()
 
         # Rename columns for clarity
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'VERIFICATION_PROMPT':'verification'}, inplace=True)
@@ -879,10 +891,10 @@ class PostFiatTaskManager:
         pivoted_df['verification'] = pivoted_df['verification'].apply(lambda x: str(x).replace('VERIFICATION PROMPT ___',''))
 
         # Reverse order to get the most recent proposals first
-        result_df = pivoted_df.iloc[::-1].reset_index(drop=True)
+        result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
         # Remove rows where verification is "nan"
-        result_df = result_df[result_df['verification'] != 'nan'].reset_index(drop=True)
+        # result_df = result_df[result_df['verification'] != 'nan'].reset_index(drop=True)
 
         return result_df
     
@@ -890,13 +902,16 @@ class PostFiatTaskManager:
         """ This reduces memos dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
 
         # Get the core task dataframe
-        task_df = self.get_core_task_df()
+        task_df = self.tasks
 
         # Filter for only PROPOSAL and REWARD rows
-        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','REWARD'])]
+        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','REWARD'])].copy()
+
+        if filtered_df.empty:
+            return pd.DataFrame()
 
         # Pivot the dataframe to get proposals and rewards side by side and reset index to make task_id a column
-        pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index()
+        pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index().copy()
 
         # Rename the columns for clarity
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'REWARD':'reward'}, inplace=True)
@@ -906,7 +921,7 @@ class PostFiatTaskManager:
         pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
 
         # Reverse order to get the most recent proposals first
-        result_df = pivoted_df.iloc[::-1].reset_index(drop=True)
+        result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
         # Add PFT value information
         pft_only = self.memos[self.memos['tx_json'].apply(is_pft_transaction)].copy()
@@ -919,7 +934,7 @@ class PostFiatTaskManager:
         result_df['payout'] = result_df['task_id'].map(task_id_to_payout)
 
         # Remove rows where payout is NaN
-        result_df = result_df[result_df['payout'].notna()].reset_index(drop=True)
+        result_df = result_df[result_df['payout'].notna()].reset_index(drop=True).copy()
 
         return result_df
 
@@ -930,12 +945,9 @@ class PostFiatTaskManager:
         EXAMPLE PARAMETERS
         task_id='2024-05-14_19:10__ME26'
         acceptance_string = 'I agree and accept 2024-05-14_19:10__ME26 - want to finalize reward testing'
-        all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
-                transaction_limit=5000)
         """
-        simplified_task_frame = self.get_core_task_df()
-        all_task_types = simplified_task_frame[simplified_task_frame['task_id']
-         == task_id]['task_type'].unique()
+        task_df = self.tasks
+        all_task_types = task_df[task_df['task_id'] == task_id]['task_type'].unique()
         if (('REFUSAL' in all_task_types) 
         | ('ACCEPTANCE' in all_task_types)
        | ('VERIFICATION_RESPONSE' in all_task_types)
@@ -950,7 +962,7 @@ class PostFiatTaskManager:
        & ('USER_GENESIS' not in all_task_types)
        & ('REWARD' not in all_task_types)):
             print('Proceeding to accept task')
-            node_account = list(simplified_task_frame[simplified_task_frame['task_id']==task_id].tail(1)['node_account'])[0]
+            node_account = list(task_df[task_df['task_id']==task_id].tail(1)['node_account'])[0]
             if 'ACCEPTANCE REASON ___' not in acceptance_string:
                 acceptance_string='ACCEPTANCE REASON ___ '+acceptance_string
             constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
@@ -972,11 +984,9 @@ class PostFiatTaskManager:
         EXAMPLE PARAMETERS
         task_id='2024-05-14_19:10__ME26'
         refusal_reason = 'I cannot accept this task because ...'
-        all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
-                transaction_limit=5000)
         """
-        simplified_task_frame = self.get_core_task_df()
-        task_statuses = simplified_task_frame[simplified_task_frame['task_id'] 
+        task_df = self.tasks
+        task_statuses = task_df[task_df['task_id'] 
         == task_id]['task_type'].unique()
 
         if any(status in task_statuses for status in ['REFUSAL', 'ACCEPTANCE', 
@@ -991,18 +1001,18 @@ class PostFiatTaskManager:
             return
 
         print('Proceeding to refuse task')
-        node_account = list(simplified_task_frame[simplified_task_frame['task_id'] 
+        node_account = list(task_df[task_df['task_id'] 
             == task_id].tail(1)['node_account'])[0]
         if 'REFUSAL REASON ___' not in refusal_reason:
             refusal_reason = 'REFUSAL REASON ___ ' + refusal_reason
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, full_output=refusal_reason)
         response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
-        account = response.result['Account']
-        destination = response.result['Destination']
-        memo_map = response.result['Memos'][0]['Memo']
-        print(f"{account} sent 1 PFT to {destination} with memo")
-        print(self.convert_memo_dict(memo_map))
+        logger.debug(f"response: {response}")
+        account = response.result['tx_json']['Account']
+        destination = response.result['tx_json']['Destination']
+        memo_map = response.result['tx_json']['Memos'][0]['Memo']
+        logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
     def request_post_fiat(self, request_message ):
@@ -1016,11 +1026,7 @@ class PostFiatTaskManager:
         
         EXAMPLE PARAMETERS
         request_message = 'Please provide details for the upcoming project.'
-        all_account_info =self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
-                transaction_limit=5000)
         """
-        simplified_task_frame = self.get_core_task_df()
-        
         # Ensure the message has the correct prefix
         if 'REQUEST_POST_FIAT ___' not in request_message:
             request_message = 'REQUEST_POST_FIAT ___ ' + request_message
@@ -1030,17 +1036,15 @@ class PostFiatTaskManager:
         
         # Construct the memo with the request message
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                               task_id=task_id, full_output=request_message)
+                                                               task_id=task_id, 
+                                                               full_output=request_message)
         # Send the memo to the default node
         response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
-
         logger.debug(f"response: {response}")
-
-        account = response.result['Account']
-        destination = response.result['Destination']
-        memo_map = response.result['Memos'][0]['Memo']
-        print(f"{account} sent 1 PFT to {destination} with memo")
-        print(self.convert_memo_dict(memo_map))
+        account = response.result['tx_json']['Account']
+        destination = response.result['tx_json']['Destination']
+        memo_map = response.result['tx_json']['Memos'][0]['Memo']
+        logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
     def send_post_fiat_initial_completion(self, completion_string, task_id):
@@ -1054,8 +1058,8 @@ class PostFiatTaskManager:
         all_account_info = self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
                                                                 transaction_limit=5000)
         """
-        simplified_task_frame = self.get_core_task_df()
-        matching_task = simplified_task_frame[simplified_task_frame['task_id'] == task_id]#
+        task_df = self.tasks
+        matching_task = task_df[task_df['task_id'] == task_id]#
         
         if matching_task.empty:
             print(f"No task found with task ID: {task_id}")
@@ -1102,8 +1106,8 @@ class PostFiatTaskManager:
             ___x TASK VERIFICATION SECTION END x___
 
             """ )
-        simplified_task_frame = self.get_core_task_df()
-        matching_task = simplified_task_frame[simplified_task_frame['task_id'] == task_id]
+        task_df = self.tasks
+        matching_task = task_df[task_df['task_id'] == task_id]
         
         if matching_task.empty:
             print(f"No task found with task ID: {task_id}")
@@ -1230,8 +1234,8 @@ class PostFiatTaskManager:
             status_constructor = 'successfully'
         non_hex_memo = self.convert_memo_dict(response.result['Memos'][0]['Memo'])
         user_string = non_hex_memo['full_output']
-        amount_of_pft_sent = response.result['DeliverMax']['value']
-        node_name = response.result['Destination']
+        amount_of_pft_sent = response.result['tx_json']['DeliverMax']['value']
+        node_name = response.result['tx_json']['Destination']
         output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
         return output_string
 
@@ -1248,6 +1252,16 @@ class PostFiatTaskManager:
         pomodoros_only['parent_task_id']=pomodoros_only['memo_data'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
     
+def to_hex(string):
+    return binascii.hexlify(string.encode()).decode()
+
+def construct_memo(user, memo_type, memo_data):
+    return Memo(
+        memo_data=to_hex(memo_data),
+        memo_type=to_hex(memo_type),
+        memo_format=to_hex(user)
+    )
+
 def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=""):
     client = xrpl.clients.JsonRpcClient(mainnet_url)
     payment = xrpl.models.transactions.Payment(
@@ -1366,78 +1380,78 @@ def generate_trust_line_to_pft_token(mainnet_url, wallet: xrpl.wallet.Wallet):
         logger.error(f"Trust line creation failed: {response}")
     return response
 
-class ProcessUserWebData:
-    def __init__(self):
-        print('kick off web history')
-        self.ticker_regex = re.compile(r'\b[A-Z]{1,5}\b')
-        #self.cik_regex = re.compile(r'CIK=(\d{10})|data/(\d{10})')
-        self.cik_regex = re.compile(r'CIK=(\d+)|data/(\d+)')
-        # THIS DOES NOT WORK FOR 'https://www.sec.gov/edgar/browse/?CIK=1409375&owner=exclude'
-        mapper = StockMapper()
-        self.cik_to_ticker_map = mapper.cik_to_tickers
-    def get_user_web_history_df(self):
-        outputs = get_history()
-        historical_info = pd.DataFrame(outputs.histories)
-        historical_info.columns=['date','url','content']
-        return historical_info
-    def get_primary_ticker_for_cik(self, cik):
-        ret = ''
-        try:
-            ret = list(self.cik_to_ticker_map[cik])[0]
-        except:
-            pass
-        return ret
+# class ProcessUserWebData:
+#     def __init__(self):
+#         print('kick off web history')
+#         self.ticker_regex = re.compile(r'\b[A-Z]{1,5}\b')
+#         #self.cik_regex = re.compile(r'CIK=(\d{10})|data/(\d{10})')
+#         self.cik_regex = re.compile(r'CIK=(\d+)|data/(\d+)')
+#         # THIS DOES NOT WORK FOR 'https://www.sec.gov/edgar/browse/?CIK=1409375&owner=exclude'
+#         mapper = StockMapper()
+#         self.cik_to_ticker_map = mapper.cik_to_tickers
+#     def get_user_web_history_df(self):
+#         outputs = get_history()
+#         historical_info = pd.DataFrame(outputs.histories)
+#         historical_info.columns=['date','url','content']
+#         return historical_info
+#     def get_primary_ticker_for_cik(self, cik):
+#         ret = ''
+#         try:
+#             ret = list(self.cik_to_ticker_map[cik])[0]
+#         except:
+#             pass
+#         return ret
 
-    def extract_cik_to_ticker(self, input_string):
-        # Define a regex pattern to match CIKs
-        cik_regex = self.cik_regex
+#     def extract_cik_to_ticker(self, input_string):
+#         # Define a regex pattern to match CIKs
+#         cik_regex = self.cik_regex
         
-        # Find all matches in the input string
-        matches = cik_regex.findall(input_string)
+#         # Find all matches in the input string
+#         matches = cik_regex.findall(input_string)
         
-        # Extract CIKs from the matches and zfill to 10 characters
-        ciks = [match[0] or match[1] for match in matches]
-        padded_ciks = [cik.zfill(10) for cik in ciks]
-        output = ''
-        if len(padded_ciks) > 0:
-            output = self.get_primary_ticker_for_cik(padded_ciks[0])
+#         # Extract CIKs from the matches and zfill to 10 characters
+#         ciks = [match[0] or match[1] for match in matches]
+#         padded_ciks = [cik.zfill(10) for cik in ciks]
+#         output = ''
+#         if len(padded_ciks) > 0:
+#             output = self.get_primary_ticker_for_cik(padded_ciks[0])
         
-        return output
+#         return output
     
 
-    def extract_tickers(self, stringer):
-        tickers = list(set(self.ticker_regex.findall(stringer)))
-        return tickers
+#     def extract_tickers(self, stringer):
+#         tickers = list(set(self.ticker_regex.findall(stringer)))
+#         return tickers
 
-    def create_basic_web_history_frame(self):
-        all_web_history_df = self.get_user_web_history_df()
-        all_web_history_df['cik_ticker_extraction']= all_web_history_df['url'].apply(lambda x: [self.extract_cik_to_ticker(x)])
-        all_web_history_df['content_tickers']=all_web_history_df['content'].apply(lambda x: self.extract_tickers(x))#.tail(20)
-        all_web_history_df['url_tickers']=all_web_history_df['url'].apply(lambda x: self.extract_tickers(x))#.tail(20)
-        all_web_history_df['all_tickers']=all_web_history_df['content_tickers']+all_web_history_df['url_tickers']+all_web_history_df['cik_ticker_extraction']
-        all_web_history_df['date_str']=all_web_history_df['date'].apply(lambda x: x.strftime('%Y-%m-%d'))
-        str_map = pd.DataFrame(all_web_history_df['date_str'].unique())
-        str_map.columns=['date_str']
-        str_map['date']=pd.to_datetime(str_map['date_str'])
-        all_web_history_df['simplified_date']=all_web_history_df['date_str'].map(str_map.groupby('date_str').last()['date'])
-        all_web_history_df['all_tickers']=all_web_history_df['all_tickers'].apply(lambda x: list(set(x)))
-        return all_web_history_df
+#     def create_basic_web_history_frame(self):
+#         all_web_history_df = self.get_user_web_history_df()
+#         all_web_history_df['cik_ticker_extraction']= all_web_history_df['url'].apply(lambda x: [self.extract_cik_to_ticker(x)])
+#         all_web_history_df['content_tickers']=all_web_history_df['content'].apply(lambda x: self.extract_tickers(x))#.tail(20)
+#         all_web_history_df['url_tickers']=all_web_history_df['url'].apply(lambda x: self.extract_tickers(x))#.tail(20)
+#         all_web_history_df['all_tickers']=all_web_history_df['content_tickers']+all_web_history_df['url_tickers']+all_web_history_df['cik_ticker_extraction']
+#         all_web_history_df['date_str']=all_web_history_df['date'].apply(lambda x: x.strftime('%Y-%m-%d'))
+#         str_map = pd.DataFrame(all_web_history_df['date_str'].unique())
+#         str_map.columns=['date_str']
+#         str_map['date']=pd.to_datetime(str_map['date_str'])
+#         all_web_history_df['simplified_date']=all_web_history_df['date_str'].map(str_map.groupby('date_str').last()['date'])
+#         all_web_history_df['all_tickers']=all_web_history_df['all_tickers'].apply(lambda x: list(set(x)))
+#         return all_web_history_df
 
-    def convert_all_web_history_to_simple_web_data_json(self,all_web_history):
-        recent_slice = all_web_history[all_web_history['simplified_date']>=datetime.datetime.now()-datetime.timedelta(7)].copy()
-        recent_slice['explode_block']=recent_slice.apply(lambda x: pd.DataFrame(([[i,x['simplified_date']] for i in x['all_tickers']])),axis=1)
+#     def convert_all_web_history_to_simple_web_data_json(self,all_web_history):
+#         recent_slice = all_web_history[all_web_history['simplified_date']>=datetime.datetime.now()-datetime.timedelta(7)].copy()
+#         recent_slice['explode_block']=recent_slice.apply(lambda x: pd.DataFrame(([[i,x['simplified_date']] for i in x['all_tickers']])),axis=1)
         
-        full_ticker_history  =pd.concat(list(recent_slice['explode_block']))
-        full_ticker_history.columns=['ticker','date']
-        full_ticker_history['included']=1
-        stop_tickers=['EDGAR','CIK','ETF','FORM','API','HOME','GAAP','EPS','NYSE','XBRL','AI','SBF','I','US','USD','SEO','','A','X','SEC','PC','EX','UTF','SIC']
-        multidex = full_ticker_history.groupby(['ticker','date']).last().sort_index()
-        financial_attention_df = multidex[~multidex.index.get_level_values(0).isin(stop_tickers)]['included'].unstack(0).sort_values('date').resample('D').last()
-        last_day = financial_attention_df[-1:].sum()
-        last_week = financial_attention_df[-7:].sum()
+#         full_ticker_history  =pd.concat(list(recent_slice['explode_block']))
+#         full_ticker_history.columns=['ticker','date']
+#         full_ticker_history['included']=1
+#         stop_tickers=['EDGAR','CIK','ETF','FORM','API','HOME','GAAP','EPS','NYSE','XBRL','AI','SBF','I','US','USD','SEO','','A','X','SEC','PC','EX','UTF','SIC']
+#         multidex = full_ticker_history.groupby(['ticker','date']).last().sort_index()
+#         financial_attention_df = multidex[~multidex.index.get_level_values(0).isin(stop_tickers)]['included'].unstack(0).sort_values('date').resample('D').last()
+#         last_day = financial_attention_df[-1:].sum()
+#         last_week = financial_attention_df[-7:].sum()
         
-        ld_lw = pd.concat([last_day, last_week],axis=1)
-        ld_lw.columns=['last_day','last_week']
-        ld_lw=ld_lw.astype(int)
-        ld_lw[ld_lw.sum(1)>0].to_json()
-        return ld_lw
+#         ld_lw = pd.concat([last_day, last_week],axis=1)
+#         ld_lw.columns=['last_day','last_week']
+#         ld_lw=ld_lw.astype(int)
+#         ld_lw[ld_lw.sum(1)>0].to_json()
+#         return ld_lw

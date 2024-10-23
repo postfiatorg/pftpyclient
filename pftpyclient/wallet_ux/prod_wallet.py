@@ -830,8 +830,6 @@ class WalletApp(wx.Frame):
             logger.debug("No data to populate rewards grid")
             self.rewards_grid.ClearGrid()
             return
-        
-        rewards_df.to_csv('rewards_df.csv', index=False)
 
         # Clear existing grid content and pre-allocate rows
         self.rewards_grid.ClearGrid()
@@ -898,8 +896,7 @@ class WalletApp(wx.Frame):
         dialog = CustomDialog("Ask For Task", ["Task Request"])
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
-            all_account_info = self.task_manager.memos
-            response = self.task_manager.request_post_fiat(request_message=request_message, all_account_info=all_account_info)
+            response = self.task_manager.request_post_fiat(request_message=request_message)
             message = self.task_manager.ux__convert_response_object_to_status_message(response)
             wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
             wx.CallLater(30000, self.update_json_data, None)
@@ -911,11 +908,9 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             acceptance_string = values["Acceptance String"]
-            all_account_info = self.task_manager.memos
             response = self.task_manager.send_acceptance_for_task_id(
                 task_id=task_id,
-                acceptance_string=acceptance_string,
-                all_account_info=all_account_info
+                acceptance_string=acceptance_string
             )
             message = self.task_manager.ux__convert_response_object_to_status_message(response)
             wx.MessageBox(message, 'Task Acceptance Result', wx.OK | wx.ICON_INFORMATION)
@@ -928,11 +923,9 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             refusal_reason = values["Refusal Reason"]
-            all_account_info = self.task_manager.memos
             response = self.task_manager.send_refusal_for_task(
                 task_id=task_id,
-                refusal_reason=refusal_reason,
-                all_account_info=all_account_info
+                refusal_reason=refusal_reason
             )
             message = self.task_manager.ux__convert_response_object_to_status_message(response)
             wx.MessageBox(message, 'Task Refusal Result', wx.OK | wx.ICON_INFORMATION)
@@ -945,11 +938,9 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             completion_string = values["Completion String"]
-            all_account_info = self.task_manager.memos
             response = self.task_manager.send_post_fiat_initial_completion(
                 completion_string=completion_string,
-                task_id=task_id,
-                all_account_info=all_account_info
+                task_id=task_id
             )
             message = self.task_manager.ux__convert_response_object_to_status_message(response)
             wx.MessageBox(message, 'Task Submission Result', wx.OK | wx.ICON_INFORMATION)
@@ -986,11 +977,9 @@ class WalletApp(wx.Frame):
     def on_submit_verification_details(self, event):
         task_id = self.txt_task_id.GetValue()
         response_string = self.txt_verification_details.GetValue()
-        all_account_info = self.task_manager.memos
         response = self.task_manager.send_post_fiat_verification_response(
             response_string=response_string,
-            task_id=task_id,
-            all_account_info=all_account_info
+            task_id=task_id
         )
         message = self.task_manager.ux__convert_response_object_to_status_message(response)
         wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
