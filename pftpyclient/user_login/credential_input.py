@@ -2,6 +2,7 @@ from pftpyclient.basic_utilities import settings as gvst
 import getpass
 from pftpyclient.basic_utilities.settings import *
 from cryptography.fernet import InvalidToken
+from loguru import logger
 
 
 class CredentialManager:
@@ -33,8 +34,8 @@ class CredentialManager:
         existing_cred_map = self.output_cred_map()
 
         if credential_ref in existing_cred_map.keys():
-            print(f'Credential {credential_ref} is already loaded')
-            print(f'To edit credential file directly go to {CREDENTIAL_FILE_PATH}')
+            logger.debug(f'Credential {credential_ref} is already loaded')
+            logger.debug(f'To edit credential file directly go to {CREDENTIAL_FILE_PATH}')
             return
 
         credential_byte_str = pwl.password_encrypt(message=bytes(pw_data, 'utf-8'), password=pw_encryptor)
@@ -46,7 +47,7 @@ variable___{credential_ref}
         with open(CREDENTIAL_FILE_PATH, 'a') as f:
             f.write(fblock)
 
-        print(f"Added credential {credential_ref} to {CREDENTIAL_FILE_PATH}")
+        logger.debug(f"Added credential {credential_ref} to {CREDENTIAL_FILE_PATH}")
 
     def enter_and_encrypt_multiple_credentials(self):
         '''Allows entering multiple credentials with a single encryption password'''
@@ -68,5 +69,5 @@ variable___{credential_ref}
         if self.fields_that_need_definition:
             self.enter_and_encrypt_multiple_credentials()
         else:
-            print("All required credentials are already loaded.")
+            logger.debug("All required credentials are already loaded.")
 

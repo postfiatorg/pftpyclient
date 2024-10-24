@@ -6,7 +6,6 @@ import xrpl
 from xrpl.wallet import Wallet
 import asyncio
 from threading import Thread
-import json
 import wx.lib.newevent
 import nest_asyncio
 from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
@@ -26,6 +25,17 @@ wx_sink = configure_logger(
     level="DEBUG"
 )
 
+MAINNET_WEBSOCKETS = [
+    "wss://xrplcluster.com",
+    "wss://xrpl.ws/",
+    "wss://s1.ripple.com/",
+    "wss://s2.ripple.com/"
+]
+
+TESTNET_WEBSOCKETS = [
+    "wss://s.altnet.rippletest.net:51233"
+]
+
 # Try to use the default browser
 if os.name == 'nt':
     try: 
@@ -39,10 +49,12 @@ nest_asyncio.apply()
 UpdateGridEvent, EVT_UPDATE_GRID = wx.lib.newevent.NewEvent()
 
 class XRPLMonitorThread(Thread):
-    def __init__(self, url, gui):
+    def __init__(self, gui):
         Thread.__init__(self, daemon=True)
         self.gui = gui
-        self.url = url
+        self.nodes = MAINNET_WEBSOCKETS
+        self.current_node_index = 0
+        self.url = self.nodes[self.current_node_index]
         self.loop = asyncio.new_event_loop()
         self.context = None
 
@@ -51,24 +63,52 @@ class XRPLMonitorThread(Thread):
         self.context = self.loop.run_until_complete(self.monitor())
 
     async def monitor(self):
-        return await self.watch_xrpl_account(self.gui.wallet.classic_address, self.gui.wallet)
+        while True:
+            try:
+                await self.watch_xrpl_account(self.gui.wallet.classic_address, self.gui.wallet)
+            except Exception as e:
+                logger.error(f"Error in monitor: {e}. Switching to next node.")
+                self.switch_node()
+                await asyncio.sleep(5)
+    
+    def switch_node(self):
+        self.current_node_index = (self.current_node_index + 1) % len(self.nodes)
+        self.url = self.nodes[self.current_node_index]
+        logger.info(f"Switching to next node: {self.url}")
 
     async def watch_xrpl_account(self, address, wallet=None):
         self.account = address
         self.wallet = wallet
-        async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
-            await self.on_connected()
-            async for message in self.client:
-                mtype = message.get("type")
-                if mtype == "ledgerClosed":
-                    wx.CallAfter(self.gui.update_ledger, message)
-                elif mtype == "transaction":
-                    response = await self.client.request(xrpl.models.requests.AccountInfo(
-                        account=self.account,
-                        ledger_index=message["ledger_index"]
-                    ))
-                    wx.CallAfter(self.gui.update_account, response.result["account_data"])
-                    wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))
+        try:
+            async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
+                try: 
+                    await asyncio.wait_for(self.on_connected(), timeout=10)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Node {self.url} timed out. Switching to next node.")
+                    self.switch_node()
+                    return
+
+                async for message in self.client:
+                    mtype = message.get("type")
+                    if mtype == "ledgerClosed":
+                        wx.CallAfter(self.gui.update_ledger, message)
+                    elif mtype == "transaction":
+                        try: 
+                            response = await asyncio.wait_for(
+                                self.client.request(xrpl.models.requests.AccountInfo(
+                                    account=self.account,
+                                    ledger_index=message["ledger_index"]
+                                )),
+                                timeout=10
+                            )
+                            wx.CallAfter(self.gui.update_account, response.result["account_data"])
+                            wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))                    
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Request to {self.url} timed out. Switching to next node.")
+                        except Exception as e:
+                            logger.error(f"Error processing request: {e}")
+        except Exception as e:
+            logger.error(f"Error in watch_xrpl_account: {e}")
 
     async def on_connected(self):
         response = await self.client.request(xrpl.models.requests.Subscribe(
@@ -129,9 +169,15 @@ class CustomDialog(wx.Dialog):
         return {field: text_ctrl.GetValue() for field, text_ctrl in self.text_controls.items()}
 
 class WalletApp(wx.Frame):
-    def __init__(self, url):
+    def __init__(self):
         wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
-        self.url = url
+
+        # Set the icon
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(current_dir, "..", "images", "simple_pf_logo.ico")
+        icon = wx.Icon(icon_path, wx.BITMAP_TYPE_ICO)
+        self.SetIcon(icon)
+
         self.wallet = None
         self.build_ui()
 
@@ -345,39 +391,50 @@ class WalletApp(wx.Frame):
     def create_login_panel(self):
         panel = wx.Panel(self.panel)
         sizer = wx.BoxSizer(wx.VERTICAL)
-        
+
+        # Create a box to center th content
+        box = wx.Panel(panel, size=(300, 300))
+        box.SetBackgroundColour(wx.Colour(240, 240, 240))
+        box_sizer = wx.BoxSizer(wx.VERTICAL)
+
         # Username
-        self.lbl_user = wx.StaticText(panel, label="Username:")
-        sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
-        self.txt_user = wx.TextCtrl(panel)
-        sizer.Add(self.txt_user, flag=wx.EXPAND | wx.ALL, border=5)
+        self.lbl_user = wx.StaticText(box, label="Username:")
+        box_sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
+        self.txt_user = wx.TextCtrl(box)
+        box_sizer.Add(self.txt_user, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Password
-        self.lbl_pass = wx.StaticText(panel, label="Password:")
-        sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
-        self.txt_pass = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
+        self.lbl_pass = wx.StaticText(box, label="Password:")
+        box_sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
+        self.txt_pass = wx.TextCtrl(box, style=wx.TE_PASSWORD)
+        box_sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
 
         # enter username and password for debug purposes
         # self.txt_user.SetValue('windowstestuser1')
         # self.txt_pass.SetValue('W2g@Y79KD52*fl')
 
         # Error label
-        self.error_label = wx.StaticText(panel, label="")
+        self.error_label = wx.StaticText(box, label="")
         self.error_label.SetForegroundColour(wx.RED)
-        sizer.Add(self.error_label, flag=wx.EXPAND |wx.ALL, border=5)
+        box_sizer.Add(self.error_label, flag=wx.EXPAND |wx.ALL, border=5)
         self.error_label.Hide()
 
         # Login button
-        self.btn_login = wx.Button(panel, label="Login")
-        sizer.Add(self.btn_login, flag=wx.EXPAND | wx.ALL, border=5)
+        self.btn_login = wx.Button(box, label="Login")
+        box_sizer.Add(self.btn_login, flag=wx.EXPAND | wx.ALL, border=5)
         self.btn_login.Bind(wx.EVT_BUTTON, self.on_login)
 
         # Create New User button
-        self.btn_new_user = wx.Button(panel, label="Create New User")
-        sizer.Add(self.btn_new_user, flag=wx.EXPAND | wx.ALL, border=5)
+        self.btn_new_user = wx.Button(box, label="Create New User")
+        box_sizer.Add(self.btn_new_user, flag=wx.EXPAND | wx.ALL, border=5)
         self.btn_new_user.Bind(wx.EVT_BUTTON, self.on_create_new_user)
 
+        box.SetSizer(box_sizer)
+
+        # Center the box on the panel
+        sizer.AddStretchSpacer(1)
+        sizer.Add(box, 0, wx.ALIGN_CENTER | wx.ALL, 20)
+        sizer.AddStretchSpacer(1)
         panel.SetSizer(sizer)
 
         # Bind text events to clear error message
@@ -570,7 +627,7 @@ class WalletApp(wx.Frame):
 
         self.summary_tab.Layout()  # Update the layout
 
-        self.worker = XRPLMonitorThread(self.url, self)
+        self.worker = XRPLMonitorThread(self)
         self.worker.start()
 
         # Immediately populate the grid with current data
@@ -1114,14 +1171,9 @@ class SelectableMessageDialog(wx.Dialog):
         self.html_window.SetPage(html_content)
 
 def main():
-    networks = {
-        "mainnet": "wss://xrplcluster.com",
-        "testnet": "wss://s.altnet.rippletest.net:51233",
-    }
-
     logger.info("Starting Post Fiat Wallet")
     app = wx.App()
-    frame = WalletApp(networks["mainnet"])
+    frame = WalletApp()
     frame.Show()
     app.MainLoop()
 

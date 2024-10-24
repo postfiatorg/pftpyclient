@@ -1230,6 +1230,7 @@ class PostFiatTaskManager:
     def ux__convert_response_object_to_status_message(self, response):
         """ Takes a response object from an XRP transaction and converts it into legible transaction text""" 
         status_constructor = 'unsuccessfully'
+        logger.debug(f"Response: {response}")
         if 'success' in response.status:
             status_constructor = 'successfully'
         non_hex_memo = self.convert_memo_dict(response.result['Memos'][0]['Memo'])
