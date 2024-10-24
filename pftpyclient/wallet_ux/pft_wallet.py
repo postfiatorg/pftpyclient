@@ -719,7 +719,7 @@ class WalletApp(wx.Frame):
             all_account_info = self.task_manager.get_memo_detail_df_for_account(
                 account_address=self.wallet.classic_address, transaction_limit=5000
             )
-            response = self.task_manager.send_post_fiat_initial_completion(
+            response = self.task_manager.submit_initial_completion(
                 completion_string=completion_string,
                 task_id=task_id,
                 all_account_info=all_account_info
@@ -771,7 +771,7 @@ class WalletApp(wx.Frame):
         all_account_info = self.task_manager.get_memo_detail_df_for_account(
             account_address=self.wallet.classic_address, transaction_limit=5000
         )
-        response = self.task_manager.send_post_fiat_verification_response(
+        response = self.task_manager.send_verification_response(
             response_string=response_string,
             task_id=task_id,
             all_account_info=all_account_info

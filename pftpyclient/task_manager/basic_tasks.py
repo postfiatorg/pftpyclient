@@ -215,10 +215,10 @@ class PostFiatTaskManager:
         self.sync_transactions()
 
         # for debugging purposes only
-        self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
-        self.tasks_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.csv")
-        self.save_memos_to_csv()
-        self.save_tasks_to_csv()
+        # self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
+        # self.tasks_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.csv")
+        # self.save_memos_to_csv()
+        # self.save_tasks_to_csv()
 
         # CHECKS
         # checks if the user has a trust line to the PFT token, and creates one if not
@@ -393,7 +393,7 @@ class PostFiatTaskManager:
         new_task_df = new_memo_df[
             new_memo_df['memo_data'].apply(is_task_id) & 
             new_memo_df['tx_json'].apply(is_pft_transaction)
-        ]
+        ].copy()
 
         if not new_task_df.empty:
             # Add the transaction hash, node account, and datetime to the dataframe
@@ -411,6 +411,28 @@ class PostFiatTaskManager:
             self.tasks = pd.concat([self.tasks, new_task_df], ignore_index=True).drop_duplicates(subset=['hash'])
         else:
             logger.debug("No new tasks to sync")
+
+    def get_task(self, task_id):
+        """ Returns the task dataframe for a given task ID """
+        task_df = self.tasks[self.tasks['task_id'] == task_id]
+        if task_df.empty:
+            raise NoMatchingTaskException(f"No task found with task_id {task_id}")
+        return task_df
+    
+    def get_task_state(self, task_df):
+        """ Returns the latest state of a task given a task dataframe containing a single task_id """
+        if task_df.empty:
+            raise ValueError("The task dataframe is empty")
+
+        # Confirm that the task_id column only has a single value
+        if task_df['task_id'].nunique() != 1:
+            raise ValueError("The task_id column must contain only one unique value")
+        
+        return task_df.sort_values(by='datetime').iloc[-1]['task_type']
+    
+    def get_task_state_using_task_id(self, task_id):
+        """ Returns the latest state of a task given a task ID """
+        return self.get_task_state(self.get_task(task_id))
 
     def convert_ripple_timestamp_to_datetime(self, ripple_timestamp = 768602652):
         ripple_epoch_offset = 946684800  # January 1, 2000 (00:00 UTC)
@@ -463,8 +485,32 @@ class PostFiatTaskManager:
     def handle_trust_line(self):
         handle_trust_line(self.mainnet_url, self.pft_issuer, self.user_wallet)
 
-    def send_pft(self, amount, destination, memo="", batch=False):
-        """ Sends PFT tokens to a destination address with optional memo """
+    def send_pft(self, amount, destination, memo=""):
+        """ Sends PFT tokens to a destination address with optional memo. 
+        If the memo is over 1 KB, it is split into multiple memos"""
+
+        response = []
+
+        # Check if the memo is a string and exceeds 1 KB
+        if is_over_1kb(memo):
+            logger.debug("Memo exceeds 1 KB, splitting into chunks")
+            chunked_memo = self._build_chunked_memo(memo)
+
+            # Split amount by number of chunks
+            amount_per_chunk = amount / len(chunked_memo)
+
+            # Send each chunk in a separate transaction
+            for memo_chunk in chunked_memo:
+                response.append(self._send_pft_single(amount_per_chunk, destination, memo_chunk))
+        
+        else:
+            logger.debug("Memo is under 1 KB, sending in a single transaction")
+            response.append(self._send_pft_single(amount, destination, memo))
+
+        return response
+
+    def _send_pft_single(self, amount, destination, memo):
+        """Helper method to send a single PFT transaction"""
         client = xrpl.clients.JsonRpcClient(self.mainnet_url)
 
         # Handle memo
@@ -473,6 +519,7 @@ class PostFiatTaskManager:
         elif isinstance(memo, str):
             memos = [Memo(memo_data=str_to_hex(memo))]
         else:
+            logger.error("Memo is not a string or a Memo object, raising ValueError")
             raise ValueError("Memo must be either a string or a Memo object")
 
         amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
@@ -488,22 +535,23 @@ class PostFiatTaskManager:
             memos=memos,
         )
 
-        try:    
+        try:
+            logger.debug("Submitting and waiting for transaction")
             response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
         except xrpl.transaction.XRPLReliableSubmissionException as e:    
             response = f"Submit failed: {e}"
-    
-        return response
+            logger.error(response)
 
-    def send_PFT_with_info_batch(self, amount, destination, memo):
-        """ 
-        Sends PFT tokens to a destination address with memo information split into multiple batches.
-        The memo is split into chunks that fit within the 1 KB limit.
-        """
+        logger.debug(f"Transaction response: {response}")
+        return response
+    
+    def _get_memo_chunks(self, memo):
+        """Helper method to split a memo into chunks of 1 KB """
+
         # Function to split memo into chunks of specified size (1 KB here)
         def chunk_string(string, chunk_size):
             return [string[i:i + chunk_size] for i in range(0, len(string), chunk_size)]
-
+        
         # Convert the memo to a hex string
         memo_hex = to_hex(memo)
         # Define the chunk size (1 KB in bytes, then converted to hex characters)
@@ -512,15 +560,19 @@ class PostFiatTaskManager:
         # Split the memo into chunks
         memo_chunks = chunk_string(memo_hex, chunk_size)
 
-        # Send each chunk in a separate transaction
+    def _build_chunked_memo(self, memo):
+        """ Helper method to build a list of Memo objects representing a single memo string split into chunks """
+        memo_chunks = self._get_memo_chunks(memo)
+        chunked_memo = []
         for index, chunk in enumerate(memo_chunks):
-            memo_obj = Memo(
-                memo_data=chunk,
-                memo_type=to_hex(f'part_{index + 1}_of_{len(memo_chunks)}'),
-                memo_format=to_hex('text/plain')
+            chunked_memo.append(
+                Memo(
+                    memo_data=chunk, 
+                    memo_type=to_hex(f'part_{index + 1}_of_{len(memo_chunks)}'), 
+                    memo_format=to_hex('text/plain')
+                )
             )
-            
-            self.send_pft(amount, destination, memo_obj, batch=True)
+        return chunked_memo
     
 ## MEMO FORMATTING AND MEMO CREATION TOOLS
     def construct_basic_postfiat_memo(self, user, task_id, full_output):
@@ -830,17 +882,19 @@ class PostFiatTaskManager:
 
 
     def get_proposals_df(self):
-        """ This reduces memos dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
+        """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
-        # Get the core task dataframe
-        task_df = self.tasks
+        # Filter tasks with task_type in ['PROPOSAL','ACCEPTANCE']
+        filtered_tasks = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','ACCEPTANCE'])]
 
-        # Filter for only PROPOSAL, ACCEPTANCE rows
-        # Exclude tasks that have been refused, pending verification, verified, or rewarded
-        filtered_df = task_df[
-            (task_df['task_type'].isin(['PROPOSAL','ACCEPTANCE'])) &
-            (~task_df['task_id'].isin(task_df[task_df['task_type'].isin(['VERIFICATION_PROMPT', 'REWARD', 'REFUSAL'])]['task_id']))
-        ].copy()
+        # Get task_ids where the latest state is 'PROPOSAL' or 'ACCEPTANCE'
+        proposal_task_ids = [
+            task_id for task_id in filtered_tasks['task_id'].unique()
+            if self.get_task_state_using_task_id(task_id) in ['PROPOSAL','ACCEPTANCE']
+        ]
+
+        # Filter for these tasks
+        filtered_df = self.tasks[(self.tasks['task_id'].isin(proposal_task_ids))].copy()
 
         if filtered_df.empty:
             return pd.DataFrame()
@@ -865,17 +919,19 @@ class PostFiatTaskManager:
         return result_df
     
     def get_verification_df(self):
-        """ This reduces memos dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
+        """ This reduces tasks dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
-        # Get the core task dataframe
-        task_df = self.tasks
+        # Filter tasks with task_type in ['PROPOSAL','VERIFICATION_PROMPT']
+        filtered_tasks = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','VERIFICATION_PROMPT'])]
 
-        # Filter for VERIFICATION_PROMPT rows
-        # Exclude tasks that have been rewarded
-        filtered_df = task_df[
-            (task_df['task_type'].isin(['VERIFICATION_PROMPT'])) &
-            (~task_df['task_id'].isin(task_df[task_df['task_type'] == 'REWARD']['task_id']))
-        ].copy()
+        # Get task_ids where the latest state is 'VERIFICATION_PROMPT'
+        verification_task_ids = [
+            task_id for task_id in filtered_tasks['task_id'].unique()
+            if self.get_task_state_using_task_id(task_id) == 'VERIFICATION_PROMPT'
+        ]
+
+        # Filter for these tasks
+        filtered_df = self.tasks[(self.tasks['task_id'].isin(verification_task_ids))].copy()
 
         if filtered_df.empty:
             return pd.DataFrame()
@@ -899,13 +955,10 @@ class PostFiatTaskManager:
         return result_df
     
     def get_rewards_df(self):
-        """ This reduces memos dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
-
-        # Get the core task dataframe
-        task_df = self.tasks
+        """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
 
         # Filter for only PROPOSAL and REWARD rows
-        filtered_df = task_df[task_df['task_type'].isin(['PROPOSAL','REWARD'])].copy()
+        filtered_df = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','REWARD'])].copy()
 
         if filtered_df.empty:
             return pd.DataFrame()
@@ -939,44 +992,29 @@ class PostFiatTaskManager:
         return result_df
 
     def send_acceptance_for_task_id(self, task_id, acceptance_string):
-        """ 
-        This function accepts a task. The function will not work 
+        task_df = self.get_task(task_id)
+        most_recent_status = self.get_task_state(task_df)
 
-        EXAMPLE PARAMETERS
-        task_id='2024-05-14_19:10__ME26'
-        acceptance_string = 'I agree and accept 2024-05-14_19:10__ME26 - want to finalize reward testing'
-        """
-        task_df = self.tasks
-        all_task_types = task_df[task_df['task_id'] == task_id]['task_type'].unique()
-        if (('REFUSAL' in all_task_types) 
-        | ('ACCEPTANCE' in all_task_types)
-       | ('VERIFICATION_RESPONSE' in all_task_types)
-       | ('USER_GENESIS' in all_task_types)
-       | ('REWARD' in all_task_types)):
-            print('task is not valid for acceptance. Its statuses include')
-            print(all_task_types)
-            
-        if (('REFUSAL' not in all_task_types) 
-        & ('ACCEPTANCE' not in all_task_types)
-       & ('VERIFICATION_RESPONSE' not in all_task_types)
-       & ('USER_GENESIS' not in all_task_types)
-       & ('REWARD' not in all_task_types)):
-            print('Proceeding to accept task')
-            node_account = list(task_df[task_df['task_id']==task_id].tail(1)['node_account'])[0]
-            if 'ACCEPTANCE REASON ___' not in acceptance_string:
-                acceptance_string='ACCEPTANCE REASON ___ '+acceptance_string
-            constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                       task_id=task_id, full_output=acceptance_string)
-            response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
-            account = response.result['Account']
-            destination = response.result['Destination']
-            memo_map = response.result['Memos'][0]['Memo']
-            #memo_map.keys()
-            print(f"{account} sent 1 PFT to {destination} with memo")
-            print(self.convert_memo_dict(memo_map))
+        if most_recent_status != 'PROPOSAL':
+            raise WrongTaskStateException('PROPOSAL', most_recent_status)
+
+        proposal_source = task_df.iloc[0]['node_account']
+        if 'ACCEPTANCE REASON ___' not in acceptance_string:
+            classified_string='ACCEPTANCE REASON ___ '+acceptance_string
+        else:
+            classified_string=acceptance_string
+        constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
+                                                    task_id=task_id, full_output=classified_string)
+        response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
+        logger.debug(f"send_acceptance_for_task_id response: {response}")
+        # account = response.result['tx_json']['Account']
+        # destination = response.result['tx_json']['Destination']
+        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
+        # logger.debug(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
     def send_refusal_for_task(self, task_id, refusal_reason):
+        # TODO - rewrite this to use the get_task and get_task_state methods
         """ 
         This function refuses a task. The function will not work if the task has already 
         been accepted, refused, or completed. 
@@ -1008,11 +1046,11 @@ class PostFiatTaskManager:
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, full_output=refusal_reason)
         response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
-        logger.debug(f"response: {response}")
-        account = response.result['tx_json']['Account']
-        destination = response.result['tx_json']['Destination']
-        memo_map = response.result['tx_json']['Memos'][0]['Memo']
-        logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
+        logger.debug(f"send_refusal_for_task response: {response}")
+        # account = response.result['tx_json']['Account']
+        # destination = response.result['tx_json']['Destination']
+        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
+        # logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
     def request_post_fiat(self, request_message ):
@@ -1027,27 +1065,28 @@ class PostFiatTaskManager:
         EXAMPLE PARAMETERS
         request_message = 'Please provide details for the upcoming project.'
         """
-        # Ensure the message has the correct prefix
-        if 'REQUEST_POST_FIAT ___' not in request_message:
-            request_message = 'REQUEST_POST_FIAT ___ ' + request_message
         
         # Generate a custom task ID for this request
         task_id = self.generate_custom_id()
         
         # Construct the memo with the request message
+        if 'REQUEST_POST_FIAT ___' not in request_message:
+            classified_request_msg = 'REQUEST_POST_FIAT ___ ' + request_message
+        else:
+            classified_request_msg = request_message
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, 
-                                                               full_output=request_message)
+                                                               full_output=classified_request_msg)
         # Send the memo to the default node
         response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
-        logger.debug(f"response: {response}")
-        account = response.result['tx_json']['Account']
-        destination = response.result['tx_json']['Destination']
-        memo_map = response.result['tx_json']['Memos'][0]['Memo']
-        logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
+        logger.debug(f"request_post_fiat response: {response}")
+        # account = response.result['tx_json']['Account']
+        # destination = response.result['tx_json']['Destination']
+        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
+        # logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
-    def send_post_fiat_initial_completion(self, completion_string, task_id):
+    def submit_initial_completion(self, completion_string, task_id):
         """
         This function sends an initial completion for a given task back to a node.
         The most recent task status must be 'ACCEPTANCE' to trigger the initial completion.
@@ -1055,39 +1094,31 @@ class PostFiatTaskManager:
         EXAMPLE PARAMETERS
         completion_string = 'I have completed the task as requested'
         task_id = '2024-05-14_19:10__ME26'
-        all_account_info = self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address,
-                                                                transaction_limit=5000)
         """
-        task_df = self.tasks
-        matching_task = task_df[task_df['task_id'] == task_id]#
-        
-        if matching_task.empty:
-            print(f"No task found with task ID: {task_id}")
-            return
-        
-        most_recent_status = matching_task.sort_values(by='datetime').iloc[-1]['task_type']
-        
+
+        task_df = self.get_task(task_id)
+        most_recent_status = self.get_task_state(task_df)
+
         if most_recent_status != 'ACCEPTANCE':
-            print(f"The most recent status for task ID {task_id} is not 'ACCEPTANCE'. Current status: {most_recent_status}")
-            return
+            raise WrongTaskStateException('ACCEPTANCE', most_recent_status)
         
-        source_of_command = matching_task.iloc[0]['node_account']
-        acceptance_string = 'COMPLETION JUSTIFICATION ___ ' + completion_string
+        proposal_source = task_df.iloc[0]['node_account']
+        if 'COMPLETION JUSTIFICATION ___' not in completion_string:
+            classified_completion_str = 'COMPLETION JUSTIFICATION ___ ' + completion_string
+        else:
+            classified_completion_str = completion_string
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                               task_id=task_id, 
-                                                              full_output=acceptance_string)
-        print(acceptance_string)
-        print('converted to memo')
-
-        response = self.send_pft(amount=1, destination=source_of_command, memo=constructed_memo)
-        account = response.result['Account']
-        destination = response.result['Destination']
-        memo_map = response.result['Memos'][0]['Memo']
-        print(f"{account} sent 1 PFT to {destination} with memo")
-        print(self.convert_memo_dict(memo_map))
+                                                              full_output=classified_completion_str)
+        response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
+        logger.debug(f"submit_initial_completion Response: {response}")
+        # account = response.result['tx_json']['Account']
+        # destination = response.result['tx_json']['Destination']
+        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
+        # logger.debug(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
         
-    def send_post_fiat_verification_response(self, response_string, task_id):
+    def send_verification_response(self, response_string, task_id):
         """
         This function sends a verification response for a given task back to a node.
         The most recent task status must be 'VERIFICATION_PROMPT' to trigger the verification response.
@@ -1095,44 +1126,29 @@ class PostFiatTaskManager:
         EXAMPLE PARAMETERS
         response_string = 'This link https://livenet.xrpl.org/accounts/rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW is the PFT token mint. You can see that the issuer wallet has been blackholed per lsfDisableMaster'
         task_id = '2024-05-10_00:19__CJ33'
-        all_account_info = self.get_memo_detail_df_for_account(account_address=self.user_wallet.classic_address, transaction_limit=5000)
         """
-        print("""Note - for the verification response - provide a brief description of your response but
-            also feel free to include supplemental information in your google doc 
-
-            wrapped in 
-            ___x TASK VERIFICATION SECTION START x___ 
-
-            ___x TASK VERIFICATION SECTION END x___
-
-            """ )
-        task_df = self.tasks
-        matching_task = task_df[task_df['task_id'] == task_id]
         
-        if matching_task.empty:
-            print(f"No task found with task ID: {task_id}")
-            return
-        
-        most_recent_status = matching_task.sort_values(by='datetime').iloc[-1]['task_type']
+        task_df = self.get_task(task_id)
+        most_recent_status = self.get_task_state(task_df)
         
         if most_recent_status != 'VERIFICATION_PROMPT':
-            print(f"The most recent status for task ID {task_id} is not 'VERIFICATION_PROMPT'. Current status: {most_recent_status}")
-            return 
+            raise WrongTaskStateException('VERIFICATION_PROMPT', most_recent_status)
         
-        source_of_command = matching_task.iloc[0]['node_account']
-        verification_response = 'VERIFICATION RESPONSE ___ ' + response_string
+        proposal_source = task_df.iloc[0]['node_account']
+        if 'VERIFICATION RESPONSE ___' not in response_string:
+            classified_response_str = 'VERIFICATION RESPONSE ___ ' + response_string
+        else:
+            classified_response_str = response_string
         constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                               task_id=task_id, 
-                                                              full_output=verification_response)
-        print(verification_response)
-        print('converted to memo')
-
-        response = self.send_pft(amount=1, destination=source_of_command, memo=constructed_memo)
-        account = response.result['Account']
-        destination = response.result['Destination']
-        memo_map = response.result['Memos'][0]['Memo']
-        print(f"{account} sent 1 PFT to {destination} with memo")
-        print(self.convert_memo_dict(memo_map))
+                                                              full_output=classified_response_str)
+        response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
+        logger.debug(f"send_verification_response Response: {response}")
+        # account = response.result['Account']
+        # destination = response.result['Destination']
+        # memo_map = response.result['Memos'][0]['Memo']
+        # print(f"{account} sent 1 PFT to {destination} with memo")
+        # print(self.convert_memo_dict(memo_map))
         return response
 
     ## WALLET UX POPULATION 
@@ -1233,7 +1249,7 @@ class PostFiatTaskManager:
         logger.debug(f"Response: {response}")
         if 'success' in response.status:
             status_constructor = 'successfully'
-        non_hex_memo = self.convert_memo_dict(response.result['Memos'][0]['Memo'])
+        non_hex_memo = self.convert_memo_dict(response.result['tx_json']['Memos'][0]['Memo'])
         user_string = non_hex_memo['full_output']
         amount_of_pft_sent = response.result['tx_json']['DeliverMax']['value']
         node_name = response.result['tx_json']['Destination']
@@ -1253,6 +1269,10 @@ class PostFiatTaskManager:
         pomodoros_only['parent_task_id']=pomodoros_only['memo_data'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
     
+def is_over_1kb(string):
+    # 1KB = 1024 bytes
+    return len(string.encode('utf-8')) > 1024
+
 def to_hex(string):
     return binascii.hexlify(string.encode()).decode()
 
@@ -1380,6 +1400,19 @@ def generate_trust_line_to_pft_token(mainnet_url, wallet: xrpl.wallet.Wallet):
         response = f"Submit failed: {e}"
         logger.error(f"Trust line creation failed: {response}")
     return response
+
+class NoMatchingTaskException(Exception):
+    """ This exception is raised when no matching task is found """
+    def __init__(self, task_id):
+        self.task_id = task_id
+        super().__init__(f"No matching task found for task ID: {task_id}")
+
+class WrongTaskStateException(Exception):
+    """ This exception is raised when the most recent task status is not the expected status """
+    def __init__(self, expected_status, actual_status):
+        self.expected_status = expected_status
+        self.actual_status = actual_status
+        super().__init__(f"Expected status: {expected_status}, actual status: {actual_status}")
 
 # class ProcessUserWebData:
 #     def __init__(self):

@@ -8,8 +8,7 @@ import asyncio
 from threading import Thread
 import wx.lib.newevent
 import nest_asyncio
-from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager  # Adjust the import path as needed
-from pftpyclient.task_manager.basic_tasks import WalletInitiationFunctions
+from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager, WalletInitiationFunctions, NoMatchingTaskException, WrongTaskStateException
 import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
@@ -390,11 +389,20 @@ class WalletApp(wx.Frame):
 
     def create_login_panel(self):
         panel = wx.Panel(self.panel)
-        sizer = wx.BoxSizer(wx.VERTICAL)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Create a box to center th content
-        box = wx.Panel(panel, size=(300, 300))
-        box.SetBackgroundColour(wx.Colour(240, 240, 240))
+        # Load and resize the logo
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        logo_path = os.path.join(current_dir, '..', 'images', 'simple_pf_logo.png')
+        logo = wx.Image(logo_path, wx.BITMAP_TYPE_ANY)
+        logo = logo.Scale(230, 230, wx.IMAGE_QUALITY_HIGH)
+        bitmap = wx.Bitmap(logo)
+        logo_ctrl = wx.StaticBitmap(panel, -1, bitmap=bitmap)
+        # sizer.Add(logo_ctrl, 0, wx.ALIGN_CENTER | wx.TOP, 20)
+
+        # Create a box to center the content
+        box = wx.Panel(panel, size=(250, 230))
+        box.SetBackgroundColour(wx.Colour(220, 220, 220))
         box_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Username
@@ -417,7 +425,7 @@ class WalletApp(wx.Frame):
         self.error_label = wx.StaticText(box, label="")
         self.error_label.SetForegroundColour(wx.RED)
         box_sizer.Add(self.error_label, flag=wx.EXPAND |wx.ALL, border=5)
-        self.error_label.Hide()
+        # self.error_label.Hide()
 
         # Login button
         self.btn_login = wx.Button(box, label="Login")
@@ -431,11 +439,17 @@ class WalletApp(wx.Frame):
 
         box.SetSizer(box_sizer)
 
+        # Create a vertical sizer for logo and login box
+        content_sizer = wx.BoxSizer(wx.VERTICAL)
+        content_sizer.Add(logo_ctrl, 0, wx.ALIGN_CENTER | wx.BOTTOM, 20)
+        content_sizer.Add(box, 0, wx.EXPAND, 20)
+
         # Center the box on the panel
-        sizer.AddStretchSpacer(1)
-        sizer.Add(box, 0, wx.ALIGN_CENTER | wx.ALL, 20)
-        sizer.AddStretchSpacer(1)
-        panel.SetSizer(sizer)
+        main_sizer.AddStretchSpacer(1)
+        main_sizer.Add(content_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 20)
+        main_sizer.AddStretchSpacer(1)
+
+        panel.SetSizer(main_sizer)
 
         # Bind text events to clear error message
         self.txt_user.Bind(wx.EVT_TEXT, self.on_clear_error)
@@ -631,7 +645,7 @@ class WalletApp(wx.Frame):
         self.worker.start()
 
         # Immediately populate the grid with current data
-        self.update_json_data(None)
+        self.update_data(None)
 
         # Start timers
         self.start_json_update_timer()
@@ -653,7 +667,7 @@ class WalletApp(wx.Frame):
 
     def show_error(self, message):
         self.error_label.SetLabel(message)
-        self.error_label.Show()
+        # self.error_label.Show()
 
         # Simple shake animation
         original_pos = self.error_label.GetPosition()
@@ -668,7 +682,7 @@ class WalletApp(wx.Frame):
 
     def on_clear_error(self, event):
         self.error_label.SetLabel("")
-        self.error_label.Hide()
+        # self.error_label.Hide()
         event.Skip()
 
     def populate_summary_tab(self, username, classic_address):
@@ -759,7 +773,7 @@ class WalletApp(wx.Frame):
 
     def start_json_update_timer(self):
         self.json_update_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.update_json_data, self.json_update_timer)
+        self.Bind(wx.EVT_TIMER, self.update_data, self.json_update_timer)
         self.json_update_timer.Start(60000)  # Update every 60 seconds
 
     def start_force_update_timer(self):
@@ -781,15 +795,15 @@ class WalletApp(wx.Frame):
         logger.debug("Transaction update timer triggered")
         self.task_manager.sync_transactions()
 
-    def update_json_data(self, event):
+    def update_data(self, event):
         try:
             # Update Accepted tab
             accepted_df = self.task_manager.get_proposals_df()
             wx.PostEvent(self, UpdateGridEvent(data=accepted_df, target="accepted"))
 
             # Update Rewards tab
-            rewards_data = self.task_manager.get_rewards_df()
-            wx.PostEvent(self, UpdateGridEvent(data=rewards_data, target="rewards"))
+            rewards_df = self.task_manager.get_rewards_df()
+            wx.PostEvent(self, UpdateGridEvent(data=rewards_df, target="rewards"))
 
             # Update Verification tab
             verification_df = self.task_manager.get_verification_df()
@@ -954,9 +968,13 @@ class WalletApp(wx.Frame):
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
             response = self.task_manager.request_post_fiat(request_message=request_message)
-            message = self.task_manager.ux__convert_response_object_to_status_message(response)
-            wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
-            wx.CallLater(30000, self.update_json_data, None)
+            try:
+                if response:
+                    message = self.task_manager.ux__convert_response_object_to_status_message(response)
+                    wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
+            except Exception as e:
+                logger.error(f"Error converting response to status message: {e}")
+            wx.CallLater(30000, self.update_data, None)
         dialog.Destroy()
 
     def on_accept_task(self, event):
@@ -965,13 +983,28 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             acceptance_string = values["Acceptance String"]
-            response = self.task_manager.send_acceptance_for_task_id(
-                task_id=task_id,
-                acceptance_string=acceptance_string
-            )
-            message = self.task_manager.ux__convert_response_object_to_status_message(response)
-            wx.MessageBox(message, 'Task Acceptance Result', wx.OK | wx.ICON_INFORMATION)
-            wx.CallLater(5000, self.update_json_data, None)
+            try:
+                response = self.task_manager.send_acceptance_for_task_id(
+                    task_id=task_id,
+                    acceptance_string=acceptance_string
+                )
+            except NoMatchingTaskException as e:
+                logger.error(f"Error accepting task: {e}")
+                wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
+            except WrongTaskStateException as e:
+                logger.error(f"Error accepting task: {e}")
+                wx.MessageBox(f"Task ID {task_id} is not in the correct state to be accepted. Current status: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
+            except Exception as e:
+                logger.error(f"Error accepting task: {e}")
+                wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
+            else:
+                try:
+                    if response:
+                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
+                        wx.MessageBox(message, 'Task Acceptance Result', wx.OK | wx.ICON_INFORMATION)
+                except Exception as e:
+                    logger.error(f"Error converting response to status message: {e}")
+                wx.CallLater(5000, self.update_data, None)
         dialog.Destroy()
 
     def on_refuse_task(self, event):
@@ -980,13 +1013,24 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             refusal_reason = values["Refusal Reason"]
-            response = self.task_manager.send_refusal_for_task(
-                task_id=task_id,
-                refusal_reason=refusal_reason
-            )
-            message = self.task_manager.ux__convert_response_object_to_status_message(response)
-            wx.MessageBox(message, 'Task Refusal Result', wx.OK | wx.ICON_INFORMATION)
-            wx.CallLater(5000, self.update_json_data, None)
+            try:
+                response = self.task_manager.send_refusal_for_task(
+                    task_id=task_id,
+                    refusal_reason=refusal_reason
+                )
+            except Exception as e:
+                logger.error(f"Error sending refusal for task: {e}")
+                wx.MessageBox(f"Error sending refusal for task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
+            else:
+                try:
+                    if response:
+                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
+                        wx.MessageBox(message, 'Task Refusal Result', wx.OK | wx.ICON_INFORMATION)
+                    else:
+                        logger.error("No response from send_refusal_for_task")
+                except Exception as e:
+                    logger.error(f"Error converting response to status message: {e}")
+                wx.CallLater(5000, self.update_data, None)
         dialog.Destroy()
 
     def on_submit_for_verification(self, event):
@@ -995,14 +1039,53 @@ class WalletApp(wx.Frame):
             values = dialog.GetValues()
             task_id = values["Task ID"]
             completion_string = values["Completion String"]
-            response = self.task_manager.send_post_fiat_initial_completion(
-                completion_string=completion_string,
+            try:
+                response = self.task_manager.submit_initial_completion(
+                    completion_string=completion_string,
+                    task_id=task_id
+                )
+            except NoMatchingTaskException as e:
+                logger.error(f"Error submitting initial completion: {e}")
+                wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
+            except WrongTaskStateException as e:
+                logger.error(f"Error submitting initial completion: {e}")
+                wx.MessageBox(f"Task ID {task_id} has not yet been accepted. Current status: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
+            except Exception as e:
+                logger.error(f"Error submitting initial completion: {e}")
+                wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
+            else:
+                try:
+                    if response:
+                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
+                        wx.MessageBox(message, 'Task Submission Result', wx.OK | wx.ICON_INFORMATION)
+                    else:
+                        logger.error("No response from submit_initial_completion")
+                except Exception as e:
+                    logger.error(f"Error converting response to status message: {e}")
+                wx.CallLater(5000, self.update_data, None)
+            
+        dialog.Destroy()
+
+    def on_submit_verification_details(self, event):
+        task_id = self.txt_task_id.GetValue()
+        response_string = self.txt_verification_details.GetValue()
+        try:
+            response = self.task_manager.send_verification_response(
+                response_string=response_string,
                 task_id=task_id
             )
-            message = self.task_manager.ux__convert_response_object_to_status_message(response)
-            wx.MessageBox(message, 'Task Submission Result', wx.OK | wx.ICON_INFORMATION)
-            wx.CallLater(5000, self.update_json_data, None)
-        dialog.Destroy()
+        except Exception as e:
+            logger.error(f"Error sending verification response: {e}")
+            wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
+        else:
+            try:
+                if response:
+                    message = self.task_manager.ux__convert_response_object_to_status_message(response)
+                    wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
+                else:
+                        logger.error("No response from send_verification_response")
+            except Exception as e:
+                logger.error(f"Error converting response to status message: {e}")
 
     def on_force_update(self, event):
         logger.info("Kicking off Force Update")
@@ -1010,36 +1093,26 @@ class WalletApp(wx.Frame):
         try:
             verification_data = self.task_manager.get_verification_df()
             self.populate_verification_grid(verification_data)
-        except:
-            logger.error("FAILED VERIFICATION UPDATE")
+        except Exception as e:
+            logger.error(f"FAILED VERIFICATION UPDATE: {e}")
 
         try:
             key_account_details = self.task_manager.process_account_info()
             self.populate_summary_grid(key_account_details)
-        except:
-            logger.error("FAILED UPDATING SUMMARY DATA")
+        except Exception as e:
+            logger.error(f"FAILED UPDATING SUMMARY DATA: {e}")
 
         try:
             rewards_data = self.task_manager.get_rewards_df()
             self.populate_rewards_grid(rewards_data)
-        except:
-            logger.error("FAILED UPDATING REWARDS DATA")
+        except Exception as e:
+            logger.error(f"FAILED UPDATING REWARDS DATA: {e}")
 
         try:
             proposals_df = self.task_manager.get_proposals_df()
             self.populate_proposals_grid(proposals_df)
-        except:
-            logger.error("FAILED UPDATING ACCEPTANCE DATA")
-
-    def on_submit_verification_details(self, event):
-        task_id = self.txt_task_id.GetValue()
-        response_string = self.txt_verification_details.GetValue()
-        response = self.task_manager.send_post_fiat_verification_response(
-            response_string=response_string,
-            task_id=task_id
-        )
-        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-        wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
+        except Exception as e:
+            logger.error(f"FAILED UPDATING ACCEPTANCE DATA: {e}")
 
     def on_log_pomodoro(self, event):
         task_id = self.txt_task_id.GetValue()
@@ -1066,9 +1139,6 @@ class WalletApp(wx.Frame):
                                                 destination=self.txt_pft_address_payment.GetValue(), 
                                                 memo=self.txt_pft_memo.GetValue()
         )
-
-        logger.debug(f"PFT Payment Response: {response}")
-
         formatted_response = self.format_response(response)
 
         logger.info(f"PFT Payment Result: {formatted_response}")
@@ -1083,6 +1153,9 @@ class WalletApp(wx.Frame):
         wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
 
     def format_response(self, response):
+        if isinstance(response, list):
+            response = response[0]  # Take the first transaction if its a list
+
         if response.status == "success":
             tx_json = response.result.get('tx_json', {})
             meta = response.result.get('meta', {})
