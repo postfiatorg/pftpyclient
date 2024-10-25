@@ -376,7 +376,7 @@ class WalletApp(wx.Frame):
 
         # Call the caching function
         wallet_functions = WalletInitiationFunctions()
-        output_string = wallet_functions.given_input_map_cache_credentials_locally(input_map)
+        output_string = wallet_functions.cache_credentials(input_map)
 
         # Display the output string in a message box
         wx.MessageBox(output_string, 'Genesis Result', wx.OK | wx.ICON_INFORMATION)

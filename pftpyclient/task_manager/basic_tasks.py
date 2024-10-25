@@ -1,4 +1,4 @@
-from pftpyclient.user_login.credential_input import CredentialManager
+from pftpyclient.user_login.credential_input import CredentialManager, cache_credentials
 import xrpl
 from xrpl.wallet import Wallet
 from xrpl.models.requests import AccountTx
@@ -29,7 +29,7 @@ from decimal import Decimal
 nest_asyncio.apply()
 
 class WalletInitiationFunctions:
-    def __init__(self, input_map, user_commitment):
+    def __init__(self, input_map, user_commitment=""):
         """
         input_map = {
             'Username_Input': Username,
@@ -48,8 +48,11 @@ class WalletInitiationFunctions:
         self.user_commitment = user_commitment
         self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
 
+    def get_xrp_balance(self):
+        return get_xrp_balance(self.mainnet_url, self.wallet.classic_address)
+
     def handle_trust_line(self):
-        return has_trust_line(self.mainnet_url, self.pft_issuer, self.wallet)
+        return handle_trust_line(self.mainnet_url, self.pft_issuer, self.wallet)
 
     def get_google_doc_text(self,share_link):
         """ Gets the Google Doc Text """ 
@@ -87,114 +90,155 @@ class WalletInitiationFunctions:
         )
         response = client.request(acct_info)
         return response.result['account_data']
+    
+    def check_if_google_doc_is_valid(self):
+        """ Checks if the google doc is valid by """
 
-    def check_if_there_is_funded_account_at_front_of_google_doc(self, google_url):
-        """
-        Checks if there is a balance bearing XRP account address at the front of the google document 
-        This is required for the user 
-
-        Returns the balance in XRP drops 
-        EXAMPLE
-        google_url = 'https://docs.google.com/document/d/1MwO8kHny7MtU0LgKsFTBqamfuUad0UXNet1wr59iRCA/edit'
-        """
-        balance = 0
-        try:
-            google_doc_text = self.get_google_doc_text(google_url)
-
-            # Split the text into lines
-            lines = google_doc_text.split('\n')
-
-            # Regular expression for XRP address
-            xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
-
-            wallet_at_front_of_doc = None
-            # look through the first 5 lines for an XRP address
-            for line in lines[:5]:
-                match = re.search(xrp_address_pattern, line)
-                if match:
-                    wallet_at_front_of_doc = match.group()
-                    break
-
-            if not wallet_at_front_of_doc:
-                logger.warning(f"No XRP address found in the first 5 lines of the document")
-                return balance
-
-            account_info = self.get_account_info(wallet_at_front_of_doc)
-            balance = Decimal(account_info['Balance'])
-
-        except Exception as e:
-            logger.error(f"Error: {e}")
-
-        return balance
-
-    def clear_credential_file(self):
-        # Define the path to the file
-        file_path = CREDENTIAL_FILE_PATH
+        # Check 1: google doc is a valid url
+        if not self.google_doc_share_link.startswith('https://docs.google.com/document/d/'):
+            raise InvalidGoogleDocException(self.google_doc_share_link)
         
-        # Clear the contents of the file
-        file_path.write_text('')
+        google_doc_text = self.get_google_doc_text(self.google_doc_share_link)
 
-    def given_input_map_cache_credentials_locally(self, input_map):
-        """ EXAMPLE INPUT MAP
-        input_map = {'Username_Input': 'goodalexander',
-                    'Password_Input': 'everythingIsRigged1a',
-                    'Google Doc Share Link_Input':'https://docs.google.com/document/d/1MwO8kHny7MtU0LgKsFTBqamfuUad0UXNet1wr59iRCA/edit',
-                     'XRP Address_Input':'r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
-                     'XRP Secret_Input': '<USER SEED ENTER HERE>'}
+        # Check 2: google doc exists
+        if google_doc_text == "Failed to retrieve the document. Status code: 404":
+            raise GoogleDocNotFoundException(self.google_doc_share_link)
 
-        Note the output is returned as the error_message. If everything went well it will say the information was cached 
-        """ 
+        # Check 3: google doc is shared
+        if google_doc_text == "Failed to retrieve the document. Status code: 401":
+            raise GoogleDocIsNotSharedException(self.google_doc_share_link)
         
-        has_variables_defined = False
-        zero_balance = True
-        balance = self.check_if_there_is_funded_account_at_front_of_google_doc(google_url=input_map['Google Doc Share Link_Input'])
-        logger.debug(f"balance: {balance}")
+        # Check 4: google doc contains the correct XRP address at the top
+        if self.retrieve_xrp_address_from_google_doc(google_doc_text) != self.xrp_address:
+            raise GoogleDocDoesNotContainXrpAddressException(self.xrp_address)
+        
+        # Check 5: XRP address has a balance
+        if self.get_xrp_balance() == 0:
+            raise GoogleDocIsNotFundedException(self.google_doc_share_link)
 
-        if balance > 0:
-            zero_balance = False
-        existing_keys= list(output_cred_map().keys())
-        if 'postfiatusername' in existing_keys:
-            has_variables_defined = True
-        output_string = ''
-        if zero_balance == True:
-            output_string=output_string+f"""XRP Wallet at Top of Google Doc {input_map['Google Doc Share Link_Input']} Has No Balance
-            Fund Your XRP Wallet and Place at Top of Google Doc
-            """
-        if has_variables_defined == True:
-            output_string=output_string+f""" 
-        Variables are already defined in {CREDENTIAL_FILE_PATH}"""
-        error_message = output_string.strip()
+    @staticmethod
+    def retrieve_xrp_address_from_google_doc(google_doc_text):
+        """ Retreives the XRP address from the google doc """
+        # Split the text into lines
+        lines = google_doc_text.split('\n')      
 
-        print(f"error_message: {error_message}")
+        # Regular expression for XRP address
+        xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
 
-        if error_message == '':
-            print("CACHING CREDENTIALS")
-            key_to_input1= f'{input_map['Username_Input']}__v1xrpaddress'
-            key_to_input2= f'{input_map['Username_Input']}__v1xrpsecret'
-            key_to_input3='postfiatusername'
-            key_to_input4 = f'{input_map['Username_Input']}__googledoc'
-            enter_and_encrypt_credential__variable_based(credential_ref=key_to_input1, 
-                                                         pw_data=input_map['XRP Address_Input'], 
-                                                         pw_encryptor=input_map['Password_Input'])
-            enter_and_encrypt_credential__variable_based(credential_ref=key_to_input2, 
-                                                         pw_data=input_map['XRP Secret_Input'], 
-                                                         pw_encryptor=input_map['Password_Input'])
+        wallet_at_front_of_doc = None
+        # look through the first 5 lines for an XRP address
+        for line in lines[:5]:
+            match = re.search(xrp_address_pattern, line)
+            if match:
+                wallet_at_front_of_doc = match.group()
+                break
+
+        return wallet_at_front_of_doc
+    
+    @staticmethod
+    def cache_credentials(input_map):
+        """ Caches the user's credentials """
+        return cache_credentials(input_map)
+
+
+    # def check_if_there_is_funded_account_at_front_of_google_doc(self, google_url):
+    #     """
+    #     Checks if there is a balance bearing XRP account address at the front of the google document 
+    #     This is required for the user 
+
+    #     Returns the balance in XRP drops 
+    #     EXAMPLE
+    #     google_url = 'https://docs.google.com/document/d/1MwO8kHny7MtU0LgKsFTBqamfuUad0UXNet1wr59iRCA/edit'
+    #     """
+    #     balance = 0
+    #     try:
+    #         google_doc_text = self.get_google_doc_text(google_url)
+
+    #         # Split the text into lines
+    #         lines = google_doc_text.split('\n')
+
+    #         # Regular expression for XRP address
+    #         xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
+
+    #         wallet_at_front_of_doc = None
+    #         # look through the first 5 lines for an XRP address
+    #         for line in lines[:5]:
+    #             match = re.search(xrp_address_pattern, line)
+    #             if match:
+    #                 wallet_at_front_of_doc = match.group()
+    #                 break
+
+    #         if not wallet_at_front_of_doc:
+    #             logger.warning(f"No XRP address found in the first 5 lines of the document")
+    #             return balance
+
+    #         account_info = self.get_account_info(wallet_at_front_of_doc)
+    #         balance = Decimal(account_info['Balance'])
+
+    #     except Exception as e:
+    #         logger.error(f"Error: {e}")
+
+    #     return balance
+
+    # def given_input_map_cache_credentials_locally(self, input_map):
+    #     """ EXAMPLE 
+    #     input_map = {'Username_Input': 'goodalexander',
+    #                 'Password_Input': 'everythingIsRigged1a',
+    #                 'Google Doc Share Link_Input':'https://docs.google.com/document/d/1MwO8kHny7MtU0LgKsFTBqamfuUad0UXNet1wr59iRCA/edit',
+    #                  'XRP Address_Input':'r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
+    #                  'XRP Secret_Input': '<USER SEED ENTER HERE>'}
+    #     """ 
+        
+    #     has_variables_defined = False
+    #     zero_balance = True
+    #     balance = self.check_if_there_is_funded_account_at_front_of_google_doc(google_url=input_map['Google Doc Share Link_Input'])
+    #     logger.debug(f"balance: {balance}")
+
+    #     if balance > 0:
+    #         zero_balance = False
+    #     existing_keys= list(output_cred_map().keys())
+    #     if 'postfiatusername' in existing_keys:
+    #         has_variables_defined = True
+    #     output_string = ''
+    #     if zero_balance == True:
+    #         output_string=output_string+f"""XRP Wallet at Top of Google Doc {input_map['Google Doc Share Link_Input']} Has No Balance
+    #         Fund Your XRP Wallet and Place at Top of Google Doc
+    #         """
+    #     if has_variables_defined == True:
+    #         output_string=output_string+f""" 
+    #     Variables are already defined in {CREDENTIAL_FILE_PATH}"""
+    #     error_message = output_string.strip()
+
+    #     print(f"error_message: {error_message}")
+
+    #     if error_message == '':
+    #         print("CACHING CREDENTIALS")
+    #         key_to_input1= f'{input_map['Username_Input']}__v1xrpaddress'
+    #         key_to_input2= f'{input_map['Username_Input']}__v1xrpsecret'
+    #         key_to_input3='postfiatusername'
+    #         key_to_input4 = f'{input_map['Username_Input']}__googledoc'
+    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input1, 
+    #                                                      pw_data=input_map['XRP Address_Input'], 
+    #                                                      pw_encryptor=input_map['Password_Input'])
+    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input2, 
+    #                                                      pw_data=input_map['XRP Secret_Input'], 
+    #                                                      pw_encryptor=input_map['Password_Input'])
             
-            enter_and_encrypt_credential__variable_based(credential_ref=key_to_input3, 
-                                                         pw_data=input_map['Username_Input'], 
-                                                         pw_encryptor=input_map['Password_Input'])
-            enter_and_encrypt_credential__variable_based(credential_ref=key_to_input4, 
-                                                         pw_data=input_map['Google Doc Share Link_Input'], 
-                                                         pw_encryptor=input_map['Password_Input'])
-            error_message = f'Information Cached and Encrypted Locally Using Password at {CREDENTIAL_FILE_PATH}'
+    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input3, 
+    #                                                      pw_data=input_map['Username_Input'], 
+    #                                                      pw_encryptor=input_map['Password_Input'])
+    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input4, 
+    #                                                      pw_data=input_map['Google Doc Share Link_Input'], 
+    #                                                      pw_encryptor=input_map['Password_Input'])
+    #         error_message = f'Information Cached and Encrypted Locally Using Password at {CREDENTIAL_FILE_PATH}'
 
-        return error_message
+    #     return error_message
 
 class PostFiatTaskManager:
     
     def __init__(self,username,password):
         self.credential_manager=CredentialManager(username,password)
-        self.pw_map = self.credential_manager.output_fully_decrypted_cred_map(self.credential_manager.pw_initiator)
+        self.pw_map = self.credential_manager.decrypt_creds(self.credential_manager.pw_initiator)
         self.mainnet_url= "https://s2.ripple.com:51234"
         self.treasury_wallet_address = 'r46SUhCzyGE4KwBnKQ6LmDmJcECCqdKy4q'
         self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
@@ -231,15 +275,8 @@ class PostFiatTaskManager:
         # check if the user has sent a google doc to the node, and sends one if not
         # self.handle_google_doc()
 
-
     def get_xrp_balance(self):
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
-        account_info = xrpl.models.requests.account_info.AccountInfo(
-            account=self.user_wallet.classic_address,
-            ledger_index="validated"
-        )
-        response = client.request(account_info)
-        return response.result['account_data']['Balance']
+        return get_xrp_balance(self.mainnet_url, self.user_wallet.classic_address)
 
     ## GENERIC UTILITY FUNCTIONS 
 
@@ -535,15 +572,24 @@ class PostFiatTaskManager:
             memos=memos,
         )
 
+        # Sign the transaction to get the hash
+        # We need to derive the hash because the submit_and_wait function doesn't return a hash if transaction fails
+        # TODO: tx_hash does not match the hash in the response
+        signed_tx = xrpl.transaction.sign(payment, self.user_wallet)
+        tx_hash = signed_tx.get_hash()
+
         try:
             logger.debug("Submitting and waiting for transaction")
-            response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
-        except xrpl.transaction.XRPLReliableSubmissionException as e:    
-            response = f"Submit failed: {e}"
+            response = xrpl.transaction.submit_and_wait(signed_tx, client, self.user_wallet)    
+            # response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
+        except xrpl.transaction.XRPLReliableSubmissionException as e:
+            response = f"Transaction submission failed: {e}"
+            logger.error(response)
+        except Exception as e:
+            response = f"Unexpected error: {e}"
             logger.error(response)
 
-        logger.debug(f"Transaction response: {response}")
-        return response
+        return tx_hash, response
     
     def _get_memo_chunks(self, memo):
         """Helper method to split a memo into chunks of 1 KB """
@@ -559,6 +605,8 @@ class PostFiatTaskManager:
 
         # Split the memo into chunks
         memo_chunks = chunk_string(memo_hex, chunk_size)
+
+        return memo_chunks
 
     def _build_chunked_memo(self, memo):
         """ Helper method to build a list of Memo objects representing a single memo string split into chunks """
@@ -958,7 +1006,19 @@ class PostFiatTaskManager:
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
 
         # Filter for only PROPOSAL and REWARD rows
-        filtered_df = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','REWARD'])].copy()
+        filtered_df = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','REWARD'])]
+
+        # Get task_ids where the latest state is 'REWARD'
+        reward_task_ids = [
+            task_id for task_id in filtered_df['task_id'].unique()
+            if self.get_task_state_using_task_id(task_id) == 'REWARD'
+        ]
+
+        # Filter for these tasks
+        filtered_df = self.tasks[(self.tasks['task_id'].isin(reward_task_ids))].copy()
+
+        # debugging
+        filtered_df.to_csv('filtered_df.csv', index=False)
 
         if filtered_df.empty:
             return pd.DataFrame()
@@ -1283,6 +1343,27 @@ def construct_memo(user, memo_type, memo_data):
         memo_format=to_hex(user)
     )
 
+def get_xrp_balance(mainnet_url, address):
+    client = xrpl.clients.JsonRpcClient(mainnet_url)
+    account_info = xrpl.models.requests.account_info.AccountInfo(
+        account=address,
+        ledger_index="validated"
+    )
+    try:
+        response = client.request(account_info)
+        if response.is_successful():
+            return response.result['account_data']['Balance']
+        else:
+            if response.result.get('error') == 'actNotFound':
+                logger.warning(f"XRP account not found: {address}. It may not be activated yet.")
+                return 0
+            else:
+                logger.error(f"Error fetching account info: {response.result.get('error_message', 'Unknown error')}")
+                return None
+    except Exception as e:
+        logger.error(f"Exception when fetching XRP balance: {e}")
+        return None
+
 def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=""):
     client = xrpl.clients.JsonRpcClient(mainnet_url)
     payment = xrpl.models.transactions.Payment(
@@ -1291,6 +1372,10 @@ def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
         destination=destination,
         memos=[Memo(memo_data=str_to_hex(memo))] if memo else None,
     )
+    # Sign the transaction to get the hash
+    # We need to derive the hash because the submit_and_wait function doesn't return a hash if transaction fails
+    signed_tx = xrpl.transaction.sign(payment, wallet)
+    tx_hash = signed_tx.get_hash()
 
     try:    
         response = xrpl.transaction.submit_and_wait(payment, client, wallet)    
@@ -1301,7 +1386,7 @@ def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
         response = f"Unexpected error: {e}"
         logger.error(response)
 
-    return response
+    return tx_hash, response
 
 def is_task_id(memo_dict) -> bool:
     """ This function checks if a memo dictionary contains a task ID or the required fields
@@ -1401,6 +1486,18 @@ def generate_trust_line_to_pft_token(mainnet_url, wallet: xrpl.wallet.Wallet):
         logger.error(f"Trust line creation failed: {response}")
     return response
 
+class GoogleDocNotFoundException(Exception):
+    """ This exception is raised when the Google Doc is not found """
+    def __init__(self, google_url):
+        self.google_url = google_url
+        super().__init__(f"Google Doc not found: {google_url}")
+
+class XRPAccountNotFoundException(Exception):
+    """ This exception is raised when the XRP account is not found """
+    def __init__(self, address):
+        self.address = address
+        super().__init__(f"XRP account not found: {address}")
+
 class NoMatchingTaskException(Exception):
     """ This exception is raised when no matching task is found """
     def __init__(self, task_id):
@@ -1413,6 +1510,30 @@ class WrongTaskStateException(Exception):
         self.expected_status = expected_status
         self.actual_status = actual_status
         super().__init__(f"Expected status: {expected_status}, actual status: {actual_status}")
+
+class InvalidGoogleDocException(Exception):
+    """ This exception is raised when the google doc is not valid """
+    def __init__(self, google_url):
+        self.google_url = google_url
+        super().__init__(f"Invalid Google Doc URL: {google_url}")
+
+class GoogleDocDoesNotContainXrpAddressException(Exception):
+    """ This exception is raised when the google doc does not contain the XRP address """
+    def __init__(self, xrp_address):
+        self.xrp_address = xrp_address
+        super().__init__(f"Google Doc does not contain expected XRP address: {xrp_address}")
+
+class GoogleDocIsNotFundedException(Exception):
+    """ This exception is raised when the google doc's XRP address is not funded """
+    def __init__(self, google_url):
+        self.google_url = google_url
+        super().__init__(f"Google Doc's XRP address is not funded: {google_url}")
+
+class GoogleDocIsNotSharedException(Exception):
+    """ This exception is raised when the google doc is not shared """
+    def __init__(self, google_url):
+        self.google_url = google_url
+        super().__init__(f"Google Doc is not shared: {google_url}")
 
 # class ProcessUserWebData:
 #     def __init__(self):

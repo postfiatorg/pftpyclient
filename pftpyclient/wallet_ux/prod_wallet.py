@@ -8,7 +8,8 @@ import asyncio
 from threading import Thread
 import wx.lib.newevent
 import nest_asyncio
-from pftpyclient.task_manager.basic_tasks import PostFiatTaskManager, WalletInitiationFunctions, NoMatchingTaskException, WrongTaskStateException
+from pftpyclient.task_manager.basic_tasks import GoogleDocNotFoundException, InvalidGoogleDocException, PostFiatTaskManager, WalletInitiationFunctions, NoMatchingTaskException, WrongTaskStateException, is_over_1kb
+from pftpyclient.user_login.credential_input import cache_credentials, get_credential_file_path
 import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
@@ -471,11 +472,32 @@ class WalletApp(wx.Frame):
         
         user_details_sizer = wx.BoxSizer(wx.VERTICAL)
 
+        # XRP Address
+        self.lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
+        user_details_sizer.Add(self.lbl_xrp_address, flag=wx.ALL, border=5)
+        self.txt_xrp_address = wx.TextCtrl(panel)
+        user_details_sizer.Add(self.txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # XRP Secret
+        secret_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
+        user_details_sizer.Add(self.lbl_xrp_secret, flag=wx.ALL, border=5)
+        self.txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)  # TODO: make a checkbox to show/hide the secret
+        secret_sizer.Add(self.txt_xrp_secret, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        self.chk_show_secret = wx.CheckBox(panel, label="Show Secret")
+        secret_sizer.Add(self.chk_show_secret, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        user_details_sizer.Add(secret_sizer, flag=wx.EXPAND)
+
+        self.chk_show_secret.Bind(wx.EVT_CHECKBOX, self.on_toggle_secret_visibility_user_details)
+
         # Username
         self.lbl_username = wx.StaticText(panel, label="Username:")
         user_details_sizer.Add(self.lbl_username, flag=wx.ALL, border=5)
-        self.txt_username = wx.TextCtrl(panel)
+        self.txt_username = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
         user_details_sizer.Add(self.txt_username, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Bind event to force lowercase
+        self.txt_username.Bind(wx.EVT_TEXT, self.on_force_lowercase)
 
         # Password
         self.lbl_password = wx.StaticText(panel, label="Password:")
@@ -495,18 +517,6 @@ class WalletApp(wx.Frame):
         self.txt_google_doc = wx.TextCtrl(panel)
         user_details_sizer.Add(self.txt_google_doc, flag=wx.EXPAND | wx.ALL, border=5)
 
-        # XRP Address
-        self.lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
-        user_details_sizer.Add(self.lbl_xrp_address, flag=wx.ALL, border=5)
-        self.txt_xrp_address = wx.TextCtrl(panel)
-        user_details_sizer.Add(self.txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
-
-        # XRP Secret
-        self.lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
-        user_details_sizer.Add(self.lbl_xrp_secret, flag=wx.ALL, border=5)
-        self.txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        user_details_sizer.Add(self.txt_xrp_secret, flag=wx.EXPAND | wx.ALL, border=5)
-
         # Commitment
         self.lbl_commitment = wx.StaticText(panel, label="Please write 1 sentence committing to a long term objective of your choosing:")
         user_details_sizer.Add(self.lbl_commitment, flag=wx.ALL, border=5)
@@ -514,25 +524,40 @@ class WalletApp(wx.Frame):
         user_details_sizer.Add(self.txt_commitment, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Info
+        # TODO: Move where this is displayed to the login screen
         self.lbl_info = wx.StaticText(panel, label="Paste Your XRP Address in the first line of your Google Doc and make sure that anyone who has the link can view Before Genesis")
         user_details_sizer.Add(self.lbl_info, flag=wx.ALL, border=5)
+
+        # Tooltips
+        self.tooltip_xrp_address = wx.ToolTip("This is your XRP address. It is used to receive XRP or PFT.")
+        self.tooltip_xrp_secret = wx.ToolTip("This is your XRP secret. NEVER SHARE THIS SECRET WITH ANYONE! NEVER LOSE THIS SECRET!")
+        self.tooltip_username = wx.ToolTip("Set a username that you will use to log in with. You can use lowercase letters, numbers, and underscores.")
+        self.tooltip_password = wx.ToolTip("Set a password that you will use to log in with. This password is used to encrypt your XRP address and secret.")
+        self.tooltip_confirm_password = wx.ToolTip("Confirm your password.")
+        self.tooltip_google_doc = wx.ToolTip("This is the link to your Google Doc. 1) It must be a shareable link. 2) The first line of the document must be your XRP address.")
+        self.txt_xrp_address.SetToolTip(self.tooltip_xrp_address)
+        self.txt_xrp_secret.SetToolTip(self.tooltip_xrp_secret)
+        self.txt_username.SetToolTip(self.tooltip_username)
+        self.txt_password.SetToolTip(self.tooltip_password)
+        self.txt_confirm_password.SetToolTip(self.tooltip_confirm_password)
+        self.txt_google_doc.SetToolTip(self.tooltip_google_doc)
 
         # Buttons
         self.btn_generate_wallet = wx.Button(panel, label="Generate New XRP Wallet")
         user_details_sizer.Add(self.btn_generate_wallet, flag=wx.ALL, border=5)
         self.btn_generate_wallet.Bind(wx.EVT_BUTTON, self.on_generate_wallet)
 
+        self.btn_existing_user = wx.Button(panel, label="Cache Credentials")
+        user_details_sizer.Add(self.btn_existing_user, flag=wx.ALL, border=5)
+        self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
+
         self.btn_genesis = wx.Button(panel, label="Genesis")
         user_details_sizer.Add(self.btn_genesis, flag=wx.ALL, border=5)
         self.btn_genesis.Bind(wx.EVT_BUTTON, self.on_genesis)
 
-        self.btn_existing_user = wx.Button(panel, label="Cache Existing User")
-        user_details_sizer.Add(self.btn_existing_user, flag=wx.ALL, border=5)
-        self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_existing_user)
-
-        self.btn_delete_user = wx.Button(panel, label="Delete Existing User")
-        user_details_sizer.Add(self.btn_delete_user, flag=wx.ALL, border=5)
-        self.btn_delete_user.Bind(wx.EVT_BUTTON, self.on_delete_user)
+        # self.btn_delete_user = wx.Button(panel, label="Delete Existing User")
+        # user_details_sizer.Add(self.btn_delete_user, flag=wx.ALL, border=5)
+        # self.btn_delete_user.Bind(wx.EVT_BUTTON, self.on_delete_user)
 
         sizer.Add(user_details_sizer, 1, wx.EXPAND | wx.ALL, 10)
 
@@ -540,6 +565,35 @@ class WalletApp(wx.Frame):
 
         return panel
     
+    def on_force_lowercase(self, event):
+        value = self.txt_username.GetValue()
+        lowercase_value = value.lower()
+        if value != lowercase_value:
+            self.txt_username.SetValue(lowercase_value)
+            self.txt_username.SetInsertionPointEnd()
+    
+    def on_toggle_secret_visibility_user_details(self, event):
+        if self.chk_show_secret.IsChecked():
+            self.txt_xrp_secret.SetWindowStyle(wx.TE_PROCESS_ENTER)  # Default style
+        else:
+            self.txt_xrp_secret.SetWindowStyle(wx.TE_PASSWORD)
+
+        # Store the current value and cursor position
+        current_value = self.txt_xrp_secret.GetValue()
+
+        # Recreate the text control with the new style
+        new_txt_xrp_secret = wx.TextCtrl(self.txt_xrp_secret.GetParent(), 
+                                        value=current_value,
+                                        style=self.txt_xrp_secret.GetWindowStyle())
+        
+        # Replace the old control with the new one in the sizer
+        self.txt_xrp_secret.GetContainingSizer().Replace(self.txt_xrp_secret, new_txt_xrp_secret)
+        self.txt_xrp_secret.Destroy()
+        self.txt_xrp_secret = new_txt_xrp_secret
+
+        # Refresh the layout
+        self.txt_xrp_secret.GetParent().Layout()
+
     def on_generate_wallet(self, event):
         # Generate a new XRP wallet
         self.wallet = Wallet.create()
@@ -558,28 +612,43 @@ class WalletApp(wx.Frame):
         commitment = self.txt_commitment.GetValue()  # Get the user commitment
 
         if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
-            wx.MessageBox('Passwords Do Not Match Please Retry', 'Info', wx.OK | wx.ICON_INFORMATION)
+            wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Info', wx.OK | wx.ICON_INFORMATION)
+        # if any of the fields are empty, show an error message 
+        elif any(not value for value in input_map.values()) or commitment == "":
+            wx.MessageBox('All fields are required for genesis!', 'Info', wx.OK | wx.ICON_INFORMATION)
         else:
-            # Call the caching function
-            output_string = wallet_functions.given_input_map_cache_credentials_locally(input_map)
-
-            # TODO: Why is this output_string labeled Genesis Result?
-            wx.MessageBox(output_string, 'Genesis Result', wx.OK | wx.ICON_INFORMATION)
-
             # initialize "pre-wallet" that helps with initiation
             wallet_functions = WalletInitiationFunctions(input_map, commitment)
 
-            # generate trust line to PFT token
-            wallet_functions.handle_trust_line()
+            try:
+                wallet_functions.check_if_google_doc_is_valid()
+            except Exception as e:
+                wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
+            else:
+                try:
+                    response = wallet_functions.cache_credentials(input_map)
+                except Exception as e:
+                    wx.MessageBox(f"Error caching credentials: {e}", 'Error', wx.OK | wx.ICON_ERROR)
+                else:
+                    wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
 
-            # Call send_initiation_rite with the gathered data
-            wallet_functions.send_initiation_rite()
+                    # generate trust line to PFT token
+                    wallet_functions.handle_trust_line()
 
-    def on_delete_user(self, event):
-        self.clear_credential_file()
-        wx.MessageBox('User Credential Cache Deleted', 'Info', wx.OK | wx.ICON_INFORMATION)
+                    # Call send_initiation_rite with the gathered data
+                    response = wallet_functions.send_initiation_rite()
 
-    def on_existing_user(self, event):
+                    formatted_response = self.format_response(response)
+
+                    logger.info(f"Genesis Result: {formatted_response}")
+
+                    dialog = SelectableMessageDialog(self, "Genesis Result", formatted_response)
+                    dialog.ShowModal()
+                    dialog.Destroy()
+
+    def on_cache_user(self, event):
+        #TODO: Phase out this method in favor of automatic caching on genesis
+        """Caches the user's credentials"""
         input_map = {
             'Username_Input': self.txt_username.GetValue(),
             'Password_Input': self.txt_password.GetValue(),
@@ -589,19 +658,27 @@ class WalletApp(wx.Frame):
             'Confirm Password_Input': self.txt_confirm_password.GetValue(),
         }
 
-        logger.debug(f"input_map: {input_map}")
-
         if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
-            wx.MessageBox('Passwords Do Not Match Please Retry', 'Info', wx.OK | wx.ICON_INFORMATION)
-
+            wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
+        elif any(not value for value in input_map.values()):
+            wx.MessageBox('All fields (except commitment) are required for caching!', 'Error', wx.OK | wx.ICON_ERROR)
         else:
-            wallet_functions = WalletInitiationFunctions()
-            wallet_functions.given_input_map_cache_credentials_locally(input_map)
-            wx.MessageBox('Existing User Information Cached. Please proceed to Log In', 'Info', wx.OK | wx.ICON_INFORMATION)
-
-    def clear_credential_file(self):
-        self.wallet = WalletInitiationFunctions()
-        self.wallet.clear_credential_file()
+            wallet_functions = WalletInitiationFunctions(input_map)
+            try:
+                wallet_functions.check_if_google_doc_is_valid()
+            # Invalid Google Doc URL's are fatal, since they cannot be easily changed once cached
+            except (InvalidGoogleDocException, GoogleDocNotFoundException) as e:
+                wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
+            # Other exceptions are non-fatal, since the user can make adjustments without modifying cached credentials
+            except Exception as e:
+                # Present the error message to the user, but allow them to continue caching credentials
+                if wx.YES == wx.MessageBox(f"{e}. \n\nContinue caching anyway?", 'Error', wx.YES_NO | wx.ICON_ERROR):
+                    try:
+                        response = wallet_functions.cache_credentials(input_map)
+                    except Exception as e:
+                        wx.MessageBox(f"Error caching credentials: {e}", 'Error', wx.OK | wx.ICON_ERROR)
+                    else:
+                        wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
 
     def on_login(self, event):
         username = self.txt_user.GetValue()
@@ -819,7 +896,6 @@ class WalletApp(wx.Frame):
             if event.target == "rewards":
                 self.populate_rewards_grid(event.data)
             elif event.target == "verification":
-                logger.debug("Updating verification grid")
                 self.populate_verification_grid(event.data)
             else:
                 self.populate_proposals_grid(event.data)
@@ -1122,11 +1198,12 @@ class WalletApp(wx.Frame):
         wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
 
     def on_submit_xrp_payment(self, event):
-        response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
-                                                destination=self.txt_xrp_address_payment.GetValue(), 
-                                                memo=self.txt_xrp_memo.GetValue()
+        tx_hash, response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
+                                                        destination=self.txt_xrp_address_payment.GetValue(), 
+                                                        memo=self.txt_xrp_memo.GetValue()
         )
-        formatted_response = self.format_response(response)
+        logger.debug(f"response: {response}")
+        formatted_response = self.format_response(tx_hash, response)
 
         logger.info(f"XRP Payment Result: {formatted_response}")
 
@@ -1135,6 +1212,13 @@ class WalletApp(wx.Frame):
         dialog.Destroy()
 
     def on_submit_pft_payment(self, event):
+
+        if is_over_1kb(self.txt_pft_memo.GetValue()):
+            if wx.YES == wx.MessageBox("Memo is over 1 KB, transaction will be batch-sent. Continue?", "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
+                pass
+            else:
+                return
+
         response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
                                                 destination=self.txt_pft_address_payment.GetValue(), 
                                                 memo=self.txt_pft_memo.GetValue()
@@ -1152,11 +1236,11 @@ class WalletApp(wx.Frame):
         secret = self.wallet.seed
         wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
 
-    def format_response(self, response):
+    def format_response(self, tx_hash, response):
         if isinstance(response, list):
             response = response[0]  # Take the first transaction if its a list
 
-        if response.status == "success":
+        if hasattr(response, 'status') and response.status == "success":
             tx_json = response.result.get('tx_json', {})
             meta = response.result.get('meta', {})
             livenet_link = f"https://livenet.xrpl.org/transactions/{response.result.get('hash', 'N/A')}"
@@ -1197,7 +1281,18 @@ class WalletApp(wx.Frame):
 
             return formatted_response
         else:
-            return f"Transaction Failed\nError: {response.result.get('error message', 'Unknown error')}\n"
+            #TODO: tx_hash does not match the hash in the response
+            # livenet_link = f"https://livenet.xrpl.org/transactions/{tx_hash}"
+            livenet_link = f"https://livenet.xrpl.org/accounts/{self.wallet.classic_address}"
+
+
+            formatted_response = (
+                f"Transaction Failed\n"
+                f"Error: {response}\n"
+                f"Check details at: <a href='{livenet_link}'>{livenet_link}</a>\n\n"
+            )
+            
+            return formatted_response
         
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
