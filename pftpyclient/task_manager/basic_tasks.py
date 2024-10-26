@@ -74,9 +74,9 @@ class WalletInitiationFunctions:
             return f"Failed to retrieve the document. Status code: {response.status_code}"
 
     def send_initiation_rite(self):
-        memo = Memo(memo_data=self.user_commitment, memo_type='INITIATION_RITE', memo_format=to_hex(self.username))
+        memo = construct_initiation_rite_memo(user=self.username, commitment=self.user_commitment)
         return send_xrp(mainnet_url=self.mainnet_url,
-                        sending_wallet=self.wallet, 
+                        wallet=self.wallet, 
                         amount=1, 
                         destination=self.default_node, 
                         memo=memo)
@@ -140,100 +140,6 @@ class WalletInitiationFunctions:
         """ Caches the user's credentials """
         return cache_credentials(input_map)
 
-
-    # def check_if_there_is_funded_account_at_front_of_google_doc(self, google_url):
-    #     """
-    #     Checks if there is a balance bearing XRP account address at the front of the google document 
-    #     This is required for the user 
-
-    #     Returns the balance in XRP drops 
-    #     EXAMPLE
-    #     google_url = 'https://docs.google.com/document/d/1MwO8kHny7MtU0LgKsFTBqamfuUad0UXNet1wr59iRCA/edit'
-    #     """
-    #     balance = 0
-    #     try:
-    #         google_doc_text = self.get_google_doc_text(google_url)
-
-    #         # Split the text into lines
-    #         lines = google_doc_text.split('\n')
-
-    #         # Regular expression for XRP address
-    #         xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
-
-    #         wallet_at_front_of_doc = None
-    #         # look through the first 5 lines for an XRP address
-    #         for line in lines[:5]:
-    #             match = re.search(xrp_address_pattern, line)
-    #             if match:
-    #                 wallet_at_front_of_doc = match.group()
-    #                 break
-
-    #         if not wallet_at_front_of_doc:
-    #             logger.warning(f"No XRP address found in the first 5 lines of the document")
-    #             return balance
-
-    #         account_info = self.get_account_info(wallet_at_front_of_doc)
-    #         balance = Decimal(account_info['Balance'])
-
-    #     except Exception as e:
-    #         logger.error(f"Error: {e}")
-
-    #     return balance
-
-    # def given_input_map_cache_credentials_locally(self, input_map):
-    #     """ EXAMPLE 
-    #     input_map = {'Username_Input': 'goodalexander',
-    #                 'Password_Input': 'everythingIsRigged1a',
-    #                 'Google Doc Share Link_Input':'https://docs.google.com/document/d/1MwO8kHny7MtU0LgKsFTBqamfuUad0UXNet1wr59iRCA/edit',
-    #                  'XRP Address_Input':'r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
-    #                  'XRP Secret_Input': '<USER SEED ENTER HERE>'}
-    #     """ 
-        
-    #     has_variables_defined = False
-    #     zero_balance = True
-    #     balance = self.check_if_there_is_funded_account_at_front_of_google_doc(google_url=input_map['Google Doc Share Link_Input'])
-    #     logger.debug(f"balance: {balance}")
-
-    #     if balance > 0:
-    #         zero_balance = False
-    #     existing_keys= list(output_cred_map().keys())
-    #     if 'postfiatusername' in existing_keys:
-    #         has_variables_defined = True
-    #     output_string = ''
-    #     if zero_balance == True:
-    #         output_string=output_string+f"""XRP Wallet at Top of Google Doc {input_map['Google Doc Share Link_Input']} Has No Balance
-    #         Fund Your XRP Wallet and Place at Top of Google Doc
-    #         """
-    #     if has_variables_defined == True:
-    #         output_string=output_string+f""" 
-    #     Variables are already defined in {CREDENTIAL_FILE_PATH}"""
-    #     error_message = output_string.strip()
-
-    #     print(f"error_message: {error_message}")
-
-    #     if error_message == '':
-    #         print("CACHING CREDENTIALS")
-    #         key_to_input1= f'{input_map['Username_Input']}__v1xrpaddress'
-    #         key_to_input2= f'{input_map['Username_Input']}__v1xrpsecret'
-    #         key_to_input3='postfiatusername'
-    #         key_to_input4 = f'{input_map['Username_Input']}__googledoc'
-    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input1, 
-    #                                                      pw_data=input_map['XRP Address_Input'], 
-    #                                                      pw_encryptor=input_map['Password_Input'])
-    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input2, 
-    #                                                      pw_data=input_map['XRP Secret_Input'], 
-    #                                                      pw_encryptor=input_map['Password_Input'])
-            
-    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input3, 
-    #                                                      pw_data=input_map['Username_Input'], 
-    #                                                      pw_encryptor=input_map['Password_Input'])
-    #         enter_and_encrypt_credential__variable_based(credential_ref=key_to_input4, 
-    #                                                      pw_data=input_map['Google Doc Share Link_Input'], 
-    #                                                      pw_encryptor=input_map['Password_Input'])
-    #         error_message = f'Information Cached and Encrypted Locally Using Password at {CREDENTIAL_FILE_PATH}'
-
-    #     return error_message
-
 class PostFiatTaskManager:
     
     def __init__(self,username,password):
@@ -244,6 +150,7 @@ class PostFiatTaskManager:
         self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
         self.trust_line_default = '100000000'
         self.user_wallet = self.spawn_user_wallet()
+        self.google_doc_link = self.pw_map[self.credential_manager.google_doc_name]
         
         # TODO: Find a use for this or delete
         # self.user_google_doc = self.pw_map[self.credential_manager.google_doc_name]
@@ -259,10 +166,10 @@ class PostFiatTaskManager:
         self.sync_transactions()
 
         # for debugging purposes only
-        # self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
-        # self.tasks_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.csv")
-        # self.save_memos_to_csv()
-        # self.save_tasks_to_csv()
+        self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
+        self.tasks_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.csv")
+        self.save_memos_to_csv()
+        self.save_tasks_to_csv()
 
         # CHECKS
         # checks if the user has a trust line to the PFT token, and creates one if not
@@ -273,7 +180,7 @@ class PostFiatTaskManager:
 
         # TODO: Prompt user for google doc through the UI, not through the code
         # check if the user has sent a google doc to the node, and sends one if not
-        # self.handle_google_doc()
+        self.handle_google_doc()
 
     def get_xrp_balance(self):
         return get_xrp_balance(self.mainnet_url, self.user_wallet.classic_address)
@@ -524,12 +431,13 @@ class PostFiatTaskManager:
 
     def send_pft(self, amount, destination, memo=""):
         """ Sends PFT tokens to a destination address with optional memo. 
-        If the memo is over 1 KB, it is split into multiple memos"""
-
-        response = []
+        If the memo is over 1 KB, it is split into multiple memos and response will be a list of responses"""
 
         # Check if the memo is a string and exceeds 1 KB
-        if is_over_1kb(memo):
+        # TODO: This is a temporary fix to handle the memo type
+        # TODO: We need to handle the memo type properly
+        if isinstance(memo, str) and is_over_1kb(memo):
+            response = []
             logger.debug("Memo exceeds 1 KB, splitting into chunks")
             chunked_memo = self._build_chunked_memo(memo)
 
@@ -542,7 +450,7 @@ class PostFiatTaskManager:
         
         else:
             logger.debug("Memo is under 1 KB, sending in a single transaction")
-            response.append(self._send_pft_single(amount, destination, memo))
+            response = self._send_pft_single(amount, destination, memo)
 
         return response
 
@@ -575,8 +483,8 @@ class PostFiatTaskManager:
         # Sign the transaction to get the hash
         # We need to derive the hash because the submit_and_wait function doesn't return a hash if transaction fails
         # TODO: tx_hash does not match the hash in the response
-        signed_tx = xrpl.transaction.sign(payment, self.user_wallet)
-        tx_hash = signed_tx.get_hash()
+        # signed_tx = xrpl.transaction.sign(payment, self.user_wallet)
+        # tx_hash = signed_tx.get_hash()
 
         try:
             logger.debug("Submitting and waiting for transaction")
@@ -589,7 +497,7 @@ class PostFiatTaskManager:
             response = f"Unexpected error: {e}"
             logger.error(response)
 
-        return tx_hash, response
+        return response
     
     def _get_memo_chunks(self, memo):
         """Helper method to split a memo into chunks of 1 KB """
@@ -623,15 +531,15 @@ class PostFiatTaskManager:
         return chunked_memo
     
 ## MEMO FORMATTING AND MEMO CREATION TOOLS
-    def construct_basic_postfiat_memo(self, user, task_id, full_output):
-        user_hex = to_hex(user)
-        task_id_hex = to_hex(task_id)
-        full_output_hex = to_hex(full_output)
-        memo = Memo(
-        memo_data=full_output_hex,
-        memo_type=task_id_hex,
-        memo_format=user_hex)  
-        return memo
+    # def construct_basic_postfiat_memo(self, user, task_id, full_output):
+    #     user_hex = to_hex(user)
+    #     task_id_hex = to_hex(task_id)
+    #     full_output_hex = to_hex(full_output)
+    #     memo = Memo(
+    #     memo_data=full_output_hex,
+    #     memo_type=task_id_hex,
+    #     memo_format=user_hex)  
+    #     return memo
     
     def get_account_transactions__limited(self, account_address,
                                     ledger_index_min=-1,
@@ -801,18 +709,20 @@ class PostFiatTaskManager:
         print(f"Longest list of transactions: {len(longest_transactions)} transactions")
         return longest_transactions
     
-    def retrieve_context_doc(self):
+    def get_latest_outgoing_context_doc_link(self):
         """ This function gets the most recent google doc context link for a given account address """
 
-        most_recent_context_link=''
+        logger.debug("Getting latest outgoing context doc link...")
 
         # Filter for memos that are PFT-related, sent to the default node, outgoing, and are google doc context links
         redux_tx_list = self.memos[
             self.memos['is_pft'] & 
             (self.memos['destination']==self.default_node) &
             (self.memos['message_type']=='OUTGOING') & 
-            (self.memos['task_id']=='google_doc_context_link')
+            (self.memos['memo_data'].apply(lambda x: x['task_id']) == 'google_doc_context_link')
             ]
+        
+        logger.debug(f"Found {len(redux_tx_list)} outgoing context doc links")
         
         if len(redux_tx_list) == 0:
             logger.warning("No Google Doc context link found")
@@ -820,13 +730,12 @@ class PostFiatTaskManager:
         
         # Get the most recent google doc context link
         most_recent_context_link = redux_tx_list.tail(1)
-        # Get the full output from the most recent google doc context link
-        link = most_recent_context_link['memo_data'].apply(lambda x: x['full_output'])[0]
+
+        link = most_recent_context_link['memo_data'].iloc[0]['full_output']
+
+        logger.debug(f"Most recent context doc link: {link}")
 
         return link
-    
-    def generate_google_doc_context_memo(self,user,google_doc_link):                  
-        return construct_memo(user, 'google_doc_context_link', google_doc_link) 
 
     def output_account_address_node_association(self):
         """this takes the account info frame and figures out what nodes
@@ -845,7 +754,7 @@ class PostFiatTaskManager:
     def handle_genesis(self):
         """ Checks if the user has sent a genesis to the node, and sends one if not """
         if not self.genesis_sent():
-            logger.debug("User has not sent genesis, sending...")
+            logger.debug("User has not sent genesis...")
             self.send_genesis()
         else:
             logger.debug("User has already sent genesis, skipping...")
@@ -859,54 +768,33 @@ class PostFiatTaskManager:
         """ Sends a user genesis transaction to the default node 
         Currently requires 7 PFT
         """
-        logger.debug("Initializing Node Genesis Transaction...")
-        genesis_memo = self.construct_basic_postfiat_memo(
+        logger.debug("Sending node genesis transaction...")
+        genesis_memo = construct_genesis_memo(
             user=self.credential_manager.postfiat_username,
-            task_id=self.generate_custom_id(), 
+            task_id=self.generate_custom_id(),
             full_output=f'USER GENESIS __ user: {self.credential_manager.postfiat_username}'
-            )
+        )
         self.send_pft(amount=7, destination=self.default_node, memo=genesis_memo)
 
-    # def handle_google_doc(self):
-    #     """Checks for google doc and prompts user to send if not found"""
-    #     if not self.google_doc_sent():
-    #         logger.debug("Google Doc not found.")
-    #         self.send_google_doc()
-    #     else:
-    #         logger.debug("Google Doc already sent, skipping...")
+    def handle_google_doc(self):
+        """Checks for google doc and prompts user to send if not found"""
+        logger.debug("Checking if Google Doc context link has already been sent...")
 
-    # def google_doc_sent(self):
-    #     return self.default_node in self.retrieve_context_doc()
+        link = self.get_latest_outgoing_context_doc_link()
+
+        if link:
+            logger.debug(f"Google Doc already sent: {link}")
+        else:
+            logger.debug("Google Doc context link not found amongst outgoing memos.")
+            self.send_google_doc()
     
-    # def send_google_doc(self, user_google_doc):
-    #     """ Sends the Google Doc context link to the node """
-    #     google_doc_memo = self.generate_google_doc_context_memo(user=self.credential_manager.postfiat_username,
-    #                                                                 google_doc_link=user_google_doc)
-    #     self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
-
-    # def send_google_doc_to_node_if_not_sent(self, user_google_doc):
-    #     """
-    #     Sends the Google Doc context link to the node if it hasn't been sent already.
-    #     """
-    #     print("Checking if Google Doc context link has already been sent...")
-        
-    #     # Check if the Google Doc context link has been sent
-    #     existing_link = self.retrieve_context_doc()
-        
-    #     if existing_link:
-    #         print("Google Doc context link already sent:", existing_link)
-    #     else:
-    #         print("Google Doc context link not found. Sending now...")
-    #         google_doc_link = user_google_doc
-    #         user_name_to_send = self.credential_manager.postfiat_username
-            
-    #         # Construct the memo
-    #         google_doc_memo = self.generate_google_doc_context_memo(user=user_name_to_send,
-    #                                                                 google_doc_link=google_doc_link)
-            
-    #         # Send the memo to the default node
-    #         self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
-    #         print("Google Doc context link sent.")
+    def send_google_doc(self):
+        """ Sends the Google Doc context link to the node """
+        logger.debug(f"Sending Google Doc context link to the node: {self.google_doc_link}")
+        google_doc_memo = construct_google_doc_context_memo(user=self.credential_manager.postfiat_username,
+                                                                    google_doc_link=self.google_doc_link)
+        self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
+        logger.debug("Google Doc context link sent.")
 
     # def check_and_prompt_google_doc(self):
     #     """
@@ -927,7 +815,6 @@ class PostFiatTaskManager:
             
     #         # Send the Google Doc context link to the default node
     #         self.send_google_doc_to_node_if_not_sent(user_google_doc = user_google_doc)
-
 
     def get_proposals_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
@@ -956,11 +843,16 @@ class PostFiatTaskManager:
         # Rename the columns for clarity
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'RESPONSE':'response'}, inplace=True)
 
-        # Clean up the proposal and response columns
-        pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('ACCEPTANCE REASON ___ ','ACCEPTED: ').replace('nan',''))
-        pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('REFUSAL REASON ___ ','REFUSED: ').replace('nan',''))
+        # Clean up the proposal column
         pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
-
+        
+        # Clean up the response column, if it exists (does not exist for the first proposal)
+        if 'response' in pivoted_df.columns:
+            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('ACCEPTANCE REASON ___ ','ACCEPTED: ').replace('nan',''))
+            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('REFUSAL REASON ___ ','REFUSED: ').replace('nan',''))
+        else:
+            pivoted_df['response'] = ''
+        
         # Reverse order to get the most recent proposals first
         result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
@@ -1063,7 +955,7 @@ class PostFiatTaskManager:
             classified_string='ACCEPTANCE REASON ___ '+acceptance_string
         else:
             classified_string=acceptance_string
-        constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
+        constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                     task_id=task_id, full_output=classified_string)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_acceptance_for_task_id response: {response}")
@@ -1103,7 +995,7 @@ class PostFiatTaskManager:
             == task_id].tail(1)['node_account'])[0]
         if 'REFUSAL REASON ___' not in refusal_reason:
             refusal_reason = 'REFUSAL REASON ___ ' + refusal_reason
-        constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
+        constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, full_output=refusal_reason)
         response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
         logger.debug(f"send_refusal_for_task response: {response}")
@@ -1134,7 +1026,7 @@ class PostFiatTaskManager:
             classified_request_msg = 'REQUEST_POST_FIAT ___ ' + request_message
         else:
             classified_request_msg = request_message
-        constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
+        constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, 
                                                                full_output=classified_request_msg)
         # Send the memo to the default node
@@ -1167,7 +1059,7 @@ class PostFiatTaskManager:
             classified_completion_str = 'COMPLETION JUSTIFICATION ___ ' + completion_string
         else:
             classified_completion_str = completion_string
-        constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
+        constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                               task_id=task_id, 
                                                               full_output=classified_completion_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
@@ -1199,7 +1091,7 @@ class PostFiatTaskManager:
             classified_response_str = 'VERIFICATION RESPONSE ___ ' + response_string
         else:
             classified_response_str = response_string
-        constructed_memo = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
+        constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                               task_id=task_id, 
                                                               full_output=classified_response_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
@@ -1318,7 +1210,7 @@ class PostFiatTaskManager:
 
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
         pomodoro_id = task_id.replace('__','==')
-        memo_to_send = self.construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username,
+        memo_to_send = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username,
                                            task_id=pomodoro_id, full_output=pomodoro_text)
         response = self.send_pft(amount=1, destination=self.default_node, memo=memo_to_send)
         return response
@@ -1335,6 +1227,18 @@ def is_over_1kb(string):
 
 def to_hex(string):
     return binascii.hexlify(string.encode()).decode()
+
+def construct_basic_postfiat_memo(user, task_id, full_output):
+    return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
+
+def construct_initiation_rite_memo(user='goodalexander', commitment='I commit to generating massive trading profits using AI and investing them to grow the Post Fiat Network'):
+    return construct_memo(user=user, memo_type='INITIATION_RITE', memo_data=commitment)
+
+def construct_google_doc_context_memo(user, google_doc_link):                  
+    return construct_memo(user=user, memo_type='google_doc_context_link', memo_data=google_doc_link) 
+
+def construct_genesis_memo(user, task_id, full_output):
+    return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
 
 def construct_memo(user, memo_type, memo_data):
     return Memo(
@@ -1366,16 +1270,29 @@ def get_xrp_balance(mainnet_url, address):
 
 def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=""):
     client = xrpl.clients.JsonRpcClient(mainnet_url)
+
+    logger.debug(f"Sending {amount} XRP to {destination} with memo {memo}")
+
+    # Handle memo
+    if isinstance(memo, Memo):
+        memos = [memo]
+    elif isinstance(memo, str):
+        memos = [Memo(memo_data=str_to_hex(memo))]
+    else:
+        logger.error("Memo is not a string or a Memo object, raising ValueError")
+        raise ValueError("Memo must be either a string or a Memo object")
+
     payment = xrpl.models.transactions.Payment(
         account=wallet.address,
         amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
         destination=destination,
-        memos=[Memo(memo_data=str_to_hex(memo))] if memo else None,
+        memos=memos,
     )
     # Sign the transaction to get the hash
     # We need to derive the hash because the submit_and_wait function doesn't return a hash if transaction fails
-    signed_tx = xrpl.transaction.sign(payment, wallet)
-    tx_hash = signed_tx.get_hash()
+    # TODO: tx_hash currently not used because it doesn't match the hash produced by xrpl.transaction.submit_and_wait
+    # signed_tx = xrpl.transaction.sign(payment, wallet)
+    # tx_hash = signed_tx.get_hash()
 
     try:    
         response = xrpl.transaction.submit_and_wait(payment, client, wallet)    
@@ -1386,7 +1303,7 @@ def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
         response = f"Unexpected error: {e}"
         logger.error(response)
 
-    return tx_hash, response
+    return response
 
 def is_task_id(memo_dict) -> bool:
     """ This function checks if a memo dictionary contains a task ID or the required fields

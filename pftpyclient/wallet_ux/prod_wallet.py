@@ -42,6 +42,11 @@ if os.name == 'nt':
         webbrowser.get('windows-default')
     except webbrowser.Error:
         pass
+elif os.name == 'posix':
+    try:
+        webbrowser.get('macosx')
+    except webbrowser.Error:
+        pass
 
 # Apply the nest_asyncio patch
 nest_asyncio.apply()
@@ -647,6 +652,8 @@ class WalletApp(wx.Frame):
                     dialog.ShowModal()
                     dialog.Destroy()
 
+                    wx.MessageBox("Genesis successful! Return to the login screen to and proceed to login.", 'Info', wx.OK | wx.ICON_INFORMATION)
+
     def on_cache_user(self, event):
         #TODO: Phase out this method in favor of automatic caching on genesis
         """Caches the user's credentials"""
@@ -682,6 +689,10 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
 
     def on_login(self, event):
+        # change login button to "Logging in..."
+        self.btn_login.SetLabel("Logging in...")
+        self.btn_login.Update()
+
         username = self.txt_user.GetValue()
         password = self.txt_pass.GetValue()
 
@@ -693,7 +704,7 @@ class WalletApp(wx.Frame):
             return
         except Exception as e:
             logger.error(f"Login failed: {e}")
-            self.show_error("Invalid username or password")
+            self.show_error(f"Login failed: {e}")
             return
         
         self.wallet = self.task_manager.user_wallet
@@ -1199,12 +1210,12 @@ class WalletApp(wx.Frame):
         wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
 
     def on_submit_xrp_payment(self, event):
-        tx_hash, response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
+        response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
                                                         destination=self.txt_xrp_address_payment.GetValue(), 
                                                         memo=self.txt_xrp_memo.GetValue()
         )
         logger.debug(f"response: {response}")
-        formatted_response = self.format_response(tx_hash, response)
+        formatted_response = self.format_response(response)
 
         logger.info(f"XRP Payment Result: {formatted_response}")
 
@@ -1220,11 +1231,11 @@ class WalletApp(wx.Frame):
             else:
                 return
 
-        tx_hash, response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
+        response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
                                                 destination=self.txt_pft_address_payment.GetValue(), 
                                                 memo=self.txt_pft_memo.GetValue()
         )
-        formatted_response = self.format_response(tx_hash, response)
+        formatted_response = self.format_response(response)
 
         logger.info(f"PFT Payment Result: {formatted_response}")
 
@@ -1237,7 +1248,7 @@ class WalletApp(wx.Frame):
         secret = self.wallet.seed
         wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
 
-    def format_response(self, tx_hash, response):
+    def format_response(self, response):
         if isinstance(response, list):
             response = response[0]  # Take the first transaction if its a list
 
@@ -1281,11 +1292,9 @@ class WalletApp(wx.Frame):
                 formatted_response += f"Transaction Result: {meta.get('TransactionResult', 'N/A')}\n"
 
             return formatted_response
-        else:
-            #TODO: tx_hash does not match the hash in the response
-            # livenet_link = f"https://livenet.xrpl.org/transactions/{tx_hash}"
+        
+        elif hasattr(self, 'wallet.classic_address'):
             livenet_link = f"https://livenet.xrpl.org/accounts/{self.wallet.classic_address}"
-
 
             formatted_response = (
                 f"Transaction Failed\n"
@@ -1293,6 +1302,10 @@ class WalletApp(wx.Frame):
                 f"Check details at: <a href='{livenet_link}'>{livenet_link}</a>\n\n"
             )
             
+            return formatted_response
+        
+        else:
+            formatted_response = f"Transaction Failed\nError: {response}"
             return formatted_response
         
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
