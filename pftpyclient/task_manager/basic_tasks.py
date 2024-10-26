@@ -580,7 +580,7 @@ class PostFiatTaskManager:
 
         try:
             logger.debug("Submitting and waiting for transaction")
-            response = xrpl.transaction.submit_and_wait(signed_tx, client, self.user_wallet)    
+            response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
             # response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             response = f"Transaction submission failed: {e}"

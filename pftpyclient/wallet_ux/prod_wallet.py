@@ -402,7 +402,7 @@ class WalletApp(wx.Frame):
         # sizer.Add(logo_ctrl, 0, wx.ALIGN_CENTER | wx.TOP, 20)
 
         # Create a box to center the content
-        box = wx.Panel(panel, size=(250, 230))
+        box = wx.Panel(panel)
         box.SetBackgroundColour(wx.Colour(220, 220, 220))
         box_sizer = wx.BoxSizer(wx.VERTICAL)
 
@@ -437,6 +437,7 @@ class WalletApp(wx.Frame):
         self.btn_new_user = wx.Button(box, label="Create New User")
         box_sizer.Add(self.btn_new_user, flag=wx.EXPAND | wx.ALL, border=5)
         self.btn_new_user.Bind(wx.EVT_BUTTON, self.on_create_new_user)
+        box_sizer.Add(wx.StaticLine(box), 0, wx.EXPAND | wx.TOP, 5)
 
         box.SetSizer(box_sizer)
 
@@ -1219,11 +1220,11 @@ class WalletApp(wx.Frame):
             else:
                 return
 
-        response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
+        tx_hash, response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
                                                 destination=self.txt_pft_address_payment.GetValue(), 
                                                 memo=self.txt_pft_memo.GetValue()
         )
-        formatted_response = self.format_response(response)
+        formatted_response = self.format_response(tx_hash, response)
 
         logger.info(f"PFT Payment Result: {formatted_response}")
 

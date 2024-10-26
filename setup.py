@@ -19,7 +19,8 @@ setup(
         'toml',
         'nest_asyncio',
         'browser_history',
-        'sec-cik-mapper'
+        'sec-cik-mapper',
+        'loguru'
     ],
     author='PFAdmin',
     author_email='admin@postfiat.com',
