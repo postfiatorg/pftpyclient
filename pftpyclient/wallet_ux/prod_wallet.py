@@ -252,6 +252,7 @@ class WalletApp(wx.Frame):
         # Tabs (hidden initially)
         self.tabs = wx.Notebook(self.panel)
         self.tabs.Hide()
+        self.tabs.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_tab_changed)
 
         #################################
         # SUMMARY
@@ -348,7 +349,7 @@ class WalletApp(wx.Frame):
         self.btn_force_update.Bind(wx.EVT_BUTTON, self.on_force_update)
 
         # Add grid to Verification tab
-        verification_columns = [("Task ID", 190), ("Proposal", 300), ("Verification", 250)]
+        verification_columns = [("Task ID", 190), ("Proposal", 300), ("Verification", 400)]
         self.verification_grid = self.setup_grid(gridlib.Grid(self.verification_tab), verification_columns)
         self.verification_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 20)
 
@@ -746,10 +747,14 @@ class WalletApp(wx.Frame):
         except (ValueError, InvalidToken, KeyError) as e:
             logger.error(f"Login failed: {e}")
             self.show_error("Invalid username or password")
+            self.btn_login.SetLabel("Login")
+            self.btn_login.Update()
             return
         except Exception as e:
             logger.error(f"Login failed: {e}")
             self.show_error(f"Login failed: {e}")
+            self.btn_login.SetLabel("Login")
+            self.btn_login.Update()
             return
         
         self.wallet = self.task_manager.user_wallet
@@ -952,6 +957,7 @@ class WalletApp(wx.Frame):
                     self.populate_summary_grid(event.data)
                 case _:
                     logger.error(f"Unknown grid target: {event.target}")
+        self.auto_size_window()
 
     def on_pft_update_timer(self, event):
         if self.wallet:
@@ -965,7 +971,7 @@ class WalletApp(wx.Frame):
         COLUMN_MAPPINGS = {
             'proposals': ['task_id', 'request', 'proposal', 'response'],
             'rewards': ['task_id', 'proposal', 'reward', 'payout'],
-            'verification': ['task_id', 'original_task', 'verification'],
+            'verification': ['task_id', 'proposal', 'verification'],
             'summary': ['Key', 'Value']  # For our converted dictionary data
         }
 
@@ -1015,6 +1021,8 @@ class WalletApp(wx.Frame):
 
         for col, original_width in enumerate(self.grid_column_widths[grid_name]):
             grid.SetColSize(col, int(original_width * self.zoom_factor))
+
+        self.auto_size_window()
 
     def populate_summary_grid(self, key_account_details):
         """Convert dictionary to dataframe and use generic grid population method"""
@@ -1111,6 +1119,12 @@ class WalletApp(wx.Frame):
         self.tabs.Layout()
         for i in range(self.tabs.GetPageCount()):
             self.tabs.GetPage(i).Layout()
+
+        self.auto_size_window()
+
+    def on_tab_changed(self, event):
+        self.auto_size_window()
+        event.Skip()
 
     def on_request_task(self, event):
         # Change button text to "Requesting Task..."
@@ -1254,23 +1268,27 @@ class WalletApp(wx.Frame):
 
         task_id = self.txt_task_id.GetValue()
         response_string = self.txt_verification_details.GetValue()
-        try:
-            response = self.task_manager.send_verification_response(
-                response_string=response_string,
-                task_id=task_id
-            )
-        except Exception as e:
-            logger.error(f"Error sending verification response: {e}")
-            wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
+
+        if not task_id or not response_string:
+            wx.MessageBox("Please enter a task ID and verification details", "Error", wx.OK | wx.ICON_ERROR)
         else:
             try:
-                if response:
-                    message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                    wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
-                else:
-                        logger.error("No response from send_verification_response")
+                response = self.task_manager.send_verification_response(
+                    response_string=response_string,
+                    task_id=task_id
+                )
             except Exception as e:
-                logger.error(f"Error converting response to status message: {e}")
+                logger.error(f"Error sending verification response: {e}")
+                wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
+            else:
+                try:
+                    if response:
+                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
+                        wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
+                    else:
+                            logger.error("No response from send_verification_response")
+                except Exception as e:
+                    logger.error(f"Error converting response to status message: {e}")
 
         # Change button text back to "Submit Verification Details"
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
@@ -1318,9 +1336,13 @@ class WalletApp(wx.Frame):
 
         task_id = self.txt_task_id.GetValue()
         pomodoro_text = self.txt_verification_details.GetValue()
-        response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
-        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-        wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
+
+        if not task_id or not pomodoro_text:
+            wx.MessageBox("Please enter a task ID and pomodoro text", "Error", wx.OK | wx.ICON_ERROR)
+        else:
+            response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
+            message = self.task_manager.ux__convert_response_object_to_status_message(response)
+            wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
 
         # Change button text back to "Log Pomodoro"
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
@@ -1334,20 +1356,19 @@ class WalletApp(wx.Frame):
         # Check that Amount and Destination are valid
         if not self.txt_xrp_amount.GetValue() or not self.txt_xrp_address_payment.GetValue():
             wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
-            return
+        else:
+            response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
+                                                            destination=self.txt_xrp_address_payment.GetValue(), 
+                                                            memo=self.txt_xrp_memo.GetValue()
+            )
+            logger.debug(f"response: {response}")
+            formatted_response = self.format_response(response)
 
-        response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
-                                                        destination=self.txt_xrp_address_payment.GetValue(), 
-                                                        memo=self.txt_xrp_memo.GetValue()
-        )
-        logger.debug(f"response: {response}")
-        formatted_response = self.format_response(response)
+            logger.info(f"XRP Payment Result: {formatted_response}")
 
-        logger.info(f"XRP Payment Result: {formatted_response}")
-
-        dialog = SelectableMessageDialog(self, "XRP Payment Result", formatted_response)
-        dialog.ShowModal()
-        dialog.Destroy()
+            dialog = SelectableMessageDialog(self, "XRP Payment Result", formatted_response)
+            dialog.ShowModal()
+            dialog.Destroy()
 
         # Change button text back to "Submit XRP Payment"
         self.btn_submit_xrp_payment.SetLabel("Submit Payment")
@@ -1361,25 +1382,24 @@ class WalletApp(wx.Frame):
         # Check that Amount and Destination are valid
         if not self.txt_pft_amount.GetValue() or not self.txt_pft_address_payment.GetValue():
             wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
-            return
+        else:
+            if is_over_1kb(self.txt_pft_memo.GetValue()):
+                if wx.YES == wx.MessageBox("Memo is over 1 KB, transaction will be batch-sent. Continue?", "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
+                    pass
+                else:
+                    return
 
-        if is_over_1kb(self.txt_pft_memo.GetValue()):
-            if wx.YES == wx.MessageBox("Memo is over 1 KB, transaction will be batch-sent. Continue?", "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
-                pass
-            else:
-                return
+            response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
+                                                    destination=self.txt_pft_address_payment.GetValue(), 
+                                                    memo=self.txt_pft_memo.GetValue()
+            )
+            formatted_response = self.format_response(response)
 
-        response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
-                                                destination=self.txt_pft_address_payment.GetValue(), 
-                                                memo=self.txt_pft_memo.GetValue()
-        )
-        formatted_response = self.format_response(response)
+            logger.info(f"PFT Payment Result: {formatted_response}")
 
-        logger.info(f"PFT Payment Result: {formatted_response}")
-
-        dialog = SelectableMessageDialog(self, "PFT Payment Result", formatted_response)
-        dialog.ShowModal()
-        dialog.Destroy()
+            dialog = SelectableMessageDialog(self, "PFT Payment Result", formatted_response)
+            dialog.ShowModal()
+            dialog.Destroy()
 
         # Change button text back to "Submit PFT Payment"
         self.btn_submit_pft_payment.SetLabel("Submit Payment")
