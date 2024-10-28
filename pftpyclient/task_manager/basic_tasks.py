@@ -841,10 +841,13 @@ class PostFiatTaskManager:
         pivoted_df = filtered_df.pivot_table(index='task_id', columns='response_type', values='full_output', aggfunc='first').reset_index().copy()
 
         # Rename the columns for clarity
-        pivoted_df.rename(columns={'PROPOSAL':'proposal', 'RESPONSE':'response'}, inplace=True)
+        pivoted_df.rename(columns={'REQUEST_POST_FIAT':'request', 'PROPOSAL':'proposal', 'RESPONSE':'response'}, inplace=True)
 
         # Clean up the proposal column
         pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
+
+        # Clean up the request column
+        pivoted_df['request'] = pivoted_df['request'].apply(lambda x: str(x).replace('REQUEST_POST_FIAT ___ ','').replace('nan',''))
         
         # Clean up the response column, if it exists (does not exist for the first proposal)
         if 'response' in pivoted_df.columns:
@@ -1332,7 +1335,7 @@ def classify_task_string(string):
             'REWARD': ['REWARD RESPONSE __'],
             'TASK_OUTPUT': ['COMPLETION JUSTIFICATION ___'],
             'USER_GENESIS': ['USER GENESIS __'],
-            'REQUEST_POST_FIAT ':['REQUEST_POST_FIAT ___']
+            'REQUEST_POST_FIAT':['REQUEST_POST_FIAT ___']
         }
 
     for category, keywords in categories.items():

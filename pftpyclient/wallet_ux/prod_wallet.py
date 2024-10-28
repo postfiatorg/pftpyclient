@@ -1,7 +1,9 @@
+import time
 import wx
 import wx.adv
 import wx.grid as gridlib
 import wx.html
+import wx.lib.scrolledpanel as scrolled
 import xrpl
 from xrpl.wallet import Wallet
 import asyncio
@@ -16,6 +18,7 @@ from pftpyclient.basic_utilities.configure_logger import configure_logger, updat
 from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
+import pandas as pd
 
 # Configure the logger at module level
 wx_sink = configure_logger(
@@ -52,6 +55,16 @@ elif os.name == 'posix':
 nest_asyncio.apply()
 
 UpdateGridEvent, EVT_UPDATE_GRID = wx.lib.newevent.NewEvent()
+
+class PostFiatWalletApp(wx.App):
+    def OnInit(self):
+        frame = WalletApp()
+        self.SetTopWindow(frame)
+        frame.Show(True)
+        return True
+    
+    def ReopenApp(self):
+        self.GetTopWindow().Raise()
 
 class XRPLMonitorThread(Thread):
     def __init__(self, gui):
@@ -176,6 +189,23 @@ class CustomDialog(wx.Dialog):
 class WalletApp(wx.Frame):
     def __init__(self):
         wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
+        self.default_size = (1150, 700)
+        self.min_size = (800, 600)
+        self.max_size = (1600, 900)
+        self.zoom_factor = 1.0
+        self.SetMinSize(self.min_size)
+        self.SetMaxSize(self.max_size)
+
+        self.ctrl_pressed = False
+        self.last_ctrl_press_time = 0
+        self.ctrl_toggle_delay = 0.2  # 200 ms debounce
+
+        # Bind the zoom event to the entire frame
+        wx.GetApp().Bind(wx.EVT_MOUSEWHEEL, self.on_mouse_wheel_zoom)
+        
+        # Use EVT_KEY_DOWN and EVT_KEY_UP events to detect Ctrl key presses
+        wx.GetApp().Bind(wx.EVT_KEY_DOWN, self.on_key_down)
+        wx.GetApp().Bind(wx.EVT_KEY_UP, self.on_key_up)
 
         # Set the icon
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -191,7 +221,20 @@ class WalletApp(wx.Frame):
 
         self.worker = None
         self.Bind(wx.EVT_CLOSE, self.on_close)
-        self.Bind(EVT_UPDATE_GRID, self.on_update_grid)
+        self.Bind(EVT_UPDATE_GRID, self.update_grid)
+
+        # grid dimensions
+        self.grid_row_heights = {}
+        self.grid_column_widths = {}
+        self.grid_base_row_height = 125
+        self.row_height_margin = 25
+
+    def setup_grid(self, grid, columns):
+        grid.CreateGrid(0, len(columns))
+        for idx, (name, width) in enumerate(columns):
+            grid.SetColLabelValue(idx, name)
+            grid.SetColSize(idx, width)
+        return grid
 
     def build_ui(self):
         self.panel = wx.Panel(self)
@@ -210,7 +253,10 @@ class WalletApp(wx.Frame):
         self.tabs = wx.Notebook(self.panel)
         self.tabs.Hide()
 
-        # Summary tab
+        #################################
+        # SUMMARY
+        #################################
+
         self.summary_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.summary_tab, "Summary")
         self.summary_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -223,12 +269,13 @@ class WalletApp(wx.Frame):
         self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
 
         # Add grid for Key Account Details
-        self.summary_grid = gridlib.Grid(self.summary_tab)
-        self.summary_grid.CreateGrid(0, 2)  # 2 columns for Key and Value
-        self.summary_grid.SetColLabelValue(0, "Key")
-        self.summary_grid.SetColLabelValue(1, "Value")
+        summary_columns = [("Key", 125), ("Value", 550)]
+        self.summary_grid = self.setup_grid(gridlib.Grid(self.summary_tab), summary_columns)
 
-        # Proposals tab
+        #################################
+        # PROPOSALS
+        #################################
+
         self.proposals_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.proposals_tab, "Proposals")
         self.proposals_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -236,9 +283,9 @@ class WalletApp(wx.Frame):
 
         # Add the task management buttons in the Accepted tab
         self.button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_ask_for_task = wx.Button(self.proposals_tab, label="Ask For Task")
-        self.button_sizer.Add(self.btn_ask_for_task, 1, wx.EXPAND | wx.ALL, 5)
-        self.btn_ask_for_task.Bind(wx.EVT_BUTTON, self.on_ask_for_task)
+        self.btn_request_task = wx.Button(self.proposals_tab, label="Request Task")
+        self.button_sizer.Add(self.btn_request_task, 1, wx.EXPAND | wx.ALL, 5)
+        self.btn_request_task.Bind(wx.EVT_BUTTON, self.on_request_task)
 
         self.btn_accept_task = wx.Button(self.proposals_tab, label="Accept Task")
         self.button_sizer.Add(self.btn_accept_task, 1, wx.EXPAND | wx.ALL, 5)
@@ -258,14 +305,14 @@ class WalletApp(wx.Frame):
         self.proposals_sizer.Add(self.button_sizer2, 0, wx.EXPAND)
 
         # Add grid to Proposals tab
-        self.proposals_grid = gridlib.Grid(self.proposals_tab)
-        self.proposals_grid.CreateGrid(0, 3)
-        self.proposals_grid.SetColLabelValue(0, "task_id")
-        self.proposals_grid.SetColLabelValue(1, "proposal")
-        self.proposals_grid.SetColLabelValue(2, "response")
-        self.proposals_sizer.Add(self.proposals_grid, 1, wx.EXPAND | wx.ALL, 5)
+        proposal_columns = [("Task ID", 200), ("Request", 250), ("Proposal", 300), ("Response", 150)]
+        self.proposals_grid = self.setup_grid(gridlib.Grid(self.proposals_tab), proposal_columns)
+        self.proposals_sizer.Add(self.proposals_grid, 1, wx.EXPAND | wx.ALL, 20)
 
-        # Verification tab
+        #################################
+        # VERIFICATION
+        #################################
+
         self.verification_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.verification_tab, "Verification")
         self.verification_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -301,29 +348,28 @@ class WalletApp(wx.Frame):
         self.btn_force_update.Bind(wx.EVT_BUTTON, self.on_force_update)
 
         # Add grid to Verification tab
-        self.verification_grid = gridlib.Grid(self.verification_tab)
-        self.verification_grid.CreateGrid(0, 3)
-        self.verification_grid.SetColLabelValue(0, "task_id")
-        self.verification_grid.SetColLabelValue(1, "original_task")
-        self.verification_grid.SetColLabelValue(2, "verification")
-        self.verification_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 5)
+        verification_columns = [("Task ID", 190), ("Proposal", 300), ("Verification", 250)]
+        self.verification_grid = self.setup_grid(gridlib.Grid(self.verification_tab), verification_columns)
+        self.verification_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 20)
 
-        # Rewards tab
+        #################################
+        # REWARDS
+        #################################
+
         self.rewards_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.rewards_tab, "Rewards")
         self.rewards_sizer = wx.BoxSizer(wx.VERTICAL)
         self.rewards_tab.SetSizer(self.rewards_sizer)
 
         # Add grid to Rewards tab
-        self.rewards_grid = gridlib.Grid(self.rewards_tab)
-        self.rewards_grid.CreateGrid(0, 4)
-        self.rewards_grid.SetColLabelValue(0, "task_id")
-        self.rewards_grid.SetColLabelValue(1, "proposal")
-        self.rewards_grid.SetColLabelValue(2, "reward")
-        self.rewards_grid.SetColLabelValue(3, "payout")  # Label the new column
-        self.rewards_sizer.Add(self.rewards_grid, 1, wx.EXPAND | wx.ALL, 5)
+        rewards_columns = [("Task ID", 170), ("Proposal", 300), ("Reward", 250), ("Payout", 75)]
+        self.rewards_grid = self.setup_grid(gridlib.Grid(self.rewards_tab), rewards_columns)
+        self.rewards_sizer.Add(self.rewards_grid, 1, wx.EXPAND | wx.ALL, 20)
 
-        # Payments tab
+        #################################
+        # PAYMENTS
+        #################################
+
         self.payments_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.payments_tab, "Payments")
         self.payments_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -383,7 +429,10 @@ class WalletApp(wx.Frame):
         self.sizer.Add(self.tabs, 1, wx.EXPAND)
         self.panel.SetSizer(self.sizer)
 
-        # Log tab
+        #################################
+        # LOGS
+        #################################
+
         self.log_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.log_tab, "Log")
         self.log_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -560,10 +609,6 @@ class WalletApp(wx.Frame):
         self.btn_genesis = wx.Button(panel, label="Genesis")
         user_details_sizer.Add(self.btn_genesis, flag=wx.ALL, border=5)
         self.btn_genesis.Bind(wx.EVT_BUTTON, self.on_genesis)
-
-        # self.btn_delete_user = wx.Button(panel, label="Delete Existing User")
-        # user_details_sizer.Add(self.btn_delete_user, flag=wx.ALL, border=5)
-        # self.btn_delete_user.Bind(wx.EVT_BUTTON, self.on_delete_user)
 
         sizer.Add(user_details_sizer, 1, wx.EXPAND | wx.ALL, 10)
 
@@ -805,14 +850,6 @@ class WalletApp(wx.Frame):
             # PFT balance update (placeholder, as it's not streamed)
             self.lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
 
-        # Update Key Account Details
-        self.update_key_account_details()
-
-    def update_key_account_details(self):
-        if self.task_manager:
-            key_account_details = self.task_manager.process_account_info()
-            self.populate_summary_grid(key_account_details)
-
     def run_bg_job(self, job):
         if self.worker.context:
             asyncio.run_coroutine_threadsafe(job, self.worker.loop)
@@ -886,173 +923,201 @@ class WalletApp(wx.Frame):
 
     def update_data(self, event):
         try:
-            # Update Accepted tab
-            accepted_df = self.task_manager.get_proposals_df()
-            wx.PostEvent(self, UpdateGridEvent(data=accepted_df, target="accepted"))
+            # Get proposals tab data
+            proposals_df = self.task_manager.get_proposals_df()
+            wx.PostEvent(self, UpdateGridEvent(data=proposals_df, target="proposals"))
 
-            # Update Rewards tab
+            # Get Rewards tab data
             rewards_df = self.task_manager.get_rewards_df()
             wx.PostEvent(self, UpdateGridEvent(data=rewards_df, target="rewards"))
 
-            # Update Verification tab
+            # Get Verification tab data
             verification_df = self.task_manager.get_verification_df()
             wx.PostEvent(self, UpdateGridEvent(data=verification_df, target="verification"))
 
         except Exception as e:
             logger.exception(f"Error updating data: {e}")
 
-    def on_update_grid(self, event):
-        logger.debug(f"Updating grid with target: {getattr(event, 'target', 'accepted')}")
-        #TODO: This is a bit messy, but it works for now
+    def update_grid(self, event):
+        logger.debug(f"Updating grid with target: {getattr(event, 'target')}")
         if hasattr(event, 'target'):
-            if event.target == "rewards":
-                self.populate_rewards_grid(event.data)
-            elif event.target == "verification":
-                self.populate_verification_grid(event.data)
-            else:
-                self.populate_proposals_grid(event.data)
-        else:
-            self.populate_proposals_grid(event.json_data)
+            match event.target:
+                case "rewards":
+                    self.populate_grid_generic(self.rewards_grid, event.data, 'rewards')
+                case "verification":
+                    self.populate_grid_generic(self.verification_grid, event.data, 'verification')
+                case "proposals":
+                    self.populate_grid_generic(self.proposals_grid, event.data, 'proposals')
+                case "summary":
+                    self.populate_summary_grid(event.data)
+                case _:
+                    logger.error(f"Unknown grid target: {event.target}")
 
     def on_pft_update_timer(self, event):
         if self.wallet:
             self.update_tokens(self.wallet.classic_address)
 
+    def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
+        """Generic grid population method that respects zoom settings"""
+
+        logger.debug(f"Populating {grid_name} grid with {data.shape[0]} rows")
+
+        COLUMN_MAPPINGS = {
+            'proposals': ['task_id', 'request', 'proposal', 'response'],
+            'rewards': ['task_id', 'proposal', 'reward', 'payout'],
+            'verification': ['task_id', 'original_task', 'verification'],
+            'summary': ['Key', 'Value']  # For our converted dictionary data
+        }
+
+        if data.empty:
+            logger.debug(f"No data to populate {grid_name} grid")
+            grid.ClearGrid()
+            return
+
+        if grid.GetNumberRows() > 0:
+            grid.DeleteRows(0, grid.GetNumberRows())
+
+        # Store original column sizes if not already stored
+        if grid_name not in self.grid_column_widths:
+            self.grid_column_widths[grid_name] = [grid.GetColSize(col) for col in range(grid.GetNumberCols())]
+
+        # Add new rows
+        grid.AppendRows(len(data))
+
+        # Get the column mapping for this grid
+        column_order = COLUMN_MAPPINGS.get(grid_name, [])
+        if not column_order:
+            logger.error(f"No column mapping found for {grid_name}")
+            return
+
+        # Populate data using the column mapping
+        for idx in range(len(data)):
+            for col, col_name in enumerate(column_order):
+                if col_name in data.columns:
+                    value = data.iloc[idx][col_name]
+                    grid.SetCellValue(idx, col, str(value))
+                    grid.SetCellRenderer(idx, col, gridlib.GridCellAutoWrapStringRenderer())
+                else:
+                    logger.error(f"Column {col_name} not found in data for {grid_name}")
+
+        # Let wxPython handle initial row sizing
+        grid.AutoSizeRows()
+
+        # Store the auto-sized row heights with an additional margin
+        self.grid_row_heights[grid_name] = [
+            grid.GetRowSize(row) + self.row_height_margin 
+            for row in range(grid.GetNumberRows())
+            ]
+        
+        # Apply the stored row heights and column widths with the zoom factor
+        for row in range(grid.GetNumberRows()):
+            grid.SetRowSize(row, int(self.grid_row_heights[grid_name][row] * self.zoom_factor))
+
+        for col, original_width in enumerate(self.grid_column_widths[grid_name]):
+            grid.SetColSize(col, int(original_width * self.zoom_factor))
+
     def populate_summary_grid(self, key_account_details):
-        self.summary_grid.ClearGrid()
+        """Convert dictionary to dataframe and use generic grid population method"""
+        summary_df = pd.DataFrame(list(key_account_details.items()), columns=['Key', 'Value'])
+        self.populate_grid_generic(self.summary_grid, summary_df, 'summary')
 
-        current_rows = self.summary_grid.GetNumberRows()
-        needed_rows = len(key_account_details)
+    def auto_size_window(self):
+        self.rewards_tab.Layout()
+        self.tabs.Layout()
+        self.panel.Layout()
 
-        if current_rows < needed_rows:
-            self.summary_grid.AppendRows(needed_rows - current_rows)
-        elif current_rows > needed_rows:
-            for row in range(needed_rows, current_rows):
-                self.summary_grid.SetCellValue(row, 0, "")
-                self.summary_grid.SetCellValue(row, 1, "")
+        size = self.panel.GetBestSize()
+        new_size = (
+            min(max(size.width, self.default_size[0]), self.max_size[0]),
+            min(max(size.height, self.default_size[1]), self.max_size[1])
+        )
+        self.SetSize(new_size)
 
-        for idx, (key, value) in enumerate(key_account_details.items()):
-            self.summary_grid.SetCellValue(idx, 0, str(key))
-            self.summary_grid.SetCellValue(idx, 1, str(value))
-            # enable text wrapping in the 'Value' column
-            self.summary_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
-            # manually set row height for better display
-            self.summary_grid.SetRowSize(idx, 300)  # Adjust the height as needed
+    def on_key_down(self, event):
+        if event.GetKeyCode() == wx.WXK_CONTROL:
+            current_time = time.time()
+            if not self.ctrl_pressed and (current_time - self.last_ctrl_press_time > self.ctrl_toggle_delay):
+                self.ctrl_pressed = True
+                self.last_ctrl_press_time = current_time
+        event.Skip()
 
-        # Set column width to ensure proper wrapping
-        self.summary_grid.SetColSize(0, 100)
-        self.summary_grid.SetColSize(1, 550)  # Adjust width as needed
-        self.summary_grid.AutoSizeRows()
-        self.summary_grid.ForceRefresh()
+    def on_key_up(self, event):
+        if event.GetKeyCode() == wx.WXK_CONTROL:
+            self.ctrl_pressed = False
+        event.Skip()
 
-    def populate_proposals_grid(self, proposals_df):
-        """
-        Populate the proposals grid with the given dataframe.
-        proposals_df is a dataframe with the following columns: task_id, proposal, acceptance
-        """
-        if proposals_df.empty:
-            logger.debug("No data to populate accepted grid")
-            self.proposals_grid.ClearGrid()
-            return
+    def on_mouse_wheel_zoom(self, event):
+        if self.ctrl_pressed:
+            if event.GetWheelRotation() > 0:
+                self.zoom_factor *= 1.1
+            else:
+                self.zoom_factor /= 1.1
+            self.zoom_factor = max(0.5, min(self.zoom_factor, 3.0))
+            self.apply_zoom()
+        else:
+            event.Skip()
 
-        # Clear existing grid content and pre-allocate rows
-        self.proposals_grid.ClearGrid()
-        if self.proposals_grid.GetNumberRows() > 0:
-            self.proposals_grid.DeleteRows(0, self.proposals_grid.GetNumberRows())
-        self.proposals_grid.AppendRows(len(proposals_df))
+    def store_grid_dimensions(self, grid, grid_name):
+        if grid_name not in self.grid_column_widths:
+            self.grid_column_widths[grid_name] = [grid.GetColSize(col) for col in range(grid.GetNumberCols())]
+        if grid_name not in self.grid_row_heights:
+            self.grid_row_heights[grid_name] = [grid.GetRowSize(row) for row in range(grid.GetNumberRows())]
 
-        # Iterate over the dataframe
-        for idx, df_row in proposals_df.iterrows():
-            self.proposals_grid.SetCellValue(idx, 0, str(df_row['task_id']))
-            self.proposals_grid.SetCellValue(idx, 1, str(df_row['proposal']))
-            self.proposals_grid.SetCellValue(idx, 2, str(df_row['response']))
+    def apply_zoom(self):
+        base_font_size = 10
+        new_font_size = int(base_font_size * self.zoom_factor)
 
-            # Enable text wrapping in the 'proposal' and 'acceptance' columns
-            self.proposals_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
-            self.proposals_grid.SetCellRenderer(idx, 2, gridlib.GridCellAutoWrapStringRenderer())
-            
-            # Manually set row height for better display
-            self.proposals_grid.SetRowSize(idx, 65)  # Adjust the height as needed
+        font = wx.Font(new_font_size, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
 
-        # Set column width to ensure proper wrapping
-        self.proposals_grid.SetColSize(0, 170)
-        self.proposals_grid.SetColSize(1, 400)  # Adjust width as needed
-        self.proposals_grid.SetColSize(2, 300)  # Adjust width as needed
+        def set_font_recursive(window):
+            window.SetFont(font)
+            if isinstance(window, wx.grid.Grid):
+                window.SetDefaultCellFont(font)
 
-    def populate_rewards_grid(self, rewards_df):
-        """
-        Populate the rewards grid with the given dataframe.
-        rewards_df is a dataframe with the following columns: task_id, proposal, reward, payout
-        """
+                # Let wxPython handle initial row sizes based on new font
+                window.AutoSizeRows()
 
-        if rewards_df.empty: 
-            logger.debug("No data to populate rewards grid")
-            self.rewards_grid.ClearGrid()
-            return
+                # Apply margin and zoom to the auto-sized rows
+                for row in range(window.GetNumberRows()):
+                    current_height = window.GetRowSize(row)
+                    window.SetRowSize(row, int((current_height + self.row_height_margin) * self.zoom_factor))
 
-        # Clear existing grid content and pre-allocate rows
-        self.rewards_grid.ClearGrid()
-        if self.rewards_grid.GetNumberRows() > 0:
-            self.rewards_grid.DeleteRows(0, self.rewards_grid.GetNumberRows())
-        self.rewards_grid.AppendRows(len(rewards_df))
+                grid_name = None
+                match window:
+                    case self.proposals_grid:
+                        grid_name = "proposals"
+                    case self.rewards_grid:
+                        grid_name = "rewards"
+                    case self.verification_grid:
+                        grid_name = "verification"
+                    case self.summary_grid:
+                        grid_name = "summary"
+                    case _:
+                        grid_name = None
+                        logger.error(f"No grid name found for {window}")
 
-        for idx, df_row in rewards_df.iterrows():
-            self.rewards_grid.SetCellValue(idx, 0, str(df_row['task_id']))
-            self.rewards_grid.SetCellValue(idx, 1, str(df_row['proposal']))
-            self.rewards_grid.SetCellValue(idx, 2, str(df_row['reward']))
-            self.rewards_grid.SetCellValue(idx, 3, str(df_row['payout']))
+                if grid_name and grid_name in self.grid_column_widths:
+                    self.store_grid_dimensions(window, grid_name)
+                    for col, original_size in enumerate(self.grid_column_widths[grid_name]):
+                        window.SetColSize(col, int(original_size * self.zoom_factor))
 
-            # Enable text wrapping in the 'proposal', 'reward', and 'payout' columns
-            self.rewards_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
-            self.rewards_grid.SetCellRenderer(idx, 2, gridlib.GridCellAutoWrapStringRenderer())
-            self.rewards_grid.SetCellRenderer(idx, 3, gridlib.GridCellAutoWrapStringRenderer())
-            
-            # Manually set row height for better display
-            self.rewards_grid.SetRowSize(idx, 65)  # Adjust the height as needed
+            for child in window.GetChildren():
+                set_font_recursive(child)
 
-        # Set column width to ensure proper wrapping
-        self.rewards_grid.SetColSize(0, 170)
-        self.rewards_grid.SetColSize(1, 400)  # Adjust width as needed
-        self.rewards_grid.SetColSize(2, 300)  # Adjust width as needed
-        self.rewards_grid.SetColSize(3, 100)  # Adjust width as needed for payout
+        set_font_recursive(self)
 
-    def populate_verification_grid(self, verification_df):
-        """
-        Populate the verification grid with the given dataframe.
-        verification_df is a dataframe with the following columns: task_id, proposal, verification
-        """
+        # Refresh layout
+        self.panel.Layout()
+        self.tabs.Layout()
+        for i in range(self.tabs.GetPageCount()):
+            self.tabs.GetPage(i).Layout()
 
-        if verification_df.empty:
-            logger.debug("No data to populate verification grid")
-            self.verification_grid.ClearGrid()
-            return
+    def on_request_task(self, event):
+        # Change button text to "Requesting Task..."
+        self.btn_request_task.SetLabel("Requesting Task...")
+        self.btn_request_task.Update()
 
-        # Clear existing grid content and pre-allocate rows
-        self.verification_grid.ClearGrid()
-        if self.verification_grid.GetNumberRows() > 0:
-            self.verification_grid.DeleteRows(0, self.verification_grid.GetNumberRows())
-        self.verification_grid.AppendRows(len(verification_df))
-
-
-        for idx, df_row in verification_df.iterrows():
-            self.verification_grid.SetCellValue(idx, 0, str(df_row['task_id']))
-            self.verification_grid.SetCellValue(idx, 1, str(df_row['proposal']))
-            self.verification_grid.SetCellValue(idx, 2, str(df_row['verification']))
-
-            # Enable text wrapping in the 'original_task' and 'verification' columns
-            self.verification_grid.SetCellRenderer(idx, 1, gridlib.GridCellAutoWrapStringRenderer())
-            self.verification_grid.SetCellRenderer(idx, 2, gridlib.GridCellAutoWrapStringRenderer())
-            
-            # Manually set row height for better display
-            self.verification_grid.SetRowSize(idx, 65)  # Adjust the height as needed
-
-        # Set column width to ensure proper wrapping
-        self.verification_grid.SetColSize(0, 170)
-        self.verification_grid.SetColSize(1, 400)  # Adjust width as needed
-        self.verification_grid.SetColSize(2, 300)  # Adjust width as needed
-
-    def on_ask_for_task(self, event):
-        dialog = CustomDialog("Ask For Task", ["Task Request"])
+        dialog = CustomDialog("Request Task", ["Task Request"])
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
             response = self.task_manager.request_post_fiat(request_message=request_message)
@@ -1065,7 +1130,15 @@ class WalletApp(wx.Frame):
             wx.CallLater(30000, self.update_data, None)
         dialog.Destroy()
 
+        # Change button text back to "Request Task"
+        self.btn_request_task.SetLabel("Request Task")
+        self.btn_request_task.Update()
+
     def on_accept_task(self, event):
+        # Change button text to "Accepting Task..."
+        self.btn_accept_task.SetLabel("Accepting Task...")
+        self.btn_accept_task.Update()
+
         dialog = CustomDialog("Accept Task", ["Task ID", "Acceptance String"])
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
@@ -1095,7 +1168,15 @@ class WalletApp(wx.Frame):
                 wx.CallLater(5000, self.update_data, None)
         dialog.Destroy()
 
+        # Change button text back to "Accept Task"
+        self.btn_accept_task.SetLabel("Accept Task")
+        self.btn_accept_task.Update()
+
     def on_refuse_task(self, event):
+        # Change button text to "Refusing Task..."
+        self.btn_refuse_task.SetLabel("Refusing Task...")
+        self.btn_refuse_task.Update()
+
         dialog = CustomDialog("Refuse Task", ["Task ID", "Refusal Reason"])
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
@@ -1121,7 +1202,15 @@ class WalletApp(wx.Frame):
                 wx.CallLater(5000, self.update_data, None)
         dialog.Destroy()
 
+        # Change button text back to "Refuse Task"
+        self.btn_refuse_task.SetLabel("Refuse Task")
+        self.btn_refuse_task.Update()
+
     def on_submit_for_verification(self, event):
+        # Change button text to "Submitting for Verification..."
+        self.btn_submit_for_verification.SetLabel("Submitting for Verification...")
+        self.btn_submit_for_verification.Update()
+
         dialog = CustomDialog("Submit for Verification", ["Task ID", "Completion String"])
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
@@ -1154,7 +1243,15 @@ class WalletApp(wx.Frame):
             
         dialog.Destroy()
 
+        # Change button text back to "Submit for Verification"
+        self.btn_submit_for_verification.SetLabel("Submit for Verification")
+        self.btn_submit_for_verification.Update()
+
     def on_submit_verification_details(self, event):
+        # Change button text to "Submitting Verification Details..."
+        self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
+        self.btn_submit_verification_details.Update()
+
         task_id = self.txt_task_id.GetValue()
         response_string = self.txt_verification_details.GetValue()
         try:
@@ -1175,14 +1272,16 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error converting response to status message: {e}")
 
-    def on_force_update(self, event):
-        logger.info("Kicking off Force Update")
+        # Change button text back to "Submit Verification Details"
+        self.btn_submit_verification_details.SetLabel("Submit Verification Details")
+        self.btn_submit_verification_details.Update()
 
-        try:
-            verification_data = self.task_manager.get_verification_df()
-            self.populate_verification_grid(verification_data)
-        except Exception as e:
-            logger.error(f"FAILED VERIFICATION UPDATE: {e}")
+    def on_force_update(self, event):
+        # Change button text to "Updating..."
+        self.btn_force_update.SetLabel("Updating...")
+        self.btn_force_update.Update()
+
+        logger.info("Kicking off Force Update")
 
         try:
             key_account_details = self.task_manager.process_account_info()
@@ -1191,25 +1290,52 @@ class WalletApp(wx.Frame):
             logger.error(f"FAILED UPDATING SUMMARY DATA: {e}")
 
         try:
+            proposals_df = self.task_manager.get_proposals_df()
+            self.populate_grid_generic(self.proposals_grid, proposals_df, 'proposals')
+        except Exception as e:
+            logger.error(f"FAILED UPDATING PROPOSALS DATA: {e}")
+
+        try:
+            verification_data = self.task_manager.get_verification_df()
+            self.populate_grid_generic(self.verification_grid, verification_data, 'verification')
+        except Exception as e:
+            logger.error(f"FAILED UPDATING VERIFICATION DATA: {e}")
+
+        try:
             rewards_data = self.task_manager.get_rewards_df()
-            self.populate_rewards_grid(rewards_data)
+            self.populate_grid_generic(self.rewards_grid, rewards_data, 'rewards')
         except Exception as e:
             logger.error(f"FAILED UPDATING REWARDS DATA: {e}")
 
-        try:
-            proposals_df = self.task_manager.get_proposals_df()
-            self.populate_proposals_grid(proposals_df)
-        except Exception as e:
-            logger.error(f"FAILED UPDATING ACCEPTANCE DATA: {e}")
+        # Change button text back to "Update"
+        self.btn_force_update.SetLabel("Force Update")
+        self.btn_force_update.Update()
 
     def on_log_pomodoro(self, event):
+        # Change button text to "Logging Pomodoro..."
+        self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
+        self.btn_log_pomodoro.Update()
+
         task_id = self.txt_task_id.GetValue()
         pomodoro_text = self.txt_verification_details.GetValue()
         response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
         message = self.task_manager.ux__convert_response_object_to_status_message(response)
         wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
 
+        # Change button text back to "Log Pomodoro"
+        self.btn_log_pomodoro.SetLabel("Log Pomodoro")
+        self.btn_log_pomodoro.Update()
+
     def on_submit_xrp_payment(self, event):
+        # Change button text to "Submitting XRP Payment..."
+        self.btn_submit_xrp_payment.SetLabel("Submitting...")
+        self.btn_submit_xrp_payment.Update()
+
+        # Check that Amount and Destination are valid
+        if not self.txt_xrp_amount.GetValue() or not self.txt_xrp_address_payment.GetValue():
+            wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
+            return
+
         response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
                                                         destination=self.txt_xrp_address_payment.GetValue(), 
                                                         memo=self.txt_xrp_memo.GetValue()
@@ -1223,7 +1349,19 @@ class WalletApp(wx.Frame):
         dialog.ShowModal()
         dialog.Destroy()
 
+        # Change button text back to "Submit XRP Payment"
+        self.btn_submit_xrp_payment.SetLabel("Submit Payment")
+        self.btn_submit_xrp_payment.Update()
+
     def on_submit_pft_payment(self, event):
+        # Change button text to "Submitting PFT Payment..."
+        self.btn_submit_pft_payment.SetLabel("Submitting...")
+        self.btn_submit_pft_payment.Update()
+
+        # Check that Amount and Destination are valid
+        if not self.txt_pft_amount.GetValue() or not self.txt_pft_address_payment.GetValue():
+            wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
+            return
 
         if is_over_1kb(self.txt_pft_memo.GetValue()):
             if wx.YES == wx.MessageBox("Memo is over 1 KB, transaction will be batch-sent. Continue?", "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
@@ -1243,10 +1381,22 @@ class WalletApp(wx.Frame):
         dialog.ShowModal()
         dialog.Destroy()
 
+        # Change button text back to "Submit PFT Payment"
+        self.btn_submit_pft_payment.SetLabel("Submit Payment")
+        self.btn_submit_pft_payment.Update()
+
     def on_show_secret(self, event):
+        # Change button text to "Showing Secret..."
+        self.btn_show_secret.SetLabel("Showing Secret...")
+        self.btn_show_secret.Update()
+
         classic_address = self.wallet.classic_address
         secret = self.wallet.seed
         wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
+
+        # Change button text back to "Show Secret"
+        self.btn_show_secret.SetLabel("Show Secret")
+        self.btn_show_secret.Update()
 
     def format_response(self, response):
         if isinstance(response, list):
@@ -1354,9 +1504,7 @@ class SelectableMessageDialog(wx.Dialog):
 
 def main():
     logger.info("Starting Post Fiat Wallet")
-    app = wx.App()
-    frame = WalletApp()
-    frame.Show()
+    app = PostFiatWalletApp()
     app.MainLoop()
 
 if __name__ == "__main__":
