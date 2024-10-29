@@ -20,8 +20,11 @@ setup(
         'nest_asyncio',
         'browser_history',
         'sec-cik-mapper',
-        'loguru'
+        'loguru',
     ],
+    extras_require={
+        'windows': ['pywin32'],
+    },
     author='PFAdmin',
     author_email='admin@postfiat.com',
     description='Basic Post Fiat Python Functionality',
