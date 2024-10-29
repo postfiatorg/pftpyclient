@@ -191,7 +191,7 @@ class WalletApp(wx.Frame):
         wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
         self.default_size = (1150, 700)
         self.min_size = (800, 600)
-        self.max_size = (1600, 900)
+        self.max_size = (1400, 900)
         self.zoom_factor = 1.0
         self.SetMinSize(self.min_size)
         self.SetMaxSize(self.max_size)
@@ -253,6 +253,7 @@ class WalletApp(wx.Frame):
         self.tabs = wx.Notebook(self.panel)
         self.tabs.Hide()
         self.tabs.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_tab_changed)
+        self.sizer.Add(self.tabs, 1, wx.EXPAND | wx.TOP, 20)
 
         #################################
         # SUMMARY
@@ -427,7 +428,6 @@ class WalletApp(wx.Frame):
         self.payments_sizer.Add(self.btn_show_secret, flag=wx.ALL, border=5)
         self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
 
-        self.sizer.Add(self.tabs, 1, wx.EXPAND)
         self.panel.SetSizer(self.sizer)
 
         #################################
@@ -458,7 +458,9 @@ class WalletApp(wx.Frame):
 
         # Create a box to center the content
         box = wx.Panel(panel)
-        box.SetBackgroundColour(wx.Colour(220, 220, 220))
+        sys_color = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+        darkened_color = self.darken_color(sys_color, 0.95)  # 5% darker
+        box.SetBackgroundColour(darkened_color)
         box_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Username
@@ -1019,8 +1021,9 @@ class WalletApp(wx.Frame):
         for row in range(grid.GetNumberRows()):
             grid.SetRowSize(row, int(self.grid_row_heights[grid_name][row] * self.zoom_factor))
 
+        column_zoom_factor = 1.0 + ((self.zoom_factor - 1.0) * 0.3)  # 30% of the regular zoom effect
         for col, original_width in enumerate(self.grid_column_widths[grid_name]):
-            grid.SetColSize(col, int(original_width * self.zoom_factor))
+            grid.SetColSize(col, int(original_width * column_zoom_factor))
 
         self.auto_size_window()
 
@@ -1057,10 +1060,10 @@ class WalletApp(wx.Frame):
     def on_mouse_wheel_zoom(self, event):
         if self.ctrl_pressed:
             if event.GetWheelRotation() > 0:
-                self.zoom_factor *= 1.1
+                self.zoom_factor *= 1.01
             else:
-                self.zoom_factor /= 1.1
-            self.zoom_factor = max(0.5, min(self.zoom_factor, 3.0))
+                self.zoom_factor /= 1.01
+            self.zoom_factor = max(0.75, min(self.zoom_factor, 2.0))
             self.apply_zoom()
         else:
             event.Skip()
@@ -1106,8 +1109,9 @@ class WalletApp(wx.Frame):
 
                 if grid_name and grid_name in self.grid_column_widths:
                     self.store_grid_dimensions(window, grid_name)
+                    column_zoom_factor = 1.0 + ((self.zoom_factor - 1.0) * 0.3)  # 30% of the regular zoom effect
                     for col, original_size in enumerate(self.grid_column_widths[grid_name]):
-                        window.SetColSize(col, int(original_size * self.zoom_factor))
+                        window.SetColSize(col, int(original_size * column_zoom_factor))
 
             for child in window.GetChildren():
                 set_font_recursive(child)
@@ -1477,6 +1481,15 @@ class WalletApp(wx.Frame):
         else:
             formatted_response = f"Transaction Failed\nError: {response}"
             return formatted_response
+        
+    def darken_color(self, color, factor=0.95):
+        """Darkens a wx.Colour object by a given factor (0.0 to 1.0)"""
+        return wx.Colour(
+            int(color.Red() * factor), 
+            int(color.Green() * factor), 
+            int(color.Blue() * factor),
+            color.Alpha()
+        )
         
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):

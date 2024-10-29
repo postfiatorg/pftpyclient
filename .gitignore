@@ -6,6 +6,9 @@ __pycache__/
 testfunct.py
 # C extensions
 *.so
+*.sh
+**/logs
+*.command
 
 # Distribution / packaging
 .Python
