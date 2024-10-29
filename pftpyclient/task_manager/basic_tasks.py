@@ -912,8 +912,8 @@ class PostFiatTaskManager:
         # Filter for these tasks
         filtered_df = self.tasks[(self.tasks['task_id'].isin(reward_task_ids))].copy()
 
-        # debugging
-        filtered_df.to_csv('filtered_df.csv', index=False)
+        # # debugging
+        # filtered_df.to_csv('filtered_df.csv', index=False)
 
         if filtered_df.empty:
             return pd.DataFrame()

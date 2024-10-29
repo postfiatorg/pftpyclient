@@ -133,3 +133,18 @@ def get_credential_file_path():
     
     return cred_file_path
 
+def get_cached_usernames():
+    '''Returns a list of unique usernames from cached credentials'''
+    try:
+        cred_map = _get_cred_map()
+        # Extract unique usernames from credential keys (removing the suffixes)
+        usernames = set()
+        for key in cred_map.keys():
+            if '__v1xrpaddress' in key:  # Use wallet address as indicator of username
+                username = key.replace('__v1xrpaddress', '')
+                usernames.add(username)
+        return sorted(list(usernames))
+    except Exception as e:
+        logger.error(f"Error reading cached usernames: {e}")
+        return []
+

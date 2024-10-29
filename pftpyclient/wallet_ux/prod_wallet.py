@@ -11,7 +11,7 @@ from threading import Thread
 import wx.lib.newevent
 import nest_asyncio
 from pftpyclient.task_manager.basic_tasks import GoogleDocNotFoundException, InvalidGoogleDocException, PostFiatTaskManager, WalletInitiationFunctions, NoMatchingTaskException, WrongTaskStateException, is_over_1kb
-from pftpyclient.user_login.credential_input import cache_credentials, get_credential_file_path
+from pftpyclient.user_login.credential_input import cache_credentials, get_credential_file_path, get_cached_usernames
 import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
@@ -458,26 +458,27 @@ class WalletApp(wx.Frame):
 
         # Create a box to center the content
         box = wx.Panel(panel)
-        sys_color = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
-        darkened_color = self.darken_color(sys_color, 0.95)  # 5% darker
+        if os.name == 'posix':  # macOS
+            sys_color = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+            darkened_color = self.darken_color(sys_color, 0.95)  # 5% darker
+        else:  # Windows
+            darkened_color = wx.Colour(220, 220, 220)
         box.SetBackgroundColour(darkened_color)
         box_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Username
         self.lbl_user = wx.StaticText(box, label="Username:")
         box_sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
-        self.txt_user = wx.TextCtrl(box)
-        box_sizer.Add(self.txt_user, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Create combobox for username dropdown
+        self.txt_user = wx.ComboBox(box, style=wx.CB_DROPDOWN)
+        box_sizer.Add(self.txt_user, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Password
         self.lbl_pass = wx.StaticText(box, label="Password:")
         box_sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
         self.txt_pass = wx.TextCtrl(box, style=wx.TE_PASSWORD)
         box_sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
-
-        # enter username and password for debug purposes
-        # self.txt_user.SetValue('windowstestuser1')
-        # self.txt_pass.SetValue('W2g@Y79KD52*fl')
 
         # Error label
         self.error_label = wx.StaticText(box, label="")
@@ -494,7 +495,7 @@ class WalletApp(wx.Frame):
         self.btn_new_user = wx.Button(box, label="Create New User")
         box_sizer.Add(self.btn_new_user, flag=wx.EXPAND | wx.ALL, border=5)
         self.btn_new_user.Bind(wx.EVT_BUTTON, self.on_create_new_user)
-        box_sizer.Add(wx.StaticLine(box), 0, wx.EXPAND | wx.TOP, 5)
+        # box_sizer.Add(wx.StaticLine(box), 0, wx.EXPAND | wx.TOP, 5)
 
         box.SetSizer(box_sizer)
 
@@ -510,11 +511,41 @@ class WalletApp(wx.Frame):
 
         panel.SetSizer(main_sizer)
 
-        # Bind text events to clear error message
+        # Bind events
+        self.txt_user.Bind(wx.EVT_COMBOBOX_DROPDOWN, self.on_dropdown_opened)
+        self.txt_user.Bind(wx.EVT_COMBOBOX, self.on_username_selected)
         self.txt_user.Bind(wx.EVT_TEXT, self.on_clear_error)
         self.txt_pass.Bind(wx.EVT_TEXT, self.on_clear_error)
 
+        self.populate_username_dropdown()
+
         return panel
+    
+    def populate_username_dropdown(self):
+        """Populates the username dropdown with cached usernames"""
+        try:
+            current_value = self.txt_user.GetValue()
+            cached_usernames = get_cached_usernames()
+            self.txt_user.Clear()
+            self.txt_user.AppendItems(cached_usernames)
+
+            if current_value and current_value in cached_usernames:
+                self.txt_user.SetValue(current_value)
+            elif cached_usernames:
+                self.txt_user.SetValue(cached_usernames[0])
+        except Exception as e:
+            logger.error(f"Error populating username dropdown: {e}")
+            self.show_error("Error loading cached usernames")
+
+    def on_dropdown_opened(self, event):
+        """Handle dropdown being opened"""
+        self.populate_username_dropdown()
+        event.Skip()
+
+    def on_username_selected(self, event):
+        """Handle username selection from dropdown"""
+        self.txt_pass.SetFocus()
+        self.on_clear_error(event)
     
     def create_user_details_panel(self):
         panel = wx.Panel(self.panel)
