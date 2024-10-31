@@ -21,6 +21,7 @@ setup(
         'browser_history',
         'sec-cik-mapper',
         'loguru',
+        'brotli',
     ],
     extras_require={
         'windows': ['pywin32'],
