@@ -41,7 +41,7 @@ TESTNET_WEBSOCKETS = [
 
 REMEMBRANCER_ADDRESS = "rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn"
 
-UPDATE_TIMER_INTERVAL_SEC = 30  # Every 30 Seconds
+UPDATE_TIMER_INTERVAL_SEC = 60  # Every 60 Seconds
 
 # Try to use the default browser
 if os.name == 'nt':
@@ -1204,6 +1204,8 @@ class WalletApp(wx.Frame):
                         grid_name = "verification"
                     case self.summary_grid:
                         grid_name = "summary"
+                    case self.memos_grid:
+                        grid_name = "memos"
                     case _:
                         grid_name = None
                         logger.error(f"No grid name found for {window}")
@@ -1452,39 +1454,56 @@ class WalletApp(wx.Frame):
         self.btn_submit_memo.SetLabel("Submitting...")
         self.btn_submit_memo.Update()
 
+        logger.info("Submitting Memo")
+
         memo_text = self.txt_memo_input.GetValue()
 
         if not memo_text:
             wx.MessageBox("Please enter a memo", "Error", wx.OK | wx.ICON_ERROR)
         else:
+            logger.info(f"Memo Text: {memo_text}")
 
-            text_bytes = memo_text.encode('utf-8')
-            num_chunks = len(text_bytes) // MAX_CHUNK_SIZE
-            if len(text_bytes) % MAX_CHUNK_SIZE != 0:
+            # Estimate chunks needed with compression
+            compressed_text = compress_string(memo_text)
+            compressed_bytes = compressed_text.encode('utf-8')
+            num_chunks = len(compressed_bytes) // MAX_CHUNK_SIZE
+            if len(compressed_bytes) % MAX_CHUNK_SIZE != 0:
                 num_chunks += 1
 
+            # Calculate uncompressed chunks for comparison
+            uncompressed_bytes = memo_text.encode('utf-8')
+            uncompressed_chunks = len(uncompressed_bytes) // MAX_CHUNK_SIZE
+            if len(uncompressed_bytes) % MAX_CHUNK_SIZE != 0:
+                uncompressed_chunks += 1
+
             if num_chunks > 1:
-                message = f"Memo will be compressed and batch-sent over {num_chunks} transactions and "
-                message += f"cost 1 PFT per chunk ({num_chunks} PFT total). Continue?"
-                if wx.YES == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
-                    try:
-                        responses = self.task_manager.send_memo(REMEMBRANCER_ADDRESS, memo_text)
+                message = (
+                    f"Memo will be compressed and sent over {num_chunks} transactions "
+                    f"(reduced from {uncompressed_chunks} without compression) and "
+                    f"cost 1 PFT per chunk ({num_chunks} PFT total). Continue?"
+                )
+                if wx.NO == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
+                    self.btn_submit_memo.SetLabel("Submit Memo")
+                    return
+                    
+            logger.info("User confirmed, submitting memo")
 
-                        formatted_responses = [self.format_response(response) for response in responses]
+            try:
+                responses = self.task_manager.send_memo(REMEMBRANCER_ADDRESS, memo_text)
+                formatted_responses = [self.format_response(response) for response in responses]
+                logger.info(f"Memo Submission Result: {formatted_responses}")
 
-                        logger.info(f"Memo Submission Result: {formatted_responses}")
+                for idx, formatted_response in enumerate(formatted_responses):
+                    if idx == 0:
+                        dialog = SelectableMessageDialog(self, f"Memo Submission Result", formatted_response)
+                    else:
+                        dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
+                    dialog.ShowModal()
+                    dialog.Destroy()
 
-                        for idx, formatted_response in enumerate(formatted_responses):
-                            if idx == 0:
-                                dialog = SelectableMessageDialog(self, f"Memo Submission Result", formatted_response)
-                            else:
-                                dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
-                            dialog.ShowModal()
-                            dialog.Destroy()
-
-                    except Exception as e:
-                        logger.error(f"Error submitting memo: {e}")
-                        wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            except Exception as e:
+                logger.error(f"Error submitting memo: {e}")
+                wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
             
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.txt_memo_input.SetValue("")

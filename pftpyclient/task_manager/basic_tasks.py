@@ -503,16 +503,32 @@ class PostFiatTaskManager:
 
         return response
     
-    def send_memo(self, destination, memo: str):
+    def send_memo(self, destination, memo: str, compress=True):
         """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE"""
 
         message_id = self.generate_custom_id()
-        # memo = compress_string(memo)
+
+        if compress:
+            logger.debug(f"Compressing memo of length {len(memo)}")
+            compressed_data = compress_string(memo)
+            logger.debug(f"Compressed to length {len(compressed_data)}")
+            memo = "COMPRESSED__" + compressed_data
+
         memo_chunks = self._split_text_into_chunks(memo)
 
         response = []
         for idx, memo_chunk in enumerate(memo_chunks):
-            logger.debug(f"Sending memo chunk {idx+1} of {len(memo_chunks)}: {memo_chunk}")
+            log_content = memo_chunk
+            if compress and idx == 0:
+                try:
+                    # Only log a preview of the original content
+                    log_content = f"[compressed memo preview] {memo[:100]}..."
+                except Exception as e:
+                    logger.error(f"Error decompressing memo chunk: {e}")
+                    log_content = "[compressed content]"
+                
+            logger.debug(f"Sending chunk {idx+1} of {len(memo_chunks)}: {log_content[:100]}...")
+        
             memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                 task_id=message_id, 
                                                 full_output=memo_chunk)
@@ -973,7 +989,21 @@ class PostFiatTaskManager:
         chunked_memos.rename(columns={'task_id' : 'memo_id', 'full_output': 'memo'}, inplace=True)
 
         # Unchunk the memos
-        memos = chunked_memos.groupby('memo_id')['memo'].apply(' '.join).reset_index()
+        memos = chunked_memos.groupby('memo_id')['memo'].apply(''.join).reset_index()
+
+        def decompress_memo(memo):
+            if memo.startswith("COMPRESSED__"):
+                try:
+                    return decompress_string(memo.replace("COMPRESSED__", ""))
+                except ValueError as e:
+                    logger.error(f"Error decompressing memo: {e}")
+                    return f"[Decompression failed: {memo[:100]}...]"
+            return memo
+        
+        memos['memo'] = memos['memo'].apply(decompress_memo)
+
+        # Reverse order to get the most recent memos first
+        memos = memos.iloc[::-1].reset_index(drop=True).copy()
         
         return memos
 
@@ -1452,6 +1482,10 @@ def decompress_string(compressed_string):
         if missing_padding:
             compressed_string += '=' * (4 - missing_padding)
         
+        # Validate the string contains only valid Base64 characters
+        if not all(c in string.ascii_letters + string.digits + '+/=' for c in compressed_string):
+            raise ValueError("Invalid Base64 characters in compressed string")
+
         # Decode the Base64 string to bytes
         base64_decoded_data = base64.b64decode(compressed_string)
         # Decompress the data using Brotli
