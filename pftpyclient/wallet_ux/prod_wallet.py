@@ -10,8 +10,8 @@ import asyncio
 from threading import Thread
 import wx.lib.newevent
 import nest_asyncio
-from pftpyclient.task_manager.basic_tasks import GoogleDocNotFoundException, InvalidGoogleDocException, PostFiatTaskManager, WalletInitiationFunctions, NoMatchingTaskException, WrongTaskStateException, is_over_1kb
-from pftpyclient.user_login.credential_input import cache_credentials, get_credential_file_path
+from pftpyclient.task_manager.basic_tasks import GoogleDocNotFoundException, InvalidGoogleDocException, PostFiatTaskManager, WalletInitiationFunctions, NoMatchingTaskException, WrongTaskStateException, is_over_1kb, MAX_CHUNK_SIZE, compress_string
+from pftpyclient.user_login.credential_input import cache_credentials, get_credential_file_path, get_cached_usernames
 import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
@@ -38,6 +38,10 @@ MAINNET_WEBSOCKETS = [
 TESTNET_WEBSOCKETS = [
     "wss://s.altnet.rippletest.net:51233"
 ]
+
+REMEMBRANCER_ADDRESS = "rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn"
+
+UPDATE_TIMER_INTERVAL_SEC = 60  # Every 60 Seconds
 
 # Try to use the default browser
 if os.name == 'nt':
@@ -187,6 +191,45 @@ class CustomDialog(wx.Dialog):
         return {field: text_ctrl.GetValue() for field, text_ctrl in self.text_controls.items()}
 
 class WalletApp(wx.Frame):
+
+    GRID_CONFIGS = {
+        'proposals': {
+            'columns': [
+                ('task_id', 'Task ID', 200),
+                ('request', 'Request', 250),
+                ('proposal', 'Proposal', 300),
+                ('response', 'Response', 150)
+            ]
+        },
+        'rewards': {
+            'columns': [
+                ('task_id', 'Task ID', 170),
+                ('proposal', 'Proposal', 300),
+                ('reward', 'Reward', 250),
+                ('payout', 'Payout', 75)
+            ]
+        },
+        'verification': {
+            'columns': [
+                ('task_id', 'Task ID', 190),
+                ('proposal', 'Proposal', 300),
+                ('verification', 'Verification', 400)
+            ]
+        },
+        'memos': {
+            'columns': [
+                ('memo_id', 'Message ID', 190),
+                ('memo', 'Memo', 700)
+            ]
+        },
+        'summary': {
+            'columns': [
+                ('Key', 'Key', 125),
+                ('Value', 'Value', 550)
+            ]
+        }
+    }
+
     def __init__(self):
         wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
         self.default_size = (1150, 700)
@@ -229,10 +272,12 @@ class WalletApp(wx.Frame):
         self.grid_base_row_height = 125
         self.row_height_margin = 25
 
-    def setup_grid(self, grid, columns):
+    def setup_grid(self, grid, grid_name):
+        """Setup grid with columns based on grid configuration"""
+        columns = self.GRID_CONFIGS[grid_name]['columns']
         grid.CreateGrid(0, len(columns))
-        for idx, (name, width) in enumerate(columns):
-            grid.SetColLabelValue(idx, name)
+        for idx, (col_id, col_label, width) in enumerate(columns):
+            grid.SetColLabelValue(idx, col_label)
             grid.SetColSize(idx, width)
         return grid
 
@@ -271,8 +316,7 @@ class WalletApp(wx.Frame):
         self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
 
         # Add grid for Key Account Details
-        summary_columns = [("Key", 125), ("Value", 550)]
-        self.summary_grid = self.setup_grid(gridlib.Grid(self.summary_tab), summary_columns)
+        self.summary_grid = self.setup_grid(gridlib.Grid(self.summary_tab), 'summary')
 
         #################################
         # PROPOSALS
@@ -307,8 +351,7 @@ class WalletApp(wx.Frame):
         self.proposals_sizer.Add(self.button_sizer2, 0, wx.EXPAND)
 
         # Add grid to Proposals tab
-        proposal_columns = [("Task ID", 200), ("Request", 250), ("Proposal", 300), ("Response", 150)]
-        self.proposals_grid = self.setup_grid(gridlib.Grid(self.proposals_tab), proposal_columns)
+        self.proposals_grid = self.setup_grid(gridlib.Grid(self.proposals_tab), 'proposals')
         self.proposals_sizer.Add(self.proposals_grid, 1, wx.EXPAND | wx.ALL, 20)
 
         #################################
@@ -350,8 +393,7 @@ class WalletApp(wx.Frame):
         self.btn_force_update.Bind(wx.EVT_BUTTON, self.on_force_update)
 
         # Add grid to Verification tab
-        verification_columns = [("Task ID", 190), ("Proposal", 300), ("Verification", 400)]
-        self.verification_grid = self.setup_grid(gridlib.Grid(self.verification_tab), verification_columns)
+        self.verification_grid = self.setup_grid(gridlib.Grid(self.verification_tab), 'verification')
         self.verification_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 20)
 
         #################################
@@ -364,8 +406,7 @@ class WalletApp(wx.Frame):
         self.rewards_tab.SetSizer(self.rewards_sizer)
 
         # Add grid to Rewards tab
-        rewards_columns = [("Task ID", 170), ("Proposal", 300), ("Reward", 250), ("Payout", 75)]
-        self.rewards_grid = self.setup_grid(gridlib.Grid(self.rewards_tab), rewards_columns)
+        self.rewards_grid = self.setup_grid(gridlib.Grid(self.rewards_tab), 'rewards')
         self.rewards_sizer.Add(self.rewards_grid, 1, wx.EXPAND | wx.ALL, 20)
 
         #################################
@@ -431,6 +472,30 @@ class WalletApp(wx.Frame):
         self.panel.SetSizer(self.sizer)
 
         #################################
+        # MEMOS
+        #################################
+
+        self.memos_tab = wx.Panel(self.tabs)
+        self.tabs.AddPage(self.memos_tab, "Memos")
+        self.memos_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.memos_tab.SetSizer(self.memos_sizer)
+
+        # Add memo input box
+        self.lbl_memo = wx.StaticText(self.memos_tab, label="Enter your memo:")
+        self.memos_sizer.Add(self.lbl_memo, 0, wx.EXPAND | wx.ALL, border=5)
+        self.txt_memo_input = wx.TextCtrl(self.memos_tab, style=wx.TE_MULTILINE, size=(-1, 200))
+        self.memos_sizer.Add(self.txt_memo_input, 1, wx.EXPAND | wx.ALL, border=5)
+
+        # Add submit button
+        self.btn_submit_memo = wx.Button(self.memos_tab, label="Submit Memo")
+        self.memos_sizer.Add(self.btn_submit_memo, flag=wx.ALL | wx.EXPAND, border=5)
+        self.btn_submit_memo.Bind(wx.EVT_BUTTON, self.on_submit_memo)        
+
+        # Add grid to Memos tab
+        self.memos_grid = self.setup_grid(gridlib.Grid(self.memos_tab), 'memos')
+        self.memos_sizer.Add(self.memos_grid, 1, wx.EXPAND | wx.ALL, 20)
+
+        #################################
         # LOGS
         #################################
 
@@ -458,26 +523,27 @@ class WalletApp(wx.Frame):
 
         # Create a box to center the content
         box = wx.Panel(panel)
-        sys_color = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
-        darkened_color = self.darken_color(sys_color, 0.95)  # 5% darker
+        if os.name == 'posix':  # macOS
+            sys_color = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+            darkened_color = self.darken_color(sys_color, 0.95)  # 5% darker
+        else:  # Windows
+            darkened_color = wx.Colour(220, 220, 220)
         box.SetBackgroundColour(darkened_color)
         box_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Username
         self.lbl_user = wx.StaticText(box, label="Username:")
         box_sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
-        self.txt_user = wx.TextCtrl(box)
-        box_sizer.Add(self.txt_user, flag=wx.EXPAND | wx.ALL, border=5)
+
+        # Create combobox for username dropdown
+        self.txt_user = wx.ComboBox(box, style=wx.CB_DROPDOWN)
+        box_sizer.Add(self.txt_user, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Password
         self.lbl_pass = wx.StaticText(box, label="Password:")
         box_sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
         self.txt_pass = wx.TextCtrl(box, style=wx.TE_PASSWORD)
         box_sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
-
-        # enter username and password for debug purposes
-        # self.txt_user.SetValue('windowstestuser1')
-        # self.txt_pass.SetValue('W2g@Y79KD52*fl')
 
         # Error label
         self.error_label = wx.StaticText(box, label="")
@@ -494,7 +560,7 @@ class WalletApp(wx.Frame):
         self.btn_new_user = wx.Button(box, label="Create New User")
         box_sizer.Add(self.btn_new_user, flag=wx.EXPAND | wx.ALL, border=5)
         self.btn_new_user.Bind(wx.EVT_BUTTON, self.on_create_new_user)
-        box_sizer.Add(wx.StaticLine(box), 0, wx.EXPAND | wx.TOP, 5)
+        # box_sizer.Add(wx.StaticLine(box), 0, wx.EXPAND | wx.TOP, 5)
 
         box.SetSizer(box_sizer)
 
@@ -510,11 +576,41 @@ class WalletApp(wx.Frame):
 
         panel.SetSizer(main_sizer)
 
-        # Bind text events to clear error message
+        # Bind events
+        self.txt_user.Bind(wx.EVT_COMBOBOX_DROPDOWN, self.on_dropdown_opened)
+        self.txt_user.Bind(wx.EVT_COMBOBOX, self.on_username_selected)
         self.txt_user.Bind(wx.EVT_TEXT, self.on_clear_error)
         self.txt_pass.Bind(wx.EVT_TEXT, self.on_clear_error)
 
+        self.populate_username_dropdown()
+
         return panel
+    
+    def populate_username_dropdown(self):
+        """Populates the username dropdown with cached usernames"""
+        try:
+            current_value = self.txt_user.GetValue()
+            cached_usernames = get_cached_usernames()
+            self.txt_user.Clear()
+            self.txt_user.AppendItems(cached_usernames)
+
+            if current_value and current_value in cached_usernames:
+                self.txt_user.SetValue(current_value)
+            elif cached_usernames:
+                self.txt_user.SetValue(cached_usernames[0])
+        except Exception as e:
+            logger.error(f"Error populating username dropdown: {e}")
+            self.show_error("Error loading cached usernames")
+
+    def on_dropdown_opened(self, event):
+        """Handle dropdown being opened"""
+        self.populate_username_dropdown()
+        event.Skip()
+
+    def on_username_selected(self, event):
+        """Handle username selection from dropdown"""
+        self.txt_pass.SetFocus()
+        self.on_clear_error(event)
     
     def create_user_details_panel(self):
         panel = wx.Panel(self.panel)
@@ -704,6 +800,7 @@ class WalletApp(wx.Frame):
 
     def on_cache_user(self, event):
         #TODO: Phase out this method in favor of automatic caching on genesis
+        logger.debug("User clicked Cache Credentials button")
         """Caches the user's credentials"""
         input_map = {
             'Username_Input': self.txt_username.GetValue(),
@@ -715,23 +812,33 @@ class WalletApp(wx.Frame):
         }
 
         if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
+            logger.error("Passwords Do Not Match! Please Retry.")
             wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
         elif any(not value for value in input_map.values()):
+            logger.error("All fields (except commitment) are required for caching!")
             wx.MessageBox('All fields (except commitment) are required for caching!', 'Error', wx.OK | wx.ICON_ERROR)
         else:
             wallet_functions = WalletInitiationFunctions(input_map)
             try:
+                logger.debug("Checking if Google Doc is valid")
                 wallet_functions.check_if_google_doc_is_valid()
+                logger.debug("Google Doc is valid. Caching credentials.")
+                response = wallet_functions.cache_credentials(input_map)
+                wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
             # Invalid Google Doc URL's are fatal, since they cannot be easily changed once cached
             except (InvalidGoogleDocException, GoogleDocNotFoundException) as e:
+                logger.error(f"{e}")
                 wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
             # Other exceptions are non-fatal, since the user can make adjustments without modifying cached credentials
             except Exception as e:
+                logger.error(f"{e}")
                 # Present the error message to the user, but allow them to continue caching credentials
                 if wx.YES == wx.MessageBox(f"{e}. \n\nContinue caching anyway?", 'Error', wx.YES_NO | wx.ICON_ERROR):
                     try:
+                        logger.debug("Attempting to cache credentials despite error")
                         response = wallet_functions.cache_credentials(input_map)
                     except Exception as e:
+                        logger.error(f"Error caching credentials: {e}")
                         wx.MessageBox(f"Error caching credentials: {e}", 'Error', wx.OK | wx.ICON_ERROR)
                     else:
                         wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
@@ -907,22 +1014,22 @@ class WalletApp(wx.Frame):
     def start_json_update_timer(self):
         self.json_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.update_data, self.json_update_timer)
-        self.json_update_timer.Start(60000)  # Update every 60 seconds
+        self.json_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000) 
 
     def start_force_update_timer(self):
         self.force_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_force_update, self.force_update_timer)
-        self.force_update_timer.Start(60000)  # Update every 60 seconds
+        self.force_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def start_pft_update_timer(self):
         self.pft_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
-        self.pft_update_timer.Start(60000)  # Update every 60 seconds (adjust as needed)
+        self.pft_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def start_transaction_update_timer(self):
         self.tx_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
-        self.tx_update_timer.Start(60000)  # Update every 60 seconds (adjust as needed)
+        self.tx_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def on_transaction_update_timer(self, _):
         logger.debug("Transaction update timer triggered")
@@ -942,6 +1049,10 @@ class WalletApp(wx.Frame):
             verification_df = self.task_manager.get_verification_df()
             wx.PostEvent(self, UpdateGridEvent(data=verification_df, target="verification"))
 
+            # Get Memos tab data
+            memos_df = self.task_manager.get_memos_df()
+            wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos"))
+
         except Exception as e:
             logger.exception(f"Error updating data: {e}")
 
@@ -955,6 +1066,8 @@ class WalletApp(wx.Frame):
                     self.populate_grid_generic(self.verification_grid, event.data, 'verification')
                 case "proposals":
                     self.populate_grid_generic(self.proposals_grid, event.data, 'proposals')
+                case "memos":
+                    self.populate_grid_generic(self.memos_grid, event.data, 'memos')
                 case "summary":
                     self.populate_summary_grid(event.data)
                 case _:
@@ -967,15 +1080,8 @@ class WalletApp(wx.Frame):
 
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
         """Generic grid population method that respects zoom settings"""
-
         logger.debug(f"Populating {grid_name} grid with {data.shape[0]} rows")
-
-        COLUMN_MAPPINGS = {
-            'proposals': ['task_id', 'request', 'proposal', 'response'],
-            'rewards': ['task_id', 'proposal', 'reward', 'payout'],
-            'verification': ['task_id', 'proposal', 'verification'],
-            'summary': ['Key', 'Value']  # For our converted dictionary data
-        }
+        logger.debug(f"DataFrame Columns: {data.columns}")
 
         if data.empty:
             logger.debug(f"No data to populate {grid_name} grid")
@@ -992,21 +1098,27 @@ class WalletApp(wx.Frame):
         # Add new rows
         grid.AppendRows(len(data))
 
-        # Get the column mapping for this grid
-        column_order = COLUMN_MAPPINGS.get(grid_name, [])
-        if not column_order:
-            logger.error(f"No column mapping found for {grid_name}")
+        # Get the column configuration for this grid
+        columns = self.GRID_CONFIGS.get(grid_name, {}).get('columns', [])
+        if not columns:
+            logger.error(f"No column configuration found for {grid_name}")
+            return
+        
+        # Get the column configuration for this grid
+        columns = self.GRID_CONFIGS.get(grid_name, {}).get('columns', [])
+        if not columns:
+            logger.error(f"No column configuration found for {grid_name}")
             return
 
         # Populate data using the column mapping
         for idx in range(len(data)):
-            for col, col_name in enumerate(column_order):
-                if col_name in data.columns:
-                    value = data.iloc[idx][col_name]
+            for col, (col_id, _, _) in enumerate(columns):
+                if col_id in data.columns:
+                    value = data.iloc[idx][col_id]
                     grid.SetCellValue(idx, col, str(value))
                     grid.SetCellRenderer(idx, col, gridlib.GridCellAutoWrapStringRenderer())
                 else:
-                    logger.error(f"Column {col_name} not found in data for {grid_name}")
+                    logger.error(f"Column {col_id} not found in data for {grid_name}")
 
         # Let wxPython handle initial row sizing
         grid.AutoSizeRows()
@@ -1103,6 +1215,8 @@ class WalletApp(wx.Frame):
                         grid_name = "verification"
                     case self.summary_grid:
                         grid_name = "summary"
+                    case self.memos_grid:
+                        grid_name = "memos"
                     case _:
                         grid_name = None
                         logger.error(f"No grid name found for {window}")
@@ -1131,7 +1245,6 @@ class WalletApp(wx.Frame):
         event.Skip()
 
     def on_request_task(self, event):
-        # Change button text to "Requesting Task..."
         self.btn_request_task.SetLabel("Requesting Task...")
         self.btn_request_task.Update()
 
@@ -1148,12 +1261,10 @@ class WalletApp(wx.Frame):
             wx.CallLater(30000, self.update_data, None)
         dialog.Destroy()
 
-        # Change button text back to "Request Task"
         self.btn_request_task.SetLabel("Request Task")
         self.btn_request_task.Update()
 
     def on_accept_task(self, event):
-        # Change button text to "Accepting Task..."
         self.btn_accept_task.SetLabel("Accepting Task...")
         self.btn_accept_task.Update()
 
@@ -1186,12 +1297,10 @@ class WalletApp(wx.Frame):
                 wx.CallLater(5000, self.update_data, None)
         dialog.Destroy()
 
-        # Change button text back to "Accept Task"
         self.btn_accept_task.SetLabel("Accept Task")
         self.btn_accept_task.Update()
 
     def on_refuse_task(self, event):
-        # Change button text to "Refusing Task..."
         self.btn_refuse_task.SetLabel("Refusing Task...")
         self.btn_refuse_task.Update()
 
@@ -1220,12 +1329,10 @@ class WalletApp(wx.Frame):
                 wx.CallLater(5000, self.update_data, None)
         dialog.Destroy()
 
-        # Change button text back to "Refuse Task"
         self.btn_refuse_task.SetLabel("Refuse Task")
         self.btn_refuse_task.Update()
 
     def on_submit_for_verification(self, event):
-        # Change button text to "Submitting for Verification..."
         self.btn_submit_for_verification.SetLabel("Submitting for Verification...")
         self.btn_submit_for_verification.Update()
 
@@ -1261,12 +1368,10 @@ class WalletApp(wx.Frame):
             
         dialog.Destroy()
 
-        # Change button text back to "Submit for Verification"
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
         self.btn_submit_for_verification.Update()
 
     def on_submit_verification_details(self, event):
-        # Change button text to "Submitting Verification Details..."
         self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
         self.btn_submit_verification_details.Update()
 
@@ -1294,12 +1399,11 @@ class WalletApp(wx.Frame):
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
 
-        # Change button text back to "Submit Verification Details"
+        self.txt_verification_details.SetValue("")
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
 
     def on_force_update(self, event):
-        # Change button text to "Updating..."
         self.btn_force_update.SetLabel("Updating...")
         self.btn_force_update.Update()
 
@@ -1329,12 +1433,16 @@ class WalletApp(wx.Frame):
         except Exception as e:
             logger.error(f"FAILED UPDATING REWARDS DATA: {e}")
 
-        # Change button text back to "Update"
+        # try:
+        memos_data = self.task_manager.get_memos_df()
+        self.populate_grid_generic(self.memos_grid, memos_data, 'memos')
+        # except Exception as e:
+        #     logger.error(f"FAILED UPDATING MEMOS DATA: {e}")
+
         self.btn_force_update.SetLabel("Force Update")
         self.btn_force_update.Update()
 
     def on_log_pomodoro(self, event):
-        # Change button text to "Logging Pomodoro..."
         self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
         self.btn_log_pomodoro.Update()
 
@@ -1348,12 +1456,70 @@ class WalletApp(wx.Frame):
             message = self.task_manager.ux__convert_response_object_to_status_message(response)
             wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
 
-        # Change button text back to "Log Pomodoro"
+        self.txt_verification_details.SetValue("")
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
         self.btn_log_pomodoro.Update()
 
+    def on_submit_memo(self, event):
+        """Submits a memo to the remembrancer."""
+        self.btn_submit_memo.SetLabel("Submitting...")
+        self.btn_submit_memo.Update()
+
+        logger.info("Submitting Memo")
+
+        memo_text = self.txt_memo_input.GetValue()
+
+        if not memo_text:
+            wx.MessageBox("Please enter a memo", "Error", wx.OK | wx.ICON_ERROR)
+        else:
+            logger.info(f"Memo Text: {memo_text}")
+
+            # Estimate chunks needed with compression
+            compressed_text = compress_string(memo_text)
+            compressed_bytes = compressed_text.encode('utf-8')
+            num_chunks = len(compressed_bytes) // MAX_CHUNK_SIZE
+            if len(compressed_bytes) % MAX_CHUNK_SIZE != 0:
+                num_chunks += 1
+
+            # Calculate uncompressed chunks for comparison
+            uncompressed_bytes = memo_text.encode('utf-8')
+            uncompressed_chunks = len(uncompressed_bytes) // MAX_CHUNK_SIZE
+            if len(uncompressed_bytes) % MAX_CHUNK_SIZE != 0:
+                uncompressed_chunks += 1
+
+            if num_chunks > 1:
+                message = (
+                    f"Memo will be compressed and sent over {num_chunks} transactions "
+                    f"(reduced from {uncompressed_chunks} without compression) and "
+                    f"cost 1 PFT per chunk ({num_chunks} PFT total). Continue?"
+                )
+                if wx.NO == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
+                    self.btn_submit_memo.SetLabel("Submit Memo")
+                    return
+                    
+            logger.info("User confirmed, submitting memo")
+
+            try:
+                responses = self.task_manager.send_memo(REMEMBRANCER_ADDRESS, memo_text)
+                formatted_responses = [self.format_response(response) for response in responses]
+                logger.info(f"Memo Submission Result: {formatted_responses}")
+
+                for idx, formatted_response in enumerate(formatted_responses):
+                    if idx == 0:
+                        dialog = SelectableMessageDialog(self, f"Memo Submission Result", formatted_response)
+                    else:
+                        dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
+                    dialog.ShowModal()
+                    dialog.Destroy()
+
+            except Exception as e:
+                logger.error(f"Error submitting memo: {e}")
+                wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            
+        self.btn_submit_memo.SetLabel("Submit Memo")
+        self.txt_memo_input.SetValue("")
+
     def on_submit_xrp_payment(self, event):
-        # Change button text to "Submitting XRP Payment..."
         self.btn_submit_xrp_payment.SetLabel("Submitting...")
         self.btn_submit_xrp_payment.Update()
 
@@ -1374,12 +1540,10 @@ class WalletApp(wx.Frame):
             dialog.ShowModal()
             dialog.Destroy()
 
-        # Change button text back to "Submit XRP Payment"
         self.btn_submit_xrp_payment.SetLabel("Submit Payment")
         self.btn_submit_xrp_payment.Update()
 
     def on_submit_pft_payment(self, event):
-        # Change button text to "Submitting PFT Payment..."
         self.btn_submit_pft_payment.SetLabel("Submitting...")
         self.btn_submit_pft_payment.Update()
 
@@ -1388,9 +1552,12 @@ class WalletApp(wx.Frame):
             wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
         else:
             if is_over_1kb(self.txt_pft_memo.GetValue()):
-                if wx.YES == wx.MessageBox("Memo is over 1 KB, transaction will be batch-sent. Continue?", "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
+                memo_chunks = self.task_manager._get_memo_chunks(self.txt_pft_memo.GetValue())
+                message = f"Memo is over 1 KB, transaction will be batch-sent over {len(memo_chunks)} transactions. Continue?"
+                if wx.YES == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
                     pass
                 else:
+                    self.btn_submit_pft_payment.SetLabel("Submit Payment")
                     return
 
             response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
@@ -1405,12 +1572,10 @@ class WalletApp(wx.Frame):
             dialog.ShowModal()
             dialog.Destroy()
 
-        # Change button text back to "Submit PFT Payment"
         self.btn_submit_pft_payment.SetLabel("Submit Payment")
         self.btn_submit_pft_payment.Update()
 
     def on_show_secret(self, event):
-        # Change button text to "Showing Secret..."
         self.btn_show_secret.SetLabel("Showing Secret...")
         self.btn_show_secret.Update()
 
@@ -1418,7 +1583,6 @@ class WalletApp(wx.Frame):
         secret = self.wallet.seed
         wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
 
-        # Change button text back to "Show Secret"
         self.btn_show_secret.SetLabel("Show Secret")
         self.btn_show_secret.Update()
 

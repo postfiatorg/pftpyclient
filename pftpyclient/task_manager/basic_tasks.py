@@ -25,8 +25,13 @@ import time
 import json
 import ast
 from decimal import Decimal
+import hashlib
+import base64
+import brotli
 
 nest_asyncio.apply()
+
+MAX_CHUNK_SIZE = 760
 
 class WalletInitiationFunctions:
     def __init__(self, input_map, user_commitment=""):
@@ -439,7 +444,7 @@ class PostFiatTaskManager:
         if isinstance(memo, str) and is_over_1kb(memo):
             response = []
             logger.debug("Memo exceeds 1 KB, splitting into chunks")
-            chunked_memo = self._build_chunked_memo(memo)
+            chunked_memo = self._split_text_into_chunks(memo)
 
             # Split amount by number of chunks
             amount_per_chunk = amount / len(chunked_memo)
@@ -489,7 +494,6 @@ class PostFiatTaskManager:
         try:
             logger.debug("Submitting and waiting for transaction")
             response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
-            # response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             response = f"Transaction submission failed: {e}"
             logger.error(response)
@@ -499,47 +503,95 @@ class PostFiatTaskManager:
 
         return response
     
-    def _get_memo_chunks(self, memo):
-        """Helper method to split a memo into chunks of 1 KB """
+    def send_memo(self, destination, memo: str, compress=True):
+        """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE"""
 
-        # Function to split memo into chunks of specified size (1 KB here)
-        def chunk_string(string, chunk_size):
-            return [string[i:i + chunk_size] for i in range(0, len(string), chunk_size)]
+        message_id = self.generate_custom_id()
+
+        if compress:
+            logger.debug(f"Compressing memo of length {len(memo)}")
+            compressed_data = compress_string(memo)
+            logger.debug(f"Compressed to length {len(compressed_data)}")
+            memo = "COMPRESSED__" + compressed_data
+
+        memo_chunks = self._split_text_into_chunks(memo)
+
+        response = []
+        for idx, memo_chunk in enumerate(memo_chunks):
+            log_content = memo_chunk
+            if compress and idx == 0:
+                try:
+                    # Only log a preview of the original content
+                    log_content = f"[compressed memo preview] {memo[:100]}..."
+                except Exception as e:
+                    logger.error(f"Error decompressing memo chunk: {e}")
+                    log_content = "[compressed content]"
+                
+            logger.debug(f"Sending chunk {idx+1} of {len(memo_chunks)}: {log_content[:100]}...")
         
-        # Convert the memo to a hex string
-        memo_hex = to_hex(memo)
-        # Define the chunk size (1 KB in bytes, then converted to hex characters)
-        chunk_size = 1024 * 2  # 1 KB in bytes is 1024, and each byte is 2 hex characters
+            memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
+                                                task_id=message_id, 
+                                                full_output=memo_chunk)
 
-        # Split the memo into chunks
-        memo_chunks = chunk_string(memo_hex, chunk_size)
+            response.append(self._send_memo_single(destination, memo))
 
-        return memo_chunks
+        return response
+    
+    def _send_memo_single(self, destination, memo):
+        """ Sends a memo to a destination. """
+        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
 
-    def _build_chunked_memo(self, memo):
+        # Handle memo 
+        if isinstance(memo, Memo):
+            memos = [memo]
+        elif isinstance(memo, str):
+            memos = [Memo(memo_data=str_to_hex(memo))]
+        else:
+            logger.error("Memo is not a string or a Memo object, raising ValueError")
+            raise ValueError("Memo must be either a string or a Memo object")
+        
+        amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
+            currency="PFT",
+            issuer=self.pft_issuer,
+            value=str(1)
+        )
+
+        payment = xrpl.models.transactions.Payment(
+            account=self.user_wallet.address,
+            amount=amount_to_send,
+            destination=destination,
+            memos=memos,
+        )
+
+        try:
+            logger.debug("Submitting and waiting for transaction")
+            response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
+        except xrpl.transaction.XRPLReliableSubmissionException as e:
+            response = f"Transaction submission failed: {e}"
+            logger.error(response)
+        except Exception as e:
+            response = f"Unexpected error: {e}"
+            logger.error(response)
+
+        return response
+
+    def _split_text_into_chunks(self, text, max_chunk_size=MAX_CHUNK_SIZE):
         """ Helper method to build a list of Memo objects representing a single memo string split into chunks """
-        memo_chunks = self._get_memo_chunks(memo)
-        chunked_memo = []
-        for index, chunk in enumerate(memo_chunks):
-            chunked_memo.append(
-                Memo(
-                    memo_data=chunk, 
-                    memo_type=to_hex(f'part_{index + 1}_of_{len(memo_chunks)}'), 
-                    memo_format=to_hex('text/plain')
-                )
-            )
-        return chunked_memo
+
+        chunks = []
+
+        text_bytes = text.encode('utf-8')
+
+        for i in range(0, len(text_bytes), max_chunk_size):
+            chunk = text_bytes[i:i+max_chunk_size]
+            chunk_number = i // max_chunk_size + 1
+            chunk_label = f"chunk_{chunk_number}__".encode('utf-8')
+            chunk_with_label = chunk_label + chunk
+            chunks.append(chunk_with_label)
+
+        return [chunk.decode('utf-8', errors='ignore') for chunk in chunks]
     
 ## MEMO FORMATTING AND MEMO CREATION TOOLS
-    # def construct_basic_postfiat_memo(self, user, task_id, full_output):
-    #     user_hex = to_hex(user)
-    #     task_id_hex = to_hex(task_id)
-    #     full_output_hex = to_hex(full_output)
-    #     memo = Memo(
-    #     memo_data=full_output_hex,
-    #     memo_type=task_id_hex,
-    #     memo_format=user_hex)  
-    #     return memo
     
     def get_account_transactions__limited(self, account_address,
                                     ledger_index_min=-1,
@@ -796,26 +848,6 @@ class PostFiatTaskManager:
         self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
         logger.debug("Google Doc context link sent.")
 
-    # def check_and_prompt_google_doc(self):
-    #     """
-    #     Checks if the Google Doc context link exists for the account on the chain.
-    #     If it doesn't exist, prompts the user to enter the Google Doc string and sends it.
-    #     """
-    #     # Get memo details for the user's account
-        
-
-    #     # Check if the Google Doc context link exists
-    #     existing_link = self.retrieve_context_doc()
-
-    #     if existing_link:
-    #         print("Google Doc context link already exists:", existing_link)
-    #     else:
-    #         # Prompt the user to enter the Google Doc string
-    #         user_google_doc = input("Enter the Google Doc string: ")
-            
-    #         # Send the Google Doc context link to the default node
-    #         self.send_google_doc_to_node_if_not_sent(user_google_doc = user_google_doc)
-
     def get_proposals_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
@@ -892,9 +924,6 @@ class PostFiatTaskManager:
         # Reverse order to get the most recent proposals first
         result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
-        # Remove rows where verification is "nan"
-        # result_df = result_df[result_df['verification'] != 'nan'].reset_index(drop=True)
-
         return result_df
     
     def get_rewards_df(self):
@@ -911,9 +940,6 @@ class PostFiatTaskManager:
 
         # Filter for these tasks
         filtered_df = self.tasks[(self.tasks['task_id'].isin(reward_task_ids))].copy()
-
-        # debugging
-        filtered_df.to_csv('filtered_df.csv', index=False)
 
         if filtered_df.empty:
             return pd.DataFrame()
@@ -945,6 +971,41 @@ class PostFiatTaskManager:
         result_df = result_df[result_df['payout'].notna()].reset_index(drop=True).copy()
 
         return result_df
+    
+    def get_memos_df(self):
+
+        def remove_chunks(text):
+            # Use regular expression to remove all occurrences of chunk_1__, chunk_2__, etc.
+            cleaned_text = re.sub(r'chunk_\d+__', '', text)
+            return cleaned_text
+
+        # Filter tasks with task_type in ['MEMO']
+        chunked_memos = self.tasks[self.tasks['task_type'].isin(['MEMO'])].copy()
+
+        # Remove "chunk_[index]_" prefix from the 'full_output' column
+        chunked_memos['full_output'] = chunked_memos['full_output'].apply(remove_chunks)
+
+        # Rename full_output to memos, and task_id to message_id
+        chunked_memos.rename(columns={'task_id' : 'memo_id', 'full_output': 'memo'}, inplace=True)
+
+        # Unchunk the memos
+        memos = chunked_memos.groupby('memo_id')['memo'].apply(''.join).reset_index()
+
+        def decompress_memo(memo):
+            if memo.startswith("COMPRESSED__"):
+                try:
+                    return decompress_string(memo.replace("COMPRESSED__", ""))
+                except ValueError as e:
+                    logger.error(f"Error decompressing memo: {e}")
+                    return f"[Decompression failed: {memo[:100]}...]"
+            return memo
+        
+        memos['memo'] = memos['memo'].apply(decompress_memo)
+
+        # Reverse order to get the most recent memos first
+        memos = memos.iloc[::-1].reset_index(drop=True).copy()
+        
+        return memos
 
     def send_acceptance_for_task_id(self, task_id, acceptance_string):
         task_df = self.get_task(task_id)
@@ -962,10 +1023,6 @@ class PostFiatTaskManager:
                                                     task_id=task_id, full_output=classified_string)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_acceptance_for_task_id response: {response}")
-        # account = response.result['tx_json']['Account']
-        # destination = response.result['tx_json']['Destination']
-        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
-        # logger.debug(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
     def send_refusal_for_task(self, task_id, refusal_reason):
@@ -1002,10 +1059,6 @@ class PostFiatTaskManager:
                                                                task_id=task_id, full_output=refusal_reason)
         response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
         logger.debug(f"send_refusal_for_task response: {response}")
-        # account = response.result['tx_json']['Account']
-        # destination = response.result['tx_json']['Destination']
-        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
-        # logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
     def request_post_fiat(self, request_message ):
@@ -1035,10 +1088,6 @@ class PostFiatTaskManager:
         # Send the memo to the default node
         response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
         logger.debug(f"request_post_fiat response: {response}")
-        # account = response.result['tx_json']['Account']
-        # destination = response.result['tx_json']['Destination']
-        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
-        # logger.info(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
 
     def submit_initial_completion(self, completion_string, task_id):
@@ -1067,10 +1116,6 @@ class PostFiatTaskManager:
                                                               full_output=classified_completion_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"submit_initial_completion Response: {response}")
-        # account = response.result['tx_json']['Account']
-        # destination = response.result['tx_json']['Destination']
-        # memo_map = response.result['tx_json']['Memos'][0]['Memo']
-        # logger.debug(f"{account} sent 1 PFT to {destination} with memo {memo_map}")
         return response
         
     def send_verification_response(self, response_string, task_id):
@@ -1099,11 +1144,6 @@ class PostFiatTaskManager:
                                                               full_output=classified_response_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_verification_response Response: {response}")
-        # account = response.result['Account']
-        # destination = response.result['Destination']
-        # memo_map = response.result['Memos'][0]['Memo']
-        # print(f"{account} sent 1 PFT to {destination} with memo")
-        # print(self.convert_memo_dict(memo_map))
         return response
 
     ## WALLET UX POPULATION 
@@ -1244,6 +1284,10 @@ def construct_genesis_memo(user, task_id, full_output):
     return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
 
 def construct_memo(user, memo_type, memo_data):
+
+    if is_over_1kb(memo_data):
+        raise ValueError("Memo exceeds 1 KB, raising ValueError")
+
     return Memo(
         memo_data=to_hex(memo_data),
         memo_type=to_hex(memo_type),
@@ -1335,7 +1379,8 @@ def classify_task_string(string):
             'REWARD': ['REWARD RESPONSE __'],
             'TASK_OUTPUT': ['COMPLETION JUSTIFICATION ___'],
             'USER_GENESIS': ['USER GENESIS __'],
-            'REQUEST_POST_FIAT':['REQUEST_POST_FIAT ___']
+            'REQUEST_POST_FIAT':['REQUEST_POST_FIAT ___'],
+            'MEMO': ['chunk_'],
         }
 
     for category, keywords in categories.items():
@@ -1405,6 +1450,51 @@ def generate_trust_line_to_pft_token(mainnet_url, wallet: xrpl.wallet.Wallet):
         response = f"Submit failed: {e}"
         logger.error(f"Trust line creation failed: {response}")
     return response
+
+def generate_random_utf8_friendly_hash(length=6):
+    # Generate a random sequence of bytes
+    random_bytes = os.urandom(16)  # 16 bytes of randomness
+    # Create a SHA-256 hash of the random bytes
+    hash_object = hashlib.sha256(random_bytes)
+    hash_bytes = hash_object.digest()
+    # Encode the hash to base64 to make it URL-safe and readable
+    base64_hash = base64.urlsafe_b64encode(hash_bytes).decode('utf-8')
+    # Take the first `length` characters of the base64-encoded hash
+    utf8_friendly_hash = base64_hash[:length]
+    return utf8_friendly_hash
+
+def compress_string(input_string):
+    try:
+        # Compress the string using Brotli
+        compressed_data = brotli.compress(input_string.encode('utf-8'))
+        # Encode the compressed data to a Base64 string
+        base64_encoded_data = base64.b64encode(compressed_data)
+        # Convert the Base64 bytes to a string
+        compressed_string = base64_encoded_data.decode('utf-8')
+        return compressed_string
+    except Exception as e:
+        raise ValueError(f"Compression failed: {e}")
+
+def decompress_string(compressed_string):
+    try:
+        # Ensure correct padding for Base64 decoding
+        missing_padding = len(compressed_string) % 4
+        if missing_padding:
+            compressed_string += '=' * (4 - missing_padding)
+        
+        # Validate the string contains only valid Base64 characters
+        if not all(c in string.ascii_letters + string.digits + '+/=' for c in compressed_string):
+            raise ValueError("Invalid Base64 characters in compressed string")
+
+        # Decode the Base64 string to bytes
+        base64_decoded_data = base64.b64decode(compressed_string)
+        # Decompress the data using Brotli
+        decompressed_data = brotli.decompress(base64_decoded_data)
+        # Convert the decompressed bytes to a string
+        decompressed_string = decompressed_data.decode('utf-8')
+        return decompressed_string
+    except (binascii.Error, brotli.error, UnicodeDecodeError) as e:
+        raise ValueError(f"Decompression failed: {e}")
 
 class GoogleDocNotFoundException(Exception):
     """ This exception is raised when the Google Doc is not found """
