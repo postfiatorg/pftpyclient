@@ -800,6 +800,7 @@ class WalletApp(wx.Frame):
 
     def on_cache_user(self, event):
         #TODO: Phase out this method in favor of automatic caching on genesis
+        logger.debug("User clicked Cache Credentials button")
         """Caches the user's credentials"""
         input_map = {
             'Username_Input': self.txt_username.GetValue(),
@@ -811,23 +812,33 @@ class WalletApp(wx.Frame):
         }
 
         if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
+            logger.error("Passwords Do Not Match! Please Retry.")
             wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
         elif any(not value for value in input_map.values()):
+            logger.error("All fields (except commitment) are required for caching!")
             wx.MessageBox('All fields (except commitment) are required for caching!', 'Error', wx.OK | wx.ICON_ERROR)
         else:
             wallet_functions = WalletInitiationFunctions(input_map)
             try:
+                logger.debug("Checking if Google Doc is valid")
                 wallet_functions.check_if_google_doc_is_valid()
+                logger.debug("Google Doc is valid. Caching credentials.")
+                response = wallet_functions.cache_credentials(input_map)
+                wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
             # Invalid Google Doc URL's are fatal, since they cannot be easily changed once cached
             except (InvalidGoogleDocException, GoogleDocNotFoundException) as e:
+                logger.error(f"{e}")
                 wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
             # Other exceptions are non-fatal, since the user can make adjustments without modifying cached credentials
             except Exception as e:
+                logger.error(f"{e}")
                 # Present the error message to the user, but allow them to continue caching credentials
                 if wx.YES == wx.MessageBox(f"{e}. \n\nContinue caching anyway?", 'Error', wx.YES_NO | wx.ICON_ERROR):
                     try:
+                        logger.debug("Attempting to cache credentials despite error")
                         response = wallet_functions.cache_credentials(input_map)
                     except Exception as e:
+                        logger.error(f"Error caching credentials: {e}")
                         wx.MessageBox(f"Error caching credentials: {e}", 'Error', wx.OK | wx.ICON_ERROR)
                     else:
                         wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
