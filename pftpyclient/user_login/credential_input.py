@@ -31,10 +31,20 @@ class CredentialManager:
         decrypted_cred_map = {
             self.wallet_address_name: pwl.password_decrypt(token=encrypted_cred_map[self.wallet_address_name], password=pw_decryptor).decode('utf-8'),
             self.wallet_secret_name: pwl.password_decrypt(token=encrypted_cred_map[self.wallet_secret_name], password=pw_decryptor).decode('utf-8'),
-            self.google_doc_name: pwl.password_decrypt(token=encrypted_cred_map[self.google_doc_name], password=pw_decryptor).decode('utf-8')
         }
+
+        # Only add google_doc_name if it exists in the encrypted_cred_map
+        if self.google_doc_name in encrypted_cred_map:
+            decrypted_cred_map[self.google_doc_name] = pwl.password_decrypt(
+                token=encrypted_cred_map[self.google_doc_name], 
+                password=pw_decryptor
+            ).decode('utf-8')
         
         return decrypted_cred_map 
+    
+    def enter_and_encrypt_credential(self, credentials_dict):
+        """Encryps and stores multiple credentials"""
+        enter_and_encrypt_credential(credentials_dict=credentials_dict, pw_encryptor=self.pw_initiator)
     
 def _read_creds(credential_file_path):
     with open(credential_file_path, 'r') as f:
@@ -102,7 +112,7 @@ def cache_credentials(input_map):
         credentials = {
             f'{input_map["Username_Input"]}__v1xrpaddress': input_map['XRP Address_Input'],
             f'{input_map["Username_Input"]}__v1xrpsecret': input_map['XRP Secret_Input'],
-            f'{input_map["Username_Input"]}__googledoc': input_map['Google Doc Share Link_Input']                
+            # f'{input_map["Username_Input"]}__googledoc': input_map['Google Doc Share Link_Input']                
         }
 
         enter_and_encrypt_credential(
