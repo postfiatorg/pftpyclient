@@ -1525,8 +1525,6 @@ class WalletApp(wx.Frame):
 
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
         """Generic grid population method that respects zoom settings"""
-        logger.debug(f"Populating {grid_name} grid with {data.shape[0]} rows")
-        logger.debug(f"DataFrame Columns: {data.columns}")
 
         if data.empty:
             logger.debug(f"No data to populate {grid_name} grid")
