@@ -4,8 +4,8 @@ from typing import Optional
 from loguru import logger
 from .perf_plotter import WalletPerformancePlotter
 from .perf_plot_item import PerfPlotQueueItem
+from .metric_types import Metric
 from functools import wraps
-import sys
 
 class PerformanceMonitor:
     _instance = None
@@ -19,33 +19,53 @@ class PerformanceMonitor:
         self.monitors = {}
         self.stopped = False
         self.shutdown_event = multiprocessing.Event()
-    
+
     @staticmethod
-    def measure_time(operation: str):
-        """Decorator that measures execution time and sends data to the plotter"""
+    def measure(process: str, *metrics: Metric):
+        """Generic decorator that measures multiple metrics and sends data to the plotter
+        
+        Args:
+            process: name of the process to measure
+            *metrics: variable number of metrics to measure
+        """
+
+        metrics = metrics or (Metric.DURATION, Metric.COUNT,)
+
         def decorator(func):
             @wraps(func)
             def wrapper(*args, **kwargs):
-
                 monitor = PerformanceMonitor._instance
-                
+
                 # If no monitor is active, just run the function
                 if monitor is None:
                     return func(*args, **kwargs)
-
-                logger.debug(f"Starting measurement for {operation}")
-                perf_item = monitor.monitors.get(operation)
-                if perf_item is None:
-                    # Create a new monitor if it doesn't exist
-                    perf_item = monitor.create_monitor(operation)
-                    monitor.monitors[operation] = perf_item
-
-                perf_item.track()
-                result = func(*args, **kwargs)
-                perf_item.end_track()
                 
-                perf_item.send_to_queue(monitor.queue)
-                logger.debug(f"Finished measurement for {operation}")
+                logger.debug(f"Starting measurement for {process} ({[m.type_name for m in metrics]})")
+                perf_item = monitor.monitors.get(process)
+
+                # Create a new monitor if it doesn't exist
+                if perf_item is None:
+                    perf_item = monitor.create_monitor(process)
+                    monitor.monitors[process] = perf_item
+
+                # Start measurement
+                for metric in metrics:
+                    perf_item.track(metric)
+
+                # Execute the function
+                result = func(*args, **kwargs)
+
+                # End measurement and send data to plotter queue
+                for metric in metrics:
+                    value = perf_item.end_track(metric)
+                    monitor.queue.put({
+                        'process': process,
+                        'data': {
+                            'type': metric.type_name,
+                            'value': value,
+                            'unit': metric.unit
+                        }
+                    })
 
                 return result
             return wrapper

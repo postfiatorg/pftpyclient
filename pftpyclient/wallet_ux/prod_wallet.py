@@ -3,7 +3,6 @@ import wx
 import wx.adv
 import wx.grid as gridlib
 import wx.html
-import wx.lib.scrolledpanel as scrolled
 import xrpl
 from xrpl.wallet import Wallet
 import asyncio
@@ -39,7 +38,6 @@ from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
 import pandas as pd
-from queue import Empty
 
 # Configure the logger at module level
 wx_sink = configure_logger(
@@ -988,11 +986,13 @@ class WalletApp(wx.Frame):
         self.update_data(None)
 
         # Start timers
+        # TODO: start_json_update_timer and start_force_update_timer might be doing the same thing
         self.start_json_update_timer()
         self.start_force_update_timer()
         self.start_pft_update_timer()
         self.start_transaction_update_timer()
 
+    @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
         """Update UI elements based on wallet state. Only hides PFT tabs if wallet is not active."""
         current_state = self.task_manager.wallet_state
@@ -1115,7 +1115,7 @@ class WalletApp(wx.Frame):
         # Update account info
         self.update_account_info()
 
-    @PerformanceMonitor.measure_time('update_account_info')
+    @PerformanceMonitor.measure('update_account_info')
     def update_account_info(self):
         if self.task_manager:
             xrp_balance = self.task_manager.get_xrp_balance()
@@ -1242,7 +1242,7 @@ class WalletApp(wx.Frame):
             case _:
                 logger.error(f"Unknown wallet state: {current_state}")
 
-    @PerformanceMonitor.measure_time('run_bg_job')
+    @PerformanceMonitor.measure('run_bg_job')
     def run_bg_job(self, job):
         if self.worker.context:
             asyncio.run_coroutine_threadsafe(job, self.worker.loop)
@@ -1250,7 +1250,7 @@ class WalletApp(wx.Frame):
     def update_ledger(self, message):
         pass  # Simplified for this version
 
-    @PerformanceMonitor.measure_time('update_account')
+    @PerformanceMonitor.measure('update_account')
     def update_account(self, acct):
         logger.debug(f"Updating account: {acct}")
         xrp_balance = str(xrpl.utils.drops_to_xrp(acct["Balance"]))
@@ -1331,7 +1331,7 @@ class WalletApp(wx.Frame):
                 wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
 
     @requires_wallet_state(TRUSTLINED_STATES)
-    @PerformanceMonitor.measure_time('update_tokens')
+    @PerformanceMonitor.measure('update_tokens')
     def update_tokens(self, account_address):
         #TODO: refactor this to use the task manager
         logger.debug(f"Fetching token balances for account: {account_address}")
@@ -1373,6 +1373,8 @@ class WalletApp(wx.Frame):
 
         self.Destroy()
 
+    # TODO: start_json_update_timer and start_force_update_timer might be doing the same thing
+
     def start_json_update_timer(self):
         self.json_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.update_data, self.json_update_timer)
@@ -1393,11 +1395,12 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
         self.tx_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
 
+    @PerformanceMonitor.measure('on_transaction_update_timer')
     def on_transaction_update_timer(self, _):
         logger.debug("Transaction update timer triggered")
         self.task_manager.sync_transactions()
 
-    @PerformanceMonitor.measure_time('update_data')
+    @PerformanceMonitor.measure('update_data')
     def update_data(self, event):
         try:
             # Get proposals tab data
@@ -1419,7 +1422,7 @@ class WalletApp(wx.Frame):
         except Exception as e:
             logger.exception(f"Error updating data: {e}")
 
-    @PerformanceMonitor.measure_time('update_grid')
+    @PerformanceMonitor.measure('update_grid')
     def update_grid(self, event):
         logger.debug(f"Updating grid with target: {getattr(event, 'target')}")
         if not hasattr(event, 'target'):
@@ -1462,11 +1465,12 @@ class WalletApp(wx.Frame):
 
         self.auto_size_window()
 
+    @PerformanceMonitor.measure('on_pft_update_timer')
     def on_pft_update_timer(self, event):
         if self.wallet:
             self.update_tokens(self.wallet.classic_address)
 
-    @PerformanceMonitor.measure_time('populate_grid_generic')
+    @PerformanceMonitor.measure('populate_grid_generic')
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
         """Generic grid population method that respects zoom settings"""
 
@@ -1526,7 +1530,7 @@ class WalletApp(wx.Frame):
 
         self.auto_size_window()
 
-    @PerformanceMonitor.measure_time('populate_summary_grid')
+    @PerformanceMonitor.measure('populate_summary_grid')
     def populate_summary_grid(self, key_account_details):
         """Convert dictionary to dataframe and use generic grid population method"""
         summary_df = pd.DataFrame(list(key_account_details.items()), columns=['Key', 'Value'])
@@ -1632,7 +1636,7 @@ class WalletApp(wx.Frame):
         self.auto_size_window()
         event.Skip()
 
-    @PerformanceMonitor.measure_time('on_request_task')
+    @PerformanceMonitor.measure('on_request_task')
     def on_request_task(self, event):
         self.btn_request_task.SetLabel("Requesting Task...")
         self.btn_request_task.Update()
@@ -1653,7 +1657,7 @@ class WalletApp(wx.Frame):
         self.btn_request_task.SetLabel("Request Task")
         self.btn_request_task.Update()
 
-    @PerformanceMonitor.measure_time('on_accept_task')
+    @PerformanceMonitor.measure('on_accept_task')
     def on_accept_task(self, event):
         self.btn_accept_task.SetLabel("Accepting Task...")
         self.btn_accept_task.Update()
@@ -1690,7 +1694,7 @@ class WalletApp(wx.Frame):
         self.btn_accept_task.SetLabel("Accept Task")
         self.btn_accept_task.Update()
 
-    @PerformanceMonitor.measure_time('on_refuse_task')
+    @PerformanceMonitor.measure('on_refuse_task')
     def on_refuse_task(self, event):
         self.btn_refuse_task.SetLabel("Refusing Task...")
         self.btn_refuse_task.Update()
@@ -1723,7 +1727,7 @@ class WalletApp(wx.Frame):
         self.btn_refuse_task.SetLabel("Refuse Task")
         self.btn_refuse_task.Update()
 
-    @PerformanceMonitor.measure_time('on_submit_for_verification')
+    @PerformanceMonitor.measure('on_submit_for_verification')
     def on_submit_for_verification(self, event):
         self.btn_submit_for_verification.SetLabel("Submitting for Verification...")
         self.btn_submit_for_verification.Update()
@@ -1763,7 +1767,7 @@ class WalletApp(wx.Frame):
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
         self.btn_submit_for_verification.Update()
 
-    @PerformanceMonitor.measure_time('on_submit_verification_details')
+    @PerformanceMonitor.measure('on_submit_verification_details')
     def on_submit_verification_details(self, event):
         self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
         self.btn_submit_verification_details.Update()
@@ -1796,7 +1800,7 @@ class WalletApp(wx.Frame):
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
 
-    @PerformanceMonitor.measure_time('on_force_update')
+    @PerformanceMonitor.measure('on_force_update')
     def on_force_update(self, event):
         self.btn_force_update.SetLabel("Updating...")
         self.btn_force_update.Update()
@@ -1841,7 +1845,7 @@ class WalletApp(wx.Frame):
         self.btn_force_update.SetLabel("Force Update")
         self.btn_force_update.Update()
 
-    @PerformanceMonitor.measure_time('on_log_pomodoro')
+    @PerformanceMonitor.measure('on_log_pomodoro')
     def on_log_pomodoro(self, event):
         self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
         self.btn_log_pomodoro.Update()
@@ -1860,7 +1864,7 @@ class WalletApp(wx.Frame):
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
         self.btn_log_pomodoro.Update()
 
-    @PerformanceMonitor.measure_time('on_submit_memo')
+    @PerformanceMonitor.measure('on_submit_memo')
     def on_submit_memo(self, event):
         """Submits a memo to the remembrancer."""
         self.btn_submit_memo.SetLabel("Submitting...")
@@ -1920,7 +1924,7 @@ class WalletApp(wx.Frame):
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.txt_memo_input.SetValue("")
 
-    @PerformanceMonitor.measure_time('on_submit_xrp_payment')
+    @PerformanceMonitor.measure('on_submit_xrp_payment')
     def on_submit_xrp_payment(self, event):
         self.btn_submit_xrp_payment.SetLabel("Submitting...")
         self.btn_submit_xrp_payment.Update()
@@ -1945,7 +1949,7 @@ class WalletApp(wx.Frame):
         self.btn_submit_xrp_payment.SetLabel("Submit Payment")
         self.btn_submit_xrp_payment.Update()
 
-    @PerformanceMonitor.measure_time('on_submit_pft_payment')
+    @PerformanceMonitor.measure('on_submit_pft_payment')
     def on_submit_pft_payment(self, event):
         self.btn_submit_pft_payment.SetLabel("Submitting...")
         self.btn_submit_pft_payment.Update()

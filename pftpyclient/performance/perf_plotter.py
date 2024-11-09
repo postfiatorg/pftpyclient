@@ -1,43 +1,15 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 import numpy as np
-from collections import defaultdict
+import pandas as pd
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
-import platform
-import psutil
 import multiprocessing
 from itertools import cycle
 from loguru import logger
-from typing import Optional, Dict, Any
 from queue import Empty
-import os
-import sys
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import QTimer
-
-SYNC_OPERATIONS = [
-    "update_account_info",
-    "run_bg_job",
-    "update_account",
-    "update_tokens",
-    "update_data",
-    "update_grid",
-    "populate_grid_generic",
-    "populate_summary_grid",
-    "on_force_update",
-]
-
-TASK_OPERATIONS = [
-    "on_request_task",
-    "on_accept_task",
-    "on_refuse_task",
-    "on_submit_for_verification",
-    "on_submit_verification_details",
-    "on_log_pomodoro",
-    "on_submit_memo",
-    "on_submit_xrp_payment",
-    "on_submit_pft_payment",
-]
+from pathlib import Path
+import platform
+from .metric_types import Metric
 
 def configure_plotter_logger():
     """Configure logger specifically for the plotter process"""
@@ -49,7 +21,7 @@ def configure_plotter_logger():
 
     logger.add(sys.stderr, level="DEBUG")
 
-    log_path = Path.cwd() / "pftpyclient" / "logs" / "perf_plotter.log"
+    log_path = Path.cwd() / "pftpyclient" / "logs" / "perf_plotter_debug.log"
     logger.add(log_path, rotation="10 MB", retention="1 week", level="DEBUG")
     return logger
 
@@ -61,6 +33,19 @@ class TimeAxisItem(pg.AxisItem):
         return [datetime.fromtimestamp(v).strftime('%H:%M:%S') for v in values]
 
 class WalletPerformancePlotter:
+    """Class to plot performance metrics in a live view"""
+
+    PERF_LOG_COLUMNS = [
+        'timestamp',
+        'process',
+        'metric_type',
+        'metric_value',
+        'metric_unit',
+        'platform',
+        'python_version',
+        'session_id'
+    ]
+
     def __init__(self, queue: multiprocessing.Queue, shutdown_event: multiprocessing.Event):
         self.logger = configure_plotter_logger()
         self.logger.debug("Initializing WalletPerformancePlotter")
@@ -70,19 +55,24 @@ class WalletPerformancePlotter:
         self.app = pg.mkQApp("PftPyClient Stats")
         
         self.win = pg.GraphicsLayoutWidget(show=True)
-        self.win.resize(600, 400)
+        self.win.resize(700, 800)
         self.win.setWindowTitle('PftPyClient Stats')
 
         self.win.closeEvent = self.handle_close
         self.win.setWindowFlags(self.win.windowFlags())
 
-        self.plot = self.win.addPlot()
-        self.plot.setTitle("Durations (ms)")
+        self.duration_plot = self.win.addPlot()
+        self.duration_bars = pg.BarGraphItem(x=[], height=[], width=0.5)
+        self.duration_plot.addItem(self.duration_bars)
 
-        self.bars = pg.BarGraphItem(x=[], height=[], width=0.5, brush='r')
-        self.plot.addItem(self.bars)
+        self.win.ci.layout.setSpacing(40)
 
-        self.data = {}
+        self.count_plot = self.win.addPlot(row=2, col=0)
+        self.count_bars = pg.BarGraphItem(x=[], height=[], width=0.5)
+        self.count_plot.addItem(self.count_bars)
+
+        self.duration_data = {}
+        self.count_data = {}
 
         # Setup colors
         self.colors = cycle(['c', 'r', 'b', 'g', 'w', 'y', 'm'])
@@ -92,6 +82,37 @@ class WalletPerformancePlotter:
         self.closed = False
 
         self.logger = logger
+
+        # Setup performance metrics logging with pandas
+        metrics_dir = Path.cwd() / "pftpyclient" / "logs"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        self.perf_log_path = metrics_dir / "performance_metrics.csv"
+        self.perf_df = self._init_perf_log()
+
+        self.last_save_time = datetime.now()
+        self.save_interval = 300  # seconds
+
+    def _init_perf_log(self):
+        """Initialize or load the performance log DataFrame"""
+
+        if self.perf_log_path.exists():
+            try:
+                return pd.read_csv(self.perf_log_path)
+            except Exception as e:
+                self.logger.error(f"Error reading performance log: {e}")
+
+        return pd.DataFrame(columns=self.PERF_LOG_COLUMNS)
+    
+    def _save_metrics(self, force: bool = False):
+        """Save metrics to CSV if interval has elapsed or force is True"""
+        now = datetime.now()
+        if force or (now - self.last_save_time).total_seconds() >= self.save_interval:
+            try:
+                self.perf_df.to_csv(self.perf_log_path, index=False)
+                self.last_save_time = now
+                self.logger.debug(f"Saved performance log to {self.perf_log_path}")
+            except Exception as e:
+                self.logger.error(f"Error saving performance log: {e}")
 
     def start(self):
         """Start the plotter and Qt event loop"""
@@ -108,45 +129,97 @@ class WalletPerformancePlotter:
         """Process the performance data queue"""
         try:
             while not self.queue.empty():
-                # self.logger.debug(f"Queue size: {self.queue.qsize()}. Processing...")
                 try:
                     data = self.queue.get_nowait()
-                    # self.logger.debug(f"Received data: {data}")
 
                     if data:
                         process_name = data.get('process')
                         metrics = data.get('data')
-                        # self.logger.debug(f"Processing {process_name}: {metrics}")
 
                         if process_name and metrics:
-                            self.data[process_name] = {
-                                'duration': float(metrics.get('duration', 0)),
-                                'timestamp': datetime.now()
-                            }
+                            metric_type = Metric.from_type_name(metrics.get('type'))
+                            metric_value = float(metrics.get('value', 0))
+
+                            new_row = pd.DataFrame([{
+                                'timestamp': datetime.now(),
+                                'process': process_name,
+                                'metric_type': metric_type.type_name, 
+                                'metric_value': metric_value,
+                                'metric_unit': metric_type.unit,
+                                'platform': platform.system(),
+                                'python_version': platform.python_version(),
+                                'session_id': id(self)
+                            }], columns=self.PERF_LOG_COLUMNS)
+                            self.perf_df = pd.concat([self.perf_df, new_row], ignore_index=True)
+                        
+                            # Update live plot data
+                            match metric_type:
+                                case Metric.DURATION:
+                                    self.duration_data[process_name] = {
+                                        'duration': metric_value,
+                                        'timestamp': datetime.now()
+                                    }
+                                case Metric.COUNT:
+                                    if process_name not in self.count_data:
+                                        self.count_data[process_name] = {
+                                            'count': 0,
+                                            'timestamp': datetime.now()
+                                        }
+                                    self.count_data[process_name]['count'] += 1
+                                    self.count_data[process_name]['timestamp'] = datetime.now()
 
                 except Empty:
                     break
 
-            self._update_plot()
+            self._update_plots()
+            self._save_metrics()
 
         except Exception as e:
             self.logger.error(f"Error processing queue: {e}", exc_info=True)
 
-    def _update_plot(self):
-        """Update the bar chart with current data"""
+    def _update_plots(self):
+        """Update all plots"""
         try:
-            if not self.data:
-                return
+            if self.duration_data:
+                self._update_metric_plot(Metric.DURATION)
 
-            # Sort operations by duration for better visualization
-            sorted_ops = sorted([(name, data['duration'], data['timestamp']) for name, data in self.data.items()],
+            if self.count_data:
+                self._update_metric_plot(Metric.COUNT)
+
+        except Exception as e:
+            self.logger.error(f"Error updating plots: {e}", exc_info=True)
+
+    def _update_metric_plot(self, metric_type: Metric):
+        """Update a metric's bar chart"""
+        try:
+            value_key = f'{metric_type.type_name}'
+            title = f"{metric_type.type_name} ({metric_type.unit})"
+
+            match metric_type:
+                case Metric.DURATION:
+                    data_dict = self.duration_data
+                    plot = self.duration_plot
+                    bars = self.duration_bars
+                case Metric.COUNT:
+                    data_dict = self.count_data
+                    plot = self.count_plot
+                    bars = self.count_bars
+                case _:
+                    raise ValueError(f"Invalid metric type: {metric_type}")
+        
+            if not data_dict:
+                return
+            
+            sorted_ops = sorted(
+                [(name, data[value_key], data['timestamp'])
+                  for name, data in data_dict.items()],
                 key=lambda x: x[1],
                 reverse=True
-            )    
+            )
 
             base_names = []
             display_names = []
-            durations = []
+            values = []
 
             # Create labels with elapsed time
             for op_name, duration, timestamp in sorted_ops:
@@ -157,62 +230,113 @@ class WalletPerformancePlotter:
                     time_str = f"{elapsed.total_seconds() // 60:.0f}m {elapsed.total_seconds() - (elapsed.total_seconds() // 60) * 60:.0f}s ago"
                 base_names.append(op_name)
                 display_names.append(f"{op_name} ({time_str})")
-                durations.append(duration)
+                values.append(duration)
 
-            # Assign colors to new operations
-            for operation, _, _ in sorted_ops:
-                if operation not in self.bar_colors:
-                    self.bar_colors[operation] = next(self.colors)
-            
+            # Assign colors to new processes
+            for process, _, _ in sorted_ops:
+                if process not in self.bar_colors:
+                    self.bar_colors[process] = next(self.colors)
+
             # Create y positions for horizontal bars
             y_pos = np.arange(len(display_names))
 
             # Remove old bars and create new horizontal ones
-            self.plot.removeItem(self.bars)
-            self.bars = pg.BarGraphItem(
+            plot.removeItem(bars)
+            bars = pg.BarGraphItem(
                 x0=0,                # Starts bars at 0
                 y=y_pos,            # Y position for each bar
-                width=np.array(durations, dtype=float),    # Bar length
+                width=np.array(values, dtype=float),    # Bar length
                 height=0.5,         # Bar thickness
                 brushes=[self.bar_colors[name] for name in base_names]  # Color for each bar
             )
-            self.plot.addItem(self.bars)
+            plot.addItem(bars)
 
-            # Update axis with labels
-            left_axis = self.plot.getAxis('left')
+            # Update plot properties
+            plot.setTitle(title)
+
+            # Update axis labels
+            left_axis = plot.getAxis('left')
             left_axis.setTicks([list(enumerate(display_names))])
-            left_axis.setLabel('Operations')
+            left_axis.setLabel('Processes')
 
-            bottom_axis = self.plot.getAxis('bottom')
-            bottom_axis.setLabel('Duration (ms)')
-
+            bottom_axis = plot.getAxis('bottom')
+            bottom_axis.setLabel(metric_type.type_name)
+            
             # Force x-axis to start at 0 and give 10% margin on the right
-            self.plot.setXRange(0, max(durations) * 1.1)
+            plot.setXRange(0, max(values) * 1.1)
             # Adjust y-axis to fit all bars
-            self.plot.setYRange(-0.5, len(display_names) - 0.5)
+            plot.setYRange(-0.5, len(display_names) - 0.5)
+
+            # Store bars reference
+            match metric_type:
+                case Metric.DURATION:
+                    self.duration_bars = bars
+                case Metric.COUNT:
+                    self.count_bars = bars
 
         except Exception as e:
-            self.logger.error(f"Error updating plot: {e}", exc_info=True)
+            self.logger.error(f"Error updating {metric_type.type_name} plot: {e}", exc_info=True)
+    
+    # def _update_duration_plot(self):
+    #     """Update the duration bar chart"""
+    #     try:
+    #         # Sort processes by duration for better visualization
+    #         sorted_ops = sorted(
+    #             [(name, data['duration'], data['timestamp']) 
+    #              for name, data in self.duration_data.items()],
+    #             key=lambda x: x[1],
+    #             reverse=True
+    #         )
 
-    def _update_mem_plot(self):
-        """Update memory usage plot"""
-        self.mem_plot.clear()
-        if "system" in self.data:
-            self.mem_plot.plot(
-                self.data["system"]["timestamp"],
-                self.data["system"]["data"]["memory_percent"],
-                pen='g'
-            )
+    #         base_names = []
+    #         display_names = []
+    #         durations = []
 
-    def _update_cpu_plot(self):
-        """Update CPU usage plot"""
-        self.cpu_plot.clear()
-        if "system" in self.data:
-            self.cpu_plot.plot(
-                self.data["system"]["timestamp"],
-                self.data["system"]["data"]["cpu_percent"],
-                pen='r'
-            )
+    #         # Create labels with elapsed time
+    #         for op_name, duration, timestamp in sorted_ops:
+    #             elapsed = datetime.now() - timestamp
+    #             if elapsed.total_seconds() < 60:
+    #                 time_str = f"{elapsed.total_seconds():.0f}s ago"
+    #             else:
+    #                 time_str = f"{elapsed.total_seconds() // 60:.0f}m {elapsed.total_seconds() - (elapsed.total_seconds() // 60) * 60:.0f}s ago"
+    #             base_names.append(op_name)
+    #             display_names.append(f"{op_name} ({time_str})")
+    #             durations.append(duration)
+
+    #         # Assign colors to new processes
+    #         for process, _, _ in sorted_ops:
+    #             if process not in self.bar_colors:
+    #                 self.bar_colors[process] = next(self.colors)
+            
+    #         # Create y positions for horizontal bars
+    #         y_pos = np.arange(len(display_names))
+
+    #         # Remove old bars and create new horizontal ones
+    #         self.duration_plot.removeItem(self.duration_bars)
+    #         self.duration_bars = pg.BarGraphItem(
+    #             x0=0,                # Starts bars at 0
+    #             y=y_pos,            # Y position for each bar
+    #             width=np.array(durations, dtype=float),    # Bar length
+    #             height=0.5,         # Bar thickness
+    #             brushes=[self.bar_colors[name] for name in base_names]  # Color for each bar
+    #         )
+    #         self.duration_plot.addItem(self.duration_bars)
+
+    #         # Update axis with labels
+    #         left_axis = self.duration_plot.getAxis('left')
+    #         left_axis.setTicks([list(enumerate(display_names))])
+    #         left_axis.setLabel('Processes')
+
+    #         bottom_axis = self.duration_plot.getAxis('bottom')
+    #         bottom_axis.setLabel('Duration (ms)')
+
+    #         # Force x-axis to start at 0 and give 10% margin on the right
+    #         self.duration_plot.setXRange(0, max(durations) * 1.1)
+    #         # Adjust y-axis to fit all bars
+    #         self.duration_plot.setYRange(-0.5, len(display_names) - 0.5)
+
+    #     except Exception as e:
+    #         self.logger.error(f"Error updating plot: {e}", exc_info=True)
 
     @staticmethod
     def _append(arr, value):
@@ -222,6 +346,8 @@ class WalletPerformancePlotter:
 
     def handle_close(self, event):
         """Handle the close event of the plotter window"""
+        self._save_metrics(force=True)
+
         # Stop the timer
         if hasattr(self, 'timer'):
             self.timer.stop()
