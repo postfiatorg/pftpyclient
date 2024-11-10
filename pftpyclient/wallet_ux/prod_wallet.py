@@ -1636,7 +1636,6 @@ class WalletApp(wx.Frame):
         self.auto_size_window()
         event.Skip()
 
-    @PerformanceMonitor.measure('on_request_task')
     def on_request_task(self, event):
         self.btn_request_task.SetLabel("Requesting Task...")
         self.btn_request_task.Update()
@@ -1657,7 +1656,6 @@ class WalletApp(wx.Frame):
         self.btn_request_task.SetLabel("Request Task")
         self.btn_request_task.Update()
 
-    @PerformanceMonitor.measure('on_accept_task')
     def on_accept_task(self, event):
         self.btn_accept_task.SetLabel("Accepting Task...")
         self.btn_accept_task.Update()
@@ -1694,7 +1692,6 @@ class WalletApp(wx.Frame):
         self.btn_accept_task.SetLabel("Accept Task")
         self.btn_accept_task.Update()
 
-    @PerformanceMonitor.measure('on_refuse_task')
     def on_refuse_task(self, event):
         self.btn_refuse_task.SetLabel("Refusing Task...")
         self.btn_refuse_task.Update()
@@ -1727,7 +1724,6 @@ class WalletApp(wx.Frame):
         self.btn_refuse_task.SetLabel("Refuse Task")
         self.btn_refuse_task.Update()
 
-    @PerformanceMonitor.measure('on_submit_for_verification')
     def on_submit_for_verification(self, event):
         self.btn_submit_for_verification.SetLabel("Submitting for Verification...")
         self.btn_submit_for_verification.Update()
@@ -1767,7 +1763,6 @@ class WalletApp(wx.Frame):
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
         self.btn_submit_for_verification.Update()
 
-    @PerformanceMonitor.measure('on_submit_verification_details')
     def on_submit_verification_details(self, event):
         self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
         self.btn_submit_verification_details.Update()
@@ -1845,7 +1840,6 @@ class WalletApp(wx.Frame):
         self.btn_force_update.SetLabel("Force Update")
         self.btn_force_update.Update()
 
-    @PerformanceMonitor.measure('on_log_pomodoro')
     def on_log_pomodoro(self, event):
         self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
         self.btn_log_pomodoro.Update()
@@ -1864,7 +1858,6 @@ class WalletApp(wx.Frame):
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
         self.btn_log_pomodoro.Update()
 
-    @PerformanceMonitor.measure('on_submit_memo')
     def on_submit_memo(self, event):
         """Submits a memo to the remembrancer."""
         self.btn_submit_memo.SetLabel("Submitting...")
@@ -1924,7 +1917,6 @@ class WalletApp(wx.Frame):
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.txt_memo_input.SetValue("")
 
-    @PerformanceMonitor.measure('on_submit_xrp_payment')
     def on_submit_xrp_payment(self, event):
         self.btn_submit_xrp_payment.SetLabel("Submitting...")
         self.btn_submit_xrp_payment.Update()
@@ -1949,7 +1941,6 @@ class WalletApp(wx.Frame):
         self.btn_submit_xrp_payment.SetLabel("Submit Payment")
         self.btn_submit_xrp_payment.Update()
 
-    @PerformanceMonitor.measure('on_submit_pft_payment')
     def on_submit_pft_payment(self, event):
         self.btn_submit_pft_payment.SetLabel("Submitting...")
         self.btn_submit_pft_payment.Update()

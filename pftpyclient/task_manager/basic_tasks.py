@@ -37,6 +37,7 @@ from pftpyclient.task_manager.wallet_state import (
     GOOGLE_DOC_SENT_STATES,
     PFT_STATES
 )
+from pftpyclient.performance.monitor import PerformanceMonitor
 
 nest_asyncio.apply()
 
@@ -77,6 +78,7 @@ class WalletInitiationFunctions:
         return get_google_doc_text(share_link)
 
     @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('send_initiation_rite')
     def send_initiation_rite(self):
         memo = construct_initiation_rite_memo(user=self.username, commitment=self.user_commitment)
         return send_xrp(network_url=self.network_url,
@@ -473,6 +475,7 @@ class PostFiatTaskManager:
         output = output.replace(' ',"_")
         return output
     
+    @PerformanceMonitor.measure('send_xrp')
     def send_xrp(self, amount, destination, memo=""):
         return send_xrp(self.network_url, self.user_wallet, amount, destination, memo)
 
@@ -500,6 +503,7 @@ class PostFiatTaskManager:
     def handle_trust_line(self):
         handle_trust_line(self.network_url, self.pft_issuer, self.user_wallet)
 
+    @PerformanceMonitor.measure('send_pft')
     def send_pft(self, amount, destination, memo=""):
         """ Sends PFT tokens to a destination address with optional memo. 
         If the memo is over 1 KB, it is split into multiple memos and response will be a list of responses"""
@@ -569,6 +573,7 @@ class PostFiatTaskManager:
 
         return response
     
+    @PerformanceMonitor.measure('send_memo')
     def send_memo(self, destination, memo: str, compress=True):
         """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE"""
 
@@ -983,6 +988,7 @@ class PostFiatTaskManager:
         logger.debug("Google Doc context link sent.")
 
     @requires_wallet_state(WalletState.ACTIVE)
+    @PerformanceMonitor.measure('get_proposals_df')
     def get_proposals_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
@@ -1029,6 +1035,7 @@ class PostFiatTaskManager:
         return result_df
     
     @requires_wallet_state(WalletState.ACTIVE)
+    @PerformanceMonitor.measure('get_verification_df')
     def get_verification_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
@@ -1063,6 +1070,7 @@ class PostFiatTaskManager:
         return result_df
     
     @requires_wallet_state(WalletState.ACTIVE)
+    @PerformanceMonitor.measure('get_rewards_df')
     def get_rewards_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
 
@@ -1110,6 +1118,7 @@ class PostFiatTaskManager:
         return result_df
     
     @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('get_memos_df')
     def get_memos_df(self):
 
         def remove_chunks(text):
@@ -1149,6 +1158,7 @@ class PostFiatTaskManager:
         
         return memos
 
+    @PerformanceMonitor.measure('send_acceptance_for_task_id')
     def send_acceptance_for_task_id(self, task_id, acceptance_string):
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
@@ -1167,6 +1177,7 @@ class PostFiatTaskManager:
         logger.debug(f"send_acceptance_for_task_id response: {response}")
         return response
 
+    @PerformanceMonitor.measure('send_refusal_for_task')
     def send_refusal_for_task(self, task_id, refusal_reason):
         # TODO - rewrite this to use the get_task and get_task_state methods
         """ 
@@ -1203,6 +1214,7 @@ class PostFiatTaskManager:
         logger.debug(f"send_refusal_for_task response: {response}")
         return response
 
+    @PerformanceMonitor.measure('request_post_fiat')
     def request_post_fiat(self, request_message ):
         """ 
         This requests a task known as a Post Fiat from the default node you are on
@@ -1232,6 +1244,7 @@ class PostFiatTaskManager:
         logger.debug(f"request_post_fiat response: {response}")
         return response
 
+    @PerformanceMonitor.measure('submit_initial_completion')
     def submit_initial_completion(self, completion_string, task_id):
         """
         This function sends an initial completion for a given task back to a node.
@@ -1260,6 +1273,7 @@ class PostFiatTaskManager:
         logger.debug(f"submit_initial_completion Response: {response}")
         return response
         
+    @PerformanceMonitor.measure('send_verification_response')
     def send_verification_response(self, response_string, task_id):
         """
         This function sends a verification response for a given task back to a node.
@@ -1304,6 +1318,7 @@ class PostFiatTaskManager:
         return 0.0
 
     @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('process_account_info')
     def process_account_info(self):
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
@@ -1395,6 +1410,7 @@ class PostFiatTaskManager:
         output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
         return output_string
 
+    @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
         pomodoro_id = task_id.replace('__','==')
         memo_to_send = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username,
