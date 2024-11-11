@@ -258,15 +258,19 @@ class PostFiatTaskManager:
         except Exception as e:
             logger.error(f"Unexpected error saving {description} to {filepath}: {e}")
 
+    @PerformanceMonitor.measure('save_transactions_to_csv')
     def save_transactions_to_csv(self):
         self.save_dataframe_to_csv(self.transactions, self.tx_history_csv_filepath, "transactions")
 
+    @PerformanceMonitor.measure('save_memos_to_csv')
     def save_memos_to_csv(self):
         self.save_dataframe_to_csv(self.memos, self.memos_csv_filepath, "memos")
 
+    @PerformanceMonitor.measure('save_tasks_to_csv')
     def save_tasks_to_csv(self):
         self.save_dataframe_to_csv(self.tasks, self.tasks_csv_filepath, "tasks")
 
+    @PerformanceMonitor.measure('load_transactions_from_csv')
     def load_transactions_from_csv(self):
         """ Loads the transactions from the CSV file into a dataframe, and deserializes some columns"""
         tx_df = None
@@ -297,6 +301,7 @@ class PostFiatTaskManager:
         logger.warning(f"No existing transaction history file found at {self.tx_history_csv_filepath}")
         return pd.DataFrame() # empty dataframe if file does not exist
     
+    @PerformanceMonitor.measure('get_new_transactions')
     def get_new_transactions(self, last_known_ledger_index):
         """Retrieves new transactions from the node after the last known transaction date"""
         logger.debug(f"Getting new transactions after ledger index {last_known_ledger_index}")
@@ -307,7 +312,8 @@ class PostFiatTaskManager:
             limit=1000  # adjust as needed
         )
 
-    def sync_transactions(self):
+    @PerformanceMonitor.measure('sync_transactions')
+    def sync_transactions(self) -> bool:
         """ Checks for new transactions and caches them locally. Also triggers memo update"""
         logger.debug("Updating transactions")
 
@@ -352,9 +358,12 @@ class PostFiatTaskManager:
             self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
             self.save_transactions_to_csv()
             self.sync_memos(new_tx_df)
+            return True
         else:
             logger.debug("No new transactions found. Finished updating local tx history")
+            return False
 
+    @PerformanceMonitor.measure('sync_memos')
     def sync_memos(self, new_tx_df):
         """ Updates the memos dataframe with new memos from the new transactions. Memos are serialized into dicts"""
         # flag rows with memos
@@ -398,6 +407,7 @@ class PostFiatTaskManager:
 
         self.sync_tasks(new_memo_df)
 
+    @PerformanceMonitor.measure('sync_tasks')
     def sync_tasks(self, new_memo_df):
         """ Updates the tasks dataframe with new tasks from the new memos.
         Task dataframe contains columns: user,task_id,full_output,hash,node_account,datetime,task_type"""

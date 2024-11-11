@@ -38,7 +38,7 @@ from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
 import pandas as pd
-
+import inspect
 # Configure the logger at module level
 wx_sink = configure_logger(
     log_to_file=True,
@@ -912,7 +912,8 @@ class WalletApp(wx.Frame):
                 wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
             except Exception as e:
                 logger.error(f"{e}")
-                # TODO: This isn't needed, since we don't check Google Docs anymore
+                # TODO: This check was inserted for instances when Google Docs were still being checked and were invalid
+                # TODO: Since google docs were removed, this check is probably no longer needed
                 if wx.YES == wx.MessageBox(f"{e}. \n\nContinue caching anyway?", 'Error', wx.YES_NO | wx.ICON_ERROR):
                     try:
                         logger.debug("Attempting to cache credentials despite error")
@@ -961,6 +962,7 @@ class WalletApp(wx.Frame):
         self.login_panel.Hide()
         self.tabs.Show()
 
+        # TODO: rename method to better reflect its function
         self.populate_summary_tab(username, classic_address)
 
         # Update layout and ensure correct sizing
@@ -968,27 +970,14 @@ class WalletApp(wx.Frame):
         self.Layout()
         self.Fit()
 
-        # Fetch and display key account details
-        try:
-            key_account_details = self.task_manager.process_account_info()
-        except Exception as e:
-            logger.error(f"Error processing account info: {e}")
-        else:
-            if key_account_details:
-                self.populate_summary_grid(key_account_details)
-
-            self.summary_tab.Layout()  # Update the layout
-
         self.worker = XRPLMonitorThread(self)
         self.worker.start()
 
-        # Immediately populate the grid with current data
-        self.update_data(None)
+        # Populate grids with data.
+        # No need to call sync_and_refresh here, since sync_transactions was called by the task manager's instantiation
+        self.refresh_grids(None)  # None is a placeholder for no specific event
 
         # Start timers
-        # TODO: start_json_update_timer and start_force_update_timer might be doing the same thing
-        self.start_json_update_timer()
-        self.start_force_update_timer()
         self.start_pft_update_timer()
         self.start_transaction_update_timer()
 
@@ -1075,6 +1064,7 @@ class WalletApp(wx.Frame):
         self.error_label.SetLabel("")
         event.Skip()
 
+    # TODO: rename method to better reflect its function
     def populate_summary_tab(self, username, classic_address):
         # Clear existing content
         self.summary_sizer.Clear(True)
@@ -1373,18 +1363,6 @@ class WalletApp(wx.Frame):
 
         self.Destroy()
 
-    # TODO: start_json_update_timer and start_force_update_timer might be doing the same thing
-
-    def start_json_update_timer(self):
-        self.json_update_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.update_data, self.json_update_timer)
-        self.json_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000) 
-
-    def start_force_update_timer(self):
-        self.force_update_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.on_force_update, self.force_update_timer)
-        self.force_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
-
     def start_pft_update_timer(self):
         self.pft_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
@@ -1395,36 +1373,84 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
         self.tx_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
 
-    @PerformanceMonitor.measure('on_transaction_update_timer')
-    def on_transaction_update_timer(self, _):
-        logger.debug("Transaction update timer triggered")
-        self.task_manager.sync_transactions()
-
-    @PerformanceMonitor.measure('update_data')
-    def update_data(self, event):
+    def _sync_and_refresh(self):
+        """Internal method to sync transactions and refresh grids"""
         try:
-            # Get proposals tab data
-            proposals_df = self.task_manager.get_proposals_df()
-            wx.PostEvent(self, UpdateGridEvent(data=proposals_df, target="proposals"))
-
-            # Get Rewards tab data
-            rewards_df = self.task_manager.get_rewards_df()
-            wx.PostEvent(self, UpdateGridEvent(data=rewards_df, target="rewards"))
-
-            # Get Verification tab data
-            verification_df = self.task_manager.get_verification_df()
-            wx.PostEvent(self, UpdateGridEvent(data=verification_df, target="verification"))
-
-            # Get Memos tab data
-            memos_df = self.task_manager.get_memos_df()
-            wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos"))
-
+            if self.task_manager.sync_transactions():
+                logger.debug("New transactions found, updating grids")
+                self.refresh_grids()
+            else:
+                logger.debug("No new transactions found, skipping grid updates.")
         except Exception as e:
-            logger.exception(f"Error updating data: {e}")
+            logger.error(f"Error during sync and refresh cycle: {e}")
+            raise
+
+    def on_transaction_update_timer(self, _):
+        """Timer-triggered update"""
+        logger.debug("Transaction update timer triggered")
+        try:
+            self._sync_and_refresh()
+        except Exception as e:
+            logger.error(f"Timer update failed: {e}")
+    
+    def on_force_update(self, _):
+        """Handle manual force update requests"""
+        logger.info("Manual force update triggered")
+        self.btn_force_update.SetLabel("Updating...")
+        self.btn_force_update.Update()
+
+        try:
+            self._sync_and_refresh()
+        except Exception as e:
+            logger.error(f"Force update failed: {e}")
+            wx.MessageBox(
+                "Failed to update wallet data. Please check the console log for more details.",
+                "Force Update Error",
+                wx.OK | wx.ICON_ERROR
+            )
+        finally:
+            self.btn_force_update.SetLabel("Force Update")
+            self.btn_force_update.Update()
+
+    @PerformanceMonitor.measure('refresh_grids')
+    def refresh_grids(self, event):
+        """Update all grids based on wallet state with proper error handling"""
+        logger.debug("Starting grid refresh")
+        current_state = self.task_manager.wallet_state
+
+        # Summary grid (available in FUNDED_STATES)
+        if current_state in FUNDED_STATES:
+            try: 
+                key_account_details = self.task_manager.process_account_info()
+                wx.PostEvent(self, UpdateGridEvent(data=key_account_details, target="summary", caller=f"{self.__class__.__name__}.refresh_grids"))
+            except Exception as e:
+                logger.error(f"Failed updating summary grid: {e}")
+
+        # Memos grid (available in TRUSTLINED_STATES)
+        if current_state in TRUSTLINED_STATES:
+            try:
+                memos_df = self.task_manager.get_memos_df()
+                wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos", caller=f"{self.__class__.__name__}.refresh_grids"))
+            except Exception as e:
+                logger.error(f"Failed updating memos grid: {e}")
+
+        # Proposals, Rewards, and Verification grids (available in PFT_STATES)
+        if current_state in PFT_STATES:
+            for grid_type, getter_method in [
+                ("proposals", self.task_manager.get_proposals_df),
+                ("rewards", self.task_manager.get_rewards_df),
+                ("verification", self.task_manager.get_verification_df)
+            ]:
+                try:
+                    data = getter_method()
+                    wx.PostEvent(self, UpdateGridEvent(data=data, target=grid_type, caller=f"{self.__class__.__name__}.refresh_grids"))
+                except Exception as e:
+                    logger.error(f"Failed updating {grid_type} grid: {e}")
 
     @PerformanceMonitor.measure('update_grid')
     def update_grid(self, event):
-        logger.debug(f"Updating grid with target: {getattr(event, 'target')}")
+        caller = getattr(event, 'caller', 'Unknown')
+        logger.debug(f"Grid update triggered by {caller} for target: {getattr(event, 'target', 'Unknown')}")
         if not hasattr(event, 'target'):
             logger.error(f"No target found in event: {event}")
             return
@@ -1473,6 +1499,12 @@ class WalletApp(wx.Frame):
     @PerformanceMonitor.measure('populate_grid_generic')
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
         """Generic grid population method that respects zoom settings"""
+        # frame = inspect.currentframe()
+        # caller_frame = frame.f_back
+        # while caller_frame.f_code.co_name == "wrapper":
+        #     caller_frame = caller_frame.f_back
+        # caller = caller_frame.f_code.co_name
+        # logger.debug(f"populate_grid_generic called from {caller} for grid {grid_name}", stack_info=True)
 
         if data.empty:
             logger.debug(f"No data to populate {grid_name} grid")
@@ -1650,7 +1682,7 @@ class WalletApp(wx.Frame):
                     wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
             except Exception as e:
                 logger.error(f"Error converting response to status message: {e}")
-            wx.CallLater(30000, self.update_data, None)
+            wx.CallLater(30000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_request_task.SetLabel("Request Task")
@@ -1686,7 +1718,7 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(message, 'Task Acceptance Result', wx.OK | wx.ICON_INFORMATION)
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.update_data, None)
+                wx.CallLater(5000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -1718,7 +1750,7 @@ class WalletApp(wx.Frame):
                         logger.error("No response from send_refusal_for_task")
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.update_data, None)
+                wx.CallLater(5000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_refuse_task.SetLabel("Refuse Task")
@@ -1756,7 +1788,7 @@ class WalletApp(wx.Frame):
                         logger.error("No response from submit_initial_completion")
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.update_data, None)
+                wx.CallLater(5000, self.refresh_grids, None)
             
         dialog.Destroy()
 
@@ -1794,51 +1826,6 @@ class WalletApp(wx.Frame):
         self.txt_verification_details.SetValue("")
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
-
-    @PerformanceMonitor.measure('on_force_update')
-    def on_force_update(self, event):
-        self.btn_force_update.SetLabel("Updating...")
-        self.btn_force_update.Update()
-
-        logger.info("Kicking off Force Update")
-
-        current_state = self.task_manager.wallet_state
-
-        if current_state in FUNDED_STATES:
-            try:
-                key_account_details = self.task_manager.process_account_info()
-                self.populate_summary_grid(key_account_details)
-            except Exception as e:
-                logger.error(f"FAILED UPDATING SUMMARY DATA: {e}")
-
-        if current_state in PFT_STATES:
-            try:
-                proposals_df = self.task_manager.get_proposals_df()
-                self.populate_grid_generic(self.proposals_grid, proposals_df, 'proposals')
-            except Exception as e:
-                logger.error(f"FAILED UPDATING PROPOSALS DATA: {e}")
-
-            try:
-                verification_data = self.task_manager.get_verification_df()
-                self.populate_grid_generic(self.verification_grid, verification_data, 'verification')
-            except Exception as e:
-                logger.error(f"FAILED UPDATING VERIFICATION DATA: {e}")
-
-            try:
-                rewards_data = self.task_manager.get_rewards_df()
-                self.populate_grid_generic(self.rewards_grid, rewards_data, 'rewards')
-            except Exception as e:
-                logger.error(f"FAILED UPDATING REWARDS DATA: {e}")
-
-        if current_state in TRUSTLINED_STATES:
-            try:
-                memos_data = self.task_manager.get_memos_df()
-                self.populate_grid_generic(self.memos_grid, memos_data, 'memos')
-            except Exception as e:
-                logger.error(f"FAILED UPDATING MEMOS DATA: {e}")
-
-        self.btn_force_update.SetLabel("Force Update")
-        self.btn_force_update.Update()
 
     def on_log_pomodoro(self, event):
         self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
