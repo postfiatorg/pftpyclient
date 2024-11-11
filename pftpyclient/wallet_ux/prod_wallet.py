@@ -609,10 +609,10 @@ class WalletApp(wx.Frame):
         self.payments_sizer.Add(self.btn_submit_pft_payment, flag=wx.ALL, border=5)
         self.btn_submit_pft_payment.Bind(wx.EVT_BUTTON, self.on_submit_pft_payment)
 
-        # Add "Show Secret" button
-        self.btn_show_secret = wx.Button(self.payments_tab, label="Show Secret")
-        self.payments_sizer.Add(self.btn_show_secret, flag=wx.ALL, border=5)
-        self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
+        # # Add "Show Secret" button
+        # self.btn_show_secret = wx.Button(self.payments_tab, label="Show Secret")
+        # self.payments_sizer.Add(self.btn_show_secret, flag=wx.ALL, border=5)
+        # self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
 
         self.panel.SetSizer(self.sizer)
 
@@ -838,12 +838,19 @@ class WalletApp(wx.Frame):
         # self.txt_google_doc.SetToolTip(self.tooltip_google_doc)
 
         # Buttons
+        wallet_buttons_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_generate_wallet = wx.Button(panel, label="Generate New XRP Wallet")
-        user_details_sizer.Add(self.btn_generate_wallet, flag=wx.ALL, border=5)
+        wallet_buttons_sizer.Add(self.btn_generate_wallet, 1, flag=wx.EXPAND | wx.RIGHT, border=5)
         self.btn_generate_wallet.Bind(wx.EVT_BUTTON, self.on_generate_wallet)
 
+        self.btn_restore_wallet = wx.Button(panel, label="Restore from Seed")
+        wallet_buttons_sizer.Add(self.btn_restore_wallet, 1, flag=wx.EXPAND | wx.LEFT, border=5)
+        self.btn_restore_wallet.Bind(wx.EVT_BUTTON, self.on_restore_wallet)
+
+        user_details_sizer.Add(wallet_buttons_sizer, flag=wx.EXPAND | wx.ALL, border=5)
+
         self.btn_existing_user = wx.Button(panel, label="Cache Credentials")
-        user_details_sizer.Add(self.btn_existing_user, flag=wx.ALL, border=5)
+        user_details_sizer.Add(self.btn_existing_user, flag=wx.EXPAND, border=15)
         self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
 
         sizer.Add(user_details_sizer, 1, wx.EXPAND | wx.ALL, 10)
@@ -886,6 +893,27 @@ class WalletApp(wx.Frame):
         self.wallet = Wallet.create()
         self.txt_xrp_address.SetValue(self.wallet.classic_address)
         self.txt_xrp_secret.SetValue(self.wallet.seed)
+
+    def on_restore_wallet(self, event):
+        """Restore wallet from existing seed"""
+        dialog = CustomDialog("Restore Wallet", ["XRP Secret"])
+        if dialog.ShowModal() == wx.ID_OK:
+            seed = dialog.GetValues()["XRP Secret"]
+            try:
+                # Attempt to create wallet from seed
+                wallet = Wallet.from_seed(seed)
+
+                # Update the UI with the restored wallet details
+                self.txt_xrp_address.SetValue(wallet.classic_address)
+                self.txt_xrp_secret.SetValue(wallet.seed)
+
+                wx.MessageBox("Wallet restored successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
+
+            except Exception as e:
+                logger.error(f"Error restoring wallet: {e}")
+                wx.MessageBox("Invalid seed format. Please check your seed and try again.", "Error", wx.OK | wx.ICON_ERROR)
+
+        dialog.Destroy()
 
     def on_cache_user(self, event):
         #TODO: Phase out this method in favor of automatic caching on genesis
@@ -975,7 +1003,7 @@ class WalletApp(wx.Frame):
 
         # Populate grids with data.
         # No need to call sync_and_refresh here, since sync_transactions was called by the task manager's instantiation
-        self.refresh_grids(None)  # None is a placeholder for no specific event
+        self.refresh_grids()
 
         # Start timers
         self.start_pft_update_timer()
@@ -1090,7 +1118,14 @@ class WalletApp(wx.Frame):
         pft_balance_row_sizer.Add(self.btn_wallet_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         self.summary_sizer.Add(pft_balance_row_sizer, 0, wx.EXPAND)
 
-        self.summary_sizer.Add(self.lbl_address, flag=wx.ALL, border=5)
+        # Create a horizontal sizer for the address and show secret button
+        address_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        address_row_sizer.Add(self.lbl_address, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        address_row_sizer.AddStretchSpacer()
+        self.btn_show_secret = wx.Button(self.summary_tab, label="Show Secret")
+        self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
+        address_row_sizer.Add(self.btn_show_secret, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_sizer.Add(address_row_sizer, 0, wx.EXPAND)
 
         # Create a heading for Key Account Details
         lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
@@ -1413,7 +1448,7 @@ class WalletApp(wx.Frame):
             self.btn_force_update.Update()
 
     @PerformanceMonitor.measure('refresh_grids')
-    def refresh_grids(self, event):
+    def refresh_grids(self, event=None):
         """Update all grids based on wallet state with proper error handling"""
         logger.debug("Starting grid refresh")
         current_state = self.task_manager.wallet_state
@@ -1961,12 +1996,33 @@ class WalletApp(wx.Frame):
         self.btn_submit_pft_payment.Update()
 
     def on_show_secret(self, event):
-        self.btn_show_secret.SetLabel("Showing Secret...")
+        self.btn_show_secret.SetLabel("Showing...")
         self.btn_show_secret.Update()
 
-        classic_address = self.wallet.classic_address
-        secret = self.wallet.seed
-        wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
+        dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your seed.")
+
+        if dialog.ShowModal() == wx.ID_OK:
+            password = dialog.GetValue()
+            dialog.Destroy()
+
+            try: 
+                if self.task_manager.verify_password(password):
+                    seed = self.wallet.seed
+                    message = (
+                        "WARNING: NEVER share this with anyone!\n\n"
+                        f"Secret: {seed}"
+                    )
+                    seed_dialog = SelectableMessageDialog(self, "Wallet Secret", message)
+                    seed_dialog.ShowModal()
+                    seed_dialog.Destroy()
+                else:
+                    wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
+            except Exception as e:
+                logger.error(f"Error showing secret: {e}")
+                wx.MessageBox(f"Error showing secret: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        
+        else:
+            dialog.Destroy()
 
         self.btn_show_secret.SetLabel("Show Secret")
         self.btn_show_secret.Update()

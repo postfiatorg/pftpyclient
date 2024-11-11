@@ -1434,6 +1434,24 @@ class PostFiatTaskManager:
         pomodoros_only['parent_task_id']=pomodoros_only['memo_data'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
     
+    def verify_password(self, password):
+        """
+        Verify if the provided password is correct by attempting to decrypt credentials
+
+        Args: 
+            password (str): The password to verify
+
+        Returns:
+            bool: True if the password is correct, False otherwise
+        """
+        try: 
+            # Attempt to decrypt credentials with provided password
+            self.credential_manager.decrypt_creds(password)
+            return True
+        except Exception as e:
+            logger.error(f"Password verification failed: {e}")
+            return False
+    
 def is_over_1kb(string):
     # 1KB = 1024 bytes
     return len(string.encode('utf-8')) > 1024
