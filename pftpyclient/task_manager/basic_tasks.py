@@ -38,13 +38,13 @@ from pftpyclient.task_manager.wallet_state import (
     PFT_STATES
 )
 from pftpyclient.performance.monitor import PerformanceMonitor
-
+from pftpyclient.configuration.configuration import ConfigurationManager
 nest_asyncio.apply()
 
 MAX_CHUNK_SIZE = 760
 
-SAVE_MEMOS_TO_CSV = True
-SAVE_TASKS_TO_CSV = True
+SAVE_MEMOS = False
+SAVE_TASKS = False
 
 AUTO_INITIALIZE = False
 
@@ -129,7 +129,7 @@ class WalletInitiationFunctions:
 
 class PostFiatTaskManager:
     
-    def __init__(self, username, password, network_url):
+    def __init__(self, username, password, network_url, config: ConfigurationManager):
         self.credential_manager=CredentialManager(username,password)
         self.pw_map = self.credential_manager.decrypt_creds(self.credential_manager.pw_initiator)
         self.network_url= network_url
@@ -140,10 +140,14 @@ class PostFiatTaskManager:
         self.user_wallet = self.spawn_user_wallet()
         self.google_doc_link = self.pw_map.get(self.credential_manager.google_doc_name, None)
 
+        self.config = config
+
+        file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
+
         # initialize dataframes
-        self.tx_history_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.csv")
-        self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")  # only used for debugging
-        self.tasks_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.csv")  # only used for debugging
+        self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.{file_extension}")
+        self.memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.{file_extension}")  # only used for debugging
+        self.tasks_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.{file_extension}")  # only used for debugging
         self.transactions = pd.DataFrame()
         self.memos = pd.DataFrame()
         self.tasks = pd.DataFrame()
@@ -232,23 +236,36 @@ class PostFiatTaskManager:
                         destination=self.default_node, 
                         memo=memo)
 
-    def save_dataframe_to_csv(self, df, filepath, description):
+    def save_dataframe(self, df, filepath, description):
         """
-        Generic method to save a dataframe to a CSV file with error handling and logging
+        Generic method to save a dataframe with error handling and logging
         
         :param dataframe: pandas Dataframe to save
-        :param filepath: str, path to the CSV file
+        :param filepath: str, path to the file (will adjust extension based on format)
         :param description: str, description of the data being saved (i.e. "transactions" or "memos")
         """
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-            # save to a temporary file first, and then replace the existing file if successful
-            temp_filepath = f"{filepath}.tmp"
-            df.to_csv(temp_filepath, index=False)
-            os.replace(temp_filepath, filepath)
+            # Get base path without extension
+            base_path = os.path.splitext(filepath)[0]
 
-            logger.info(f"Successfully saved {description} to {filepath}")
+            # Determine format from preferences
+            format_type = self.config.get_global_config('transaction_cache_format')
+
+            if format_type == 'pickle':
+                final_path = f"{base_path}.pkl"
+                temp_path = f"{final_path}.tmp"
+                df.to_pickle(temp_path)
+            else:
+                final_path = f"{base_path}.csv"
+                temp_path = f"{final_path}.tmp"
+                df.to_csv(temp_path, index=False)
+
+            # Rplace existing file if save was successful
+            os.replace(temp_path, final_path)
+            logger.info(f"Successfully saved {description} to {final_path}")
+
         except PermissionError:
             logger.error(f"Permission denied when trying to save {description} to {filepath}")
         except IOError as e:
@@ -258,32 +275,43 @@ class PostFiatTaskManager:
         except Exception as e:
             logger.error(f"Unexpected error saving {description} to {filepath}: {e}")
 
-    @PerformanceMonitor.measure('save_transactions_to_csv')
-    def save_transactions_to_csv(self):
-        self.save_dataframe_to_csv(self.transactions, self.tx_history_csv_filepath, "transactions")
+    @PerformanceMonitor.measure('save_transactions')
+    def save_transactions(self):
+        self.save_dataframe(self.transactions, self.tx_history_filepath, "transactions")
 
-    @PerformanceMonitor.measure('save_memos_to_csv')
-    def save_memos_to_csv(self):
-        self.save_dataframe_to_csv(self.memos, self.memos_csv_filepath, "memos")
+    @PerformanceMonitor.measure('save_memos')
+    def save_memos(self):
+        self.save_dataframe(self.memos, self.memos_filepath, "memos")
 
-    @PerformanceMonitor.measure('save_tasks_to_csv')
-    def save_tasks_to_csv(self):
-        self.save_dataframe_to_csv(self.tasks, self.tasks_csv_filepath, "tasks")
+    @PerformanceMonitor.measure('save_tasks')
+    def save_tasks(self):
+        self.save_dataframe(self.tasks, self.tasks_filepath, "tasks")
 
-    @PerformanceMonitor.measure('load_transactions_from_csv')
-    def load_transactions_from_csv(self):
-        """ Loads the transactions from the CSV file into a dataframe, and deserializes some columns"""
+    @PerformanceMonitor.measure('load_transactions')
+    def load_transactions(self):
+        """ Loads the transactions from file into a dataframe, and deserializes some columns"""
         tx_df = None
-        file_path = self.tx_history_csv_filepath
+        base_path = os.path.splitext(self.tx_history_filepath)[0]
+        format_type = self.config.get_global_config('transaction_cache_format')
+        
+        # Determine which file to try loading
+        if format_type == 'pickle':
+            file_path = f"{base_path}.pkl"
+        else:
+            file_path = f"{base_path}.csv"
+
         if os.path.exists(file_path):
             logger.debug(f"Loading transactions from {file_path}")
             try:
-                tx_df = pd.read_csv(file_path)
+                if format_type == 'pickle':
+                    tx_df = pd.read_pickle(file_path)
+                else:
+                    tx_df = pd.read_csv(file_path)
 
-                # deserialize columns
-                for col in ['meta', 'tx_json']:
-                    if col in tx_df.columns:
-                        tx_df[col] = tx_df[col].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else x)
+                    # deserialize columns for CSV
+                    for col in ['meta', 'tx_json']:
+                        if col in tx_df.columns:
+                            tx_df[col] = tx_df[col].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else x)
 
             except pd.errors.EmptyDataError:
                 logger.warning(f"The file {file_path} is empty. Creating a new DataFrame.")
@@ -298,7 +326,7 @@ class PostFiatTaskManager:
             else:
                 return tx_df
 
-        logger.warning(f"No existing transaction history file found at {self.tx_history_csv_filepath}")
+        logger.warning(f"No existing transaction history file found at {self.tx_history_filepath}")
         return pd.DataFrame() # empty dataframe if file does not exist
     
     @PerformanceMonitor.measure('get_new_transactions')
@@ -334,11 +362,10 @@ class PostFiatTaskManager:
 
         # Attempt to load transactions from local csv
         if self.transactions.empty: 
-            loaded_tx_df = self.load_transactions_from_csv()
+            loaded_tx_df = self.load_transactions()
             if not loaded_tx_df.empty:
-                logger.debug(f"Loaded {len(loaded_tx_df)} transactions from csv file")
+                logger.debug(f"Loaded {len(loaded_tx_df)} transactions from {self.tx_history_filepath}")
                 self.transactions = loaded_tx_df
-                self.save_transactions_to_csv()
                 self.sync_memos(loaded_tx_df)
 
         # Choose ledger index to start sync from
@@ -356,7 +383,7 @@ class PostFiatTaskManager:
             logger.debug(f"Adding {len(new_tx_list)} new transactions...")
             new_tx_df = pd.DataFrame(new_tx_list)
             self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
-            self.save_transactions_to_csv()
+            self.save_transactions()
             self.sync_memos(new_tx_df)
             return True
         else:
@@ -402,8 +429,8 @@ class PostFiatTaskManager:
         logger.debug(f"Added {len(new_memo_df)} memos to local memos dataframe")
 
         # for debugging purposes only
-        if SAVE_MEMOS_TO_CSV:
-            self.save_memos_to_csv()
+        if SAVE_MEMOS:
+            self.save_memos()
 
         self.sync_tasks(new_memo_df)
 
@@ -434,8 +461,8 @@ class PostFiatTaskManager:
             self.tasks = pd.concat([self.tasks, new_task_df], ignore_index=True).drop_duplicates(subset=['hash'])
 
             # for debugging purposes only
-            if SAVE_TASKS_TO_CSV:
-                self.save_tasks_to_csv()
+            if SAVE_TASKS:
+                self.save_tasks()
         else:
             logger.debug("No new tasks to sync")
 

@@ -34,6 +34,7 @@ import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from pftpyclient.performance.monitor import PerformanceMonitor
+from pftpyclient.configuration.configuration import ConfigurationManager
 from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
@@ -381,6 +382,11 @@ class WalletApp(wx.Frame):
 
         self.perf_monitor = None
 
+        self.config = ConfigurationManager()
+        
+        if self.config.get_global_config('performance_monitor'):
+            self.launch_perf_monitor()
+
         self.create_menu_bar()
 
         self.tab_pages = {}  # Store references to tab pages
@@ -418,8 +424,10 @@ class WalletApp(wx.Frame):
 
         # File menu
         file_menu = wx.Menu()
+        preferences_item = file_menu.Append(wx.ID_ANY, "Preferences", "Configure client settings")
         logout_item = file_menu.Append(wx.ID_ANY, "Logout", "Return to login screen")
         quit_item = file_menu.Append(wx.ID_EXIT, "Quit", "Quit the application")
+        self.Bind(wx.EVT_MENU, self.on_preferences, preferences_item)
         self.Bind(wx.EVT_MENU, self.on_logout, logout_item)
         self.Bind(wx.EVT_MENU, self.on_close, quit_item)
         self.menubar.Append(file_menu, "File")
@@ -828,15 +836,19 @@ class WalletApp(wx.Frame):
     def populate_username_dropdown(self):
         """Populates the username dropdown with cached usernames"""
         try:
-            current_value = self.login_txt_username.GetValue()
             cached_usernames = get_cached_usernames()
             self.login_txt_username.Clear()
             self.login_txt_username.AppendItems(cached_usernames)
 
-            if current_value and current_value in cached_usernames:
-                self.login_txt_username.SetValue(current_value)
+            # Get the last logged-in user
+            last_user = self.config.get_global_config('last_logged_in_user')
+
+            if last_user and last_user in cached_usernames:
+                self.login_txt_username.SetValue(last_user)
+                self.login_txt_password.SetFocus()
             elif cached_usernames:
                 self.login_txt_username.SetValue(cached_usernames[0])
+                self.login_txt_password.SetFocus()
         except Exception as e:
             logger.error(f"Error populating username dropdown: {e}")
             self.show_error("Error loading cached usernames")
@@ -1047,7 +1059,8 @@ class WalletApp(wx.Frame):
             self.task_manager = PostFiatTaskManager(
                 username=username, 
                 password=password,
-                network_url=self.network_url
+                network_url=self.network_url,
+                config=self.config
             )
 
         except (ValueError, InvalidToken, KeyError) as e:
@@ -1071,6 +1084,9 @@ class WalletApp(wx.Frame):
         self.update_ui_based_on_wallet_state()
 
         logger.info(f"Logged in as {username}")
+
+        # Save the last logged-in user
+        self.config.set_global_config('last_logged_in_user', username)
 
         # Hide login panel and show tabs
         self.login_panel.Hide()
@@ -1530,8 +1546,7 @@ class WalletApp(wx.Frame):
 
     @PerformanceMonitor.measure('update_grid')
     def update_grid(self, event):
-        caller = getattr(event, 'caller', 'Unknown')
-        logger.debug(f"Grid update triggered by {caller} for target: {getattr(event, 'target', 'Unknown')}")
+        """Update a specific grid based on the event target and wallet state"""
         if not hasattr(event, 'target'):
             logger.error(f"No target found in event: {event}")
             return
@@ -2208,7 +2223,7 @@ class WalletApp(wx.Frame):
             color.Alpha()
         )
     
-    def launch_perf_monitor(self, event):
+    def launch_perf_monitor(self, event=None):
         """Toggle the performance monitor on and off"""
         if self.perf_monitor is None:
             self.perf_monitor = PerformanceMonitor(
@@ -2225,6 +2240,18 @@ class WalletApp(wx.Frame):
                 PerformanceMonitor._instance = None
         
             Thread(target=monitor_thread, daemon=True).start()
+
+    def on_preferences(self, event):
+        """Handle preferences dialog"""
+        dialog = PreferencesDialog(self)
+        if dialog.ShowModal() == wx.ID_OK:
+            # Check if performance monitor setting changed
+            if self.config.get_global_config('performance_monitor'):
+                self.launch_perf_monitor(None)
+            else:
+                if self.perf_monitor:
+                    self.perf_monitor.shutdown_event.set()
+        dialog.Destroy()
 
     def set_wallet_ui_state(self, state: WalletUIState, message: str = ""):
         """Update the status bar with current wallet state"""
@@ -2394,6 +2421,66 @@ class ChangePasswordDialog(wx.Dialog):
 
         panel.SetSizer(sizer)
         self.Center()
+
+class PreferencesDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Preferences")
+        self.config = parent.config
+        self.InitUI()
+
+    def InitUI(self):
+        panel = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        # Create a static box for grouping preferences
+        sb = wx.StaticBox(panel, label="Application Settings")
+        sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
+
+        # Performance Monitor checkbox
+        self.perf_monitor = wx.CheckBox(panel, label="Enable Performance Monitor")
+        self.perf_monitor.SetValue(self.config.get_global_config('performance_monitor'))
+        sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Cache Format radio buttons
+        cache_box = wx.StaticBox(panel, label="Transaction Cache Format")
+        cache_sbs = wx.StaticBoxSizer(cache_box, wx.VERTICAL)
+
+        self.cache_csv = wx.RadioButton(panel, label="CSV", style=wx.RB_GROUP)
+        self.cache_pickle = wx.RadioButton(panel, label="Pickle")
+
+        current_format = self.config.get_global_config("transaction_cache_format")
+        if current_format == "csv":
+            self.cache_csv.SetValue(True)
+        else:
+            self.cache_pickle.SetValue(True)
+
+        cache_sbs.Add(self.cache_csv, 0, wx.ALL, 5)
+        cache_sbs.Add(self.cache_pickle, 0, wx.ALL, 5)
+        sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Add the static box to the main vertical box
+        vbox.Add(sbs, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Add OK and Cancel buttons
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        ok_button = wx.Button(panel, wx.ID_OK, "OK")
+        cancel_button = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        button_sizer.Add(ok_button, 0, wx.ALL, 5)
+        button_sizer.Add(cancel_button, 0, wx.ALL, 5)
+        vbox.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+
+        # Bind the OK button event
+        ok_button.Bind(wx.EVT_BUTTON, self.on_ok)
+
+        panel.SetSizer(vbox)
+        vbox.Fit(panel)
+        self.Center()
+
+    def on_ok(self, event):
+        """Save config when OK is clicked"""
+        self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
+        self.config.set_global_config('transaction_cache_format', 'csv' if self.cache_csv.GetValue() else 'pickle')
+        self.EndModal(wx.ID_OK)
 
 def main():
     logger.info("Starting Post Fiat Wallet")
