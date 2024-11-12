@@ -3,6 +3,7 @@ import getpass
 from pftpyclient.basic_utilities.settings import *
 from cryptography.fernet import InvalidToken
 from loguru import logger
+import shutil
 
 CREDENTIAL_FILENAME = "manyasone_cred_list.txt"
 
@@ -45,6 +46,58 @@ class CredentialManager:
     def enter_and_encrypt_credential(self, credentials_dict):
         """Encryps and stores multiple credentials"""
         enter_and_encrypt_credential(credentials_dict=credentials_dict, pw_encryptor=self.pw_initiator)
+
+    def change_password(self, current_password, new_password):
+        """Change the encryption password for the current user's credentials"""
+        # Verify current password
+        try:
+            current_creds = self.decrypt_creds(current_password)
+        except InvalidToken:
+            return ValueError("Current password is incorrect")
+        
+        # Create backup
+        backup_path = self.credential_file_path.with_suffix('.txt_backup')
+        shutil.copy2(self.credential_file_path, backup_path)
+
+        try:
+            # Get all existing credentials
+            existing_cred_map = _get_cred_map()
+
+            # Prepare new credentials for current user
+            new_creds = []
+            for key in self.key_variables:
+                if key in current_creds:
+                    credential_byte_str = pwl.password_encrypt(
+                        message=bytes(current_creds[key], 'utf-8'), 
+                        password=new_password
+                    )
+                    new_creds.append(f'\nvariable___{key}\n{credential_byte_str}')
+
+            # Write updated credential file
+            with open(self.credential_file_path, 'w') as f:
+                # Write credentials for other users (unchanged)
+                for key, value in existing_cred_map.items():
+                    if key not in self.key_variables:
+                        f.write(f'\nvariable___{key}\n{value}')
+                # Write new credentials for current user
+                f.write(''.join(new_creds))
+
+            # Update instance password
+            self.pw_initiator = new_password
+
+            # Remove backup file after successful change
+            if backup_path.exists():
+                os.remove(backup_path)
+
+            return True
+        
+        except Exception as e:
+            # Restore from backup if anything fails
+            if backup_path.exists():
+                shutil.copy2(backup_path, self.credential_file_path)
+                os.remove(backup_path)
+            logger.error(f"Error changing password: {e}")
+            raise Exception(f"Error changing password: {e}")
     
 def _read_creds(credential_file_path):
     with open(credential_file_path, 'r') as f:
@@ -157,4 +210,3 @@ def get_cached_usernames():
     except Exception as e:
         logger.error(f"Error reading cached usernames: {e}")
         return []
-

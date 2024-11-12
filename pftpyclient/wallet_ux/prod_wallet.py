@@ -388,21 +388,38 @@ class WalletApp(wx.Frame):
     
     def create_menu_bar(self):
         """Create the menu bar with File and Extras menus"""
-        menubar = wx.MenuBar()
+        self.menubar = wx.MenuBar()
 
         # File menu
         file_menu = wx.Menu()
         quit_item = file_menu.Append(wx.ID_EXIT, "Quit", "Quit the application")
         self.Bind(wx.EVT_MENU, self.on_close, quit_item)
-        menubar.Append(file_menu, "File")
+        self.menubar.Append(file_menu, "File")
+
+        # Create Account menu
+        self.account_menu = wx.Menu()
+        self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
+        self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
+        self.menubar.Append(self.account_menu, "Account")
+
+        # Bind menu events
+        self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
+        self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
 
         # Extras menu
         extras_menu = wx.Menu()
         self.perf_monitor_item = extras_menu.Append(wx.ID_ANY, "Performance Monitor", "Monitor client's performance")
         self.Bind(wx.EVT_MENU, self.launch_perf_monitor, self.perf_monitor_item)
-        menubar.Append(extras_menu, "Extras")
+        self.menubar.Append(extras_menu, "Extras")
 
-        self.SetMenuBar(menubar)
+        self.SetMenuBar(self.menubar)
+
+        # Initially disable Account menu
+        self.menubar.EnableTop(self.menubar.FindMenu("Account"), False)
+
+    def enable_menus(self):
+        """Enable certain menus after successful login"""
+        self.menubar.EnableTop(self.menubar.FindMenu("Account"), True)
 
     def build_ui(self):
         self.panel = wx.Panel(self)
@@ -812,7 +829,7 @@ class WalletApp(wx.Frame):
         self.txt_username.Bind(wx.EVT_TEXT, self.on_force_lowercase)
 
         # Password
-        self.lbl_password = wx.StaticText(panel, label="Password:")
+        self.lbl_password = wx.StaticText(panel, label="Password (minimum 8 characters):")
         user_details_sizer.Add(self.lbl_password, flag=wx.ALL, border=5)
         self.txt_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
         user_details_sizer.Add(self.txt_password, flag=wx.EXPAND | wx.ALL, border=5)
@@ -927,7 +944,11 @@ class WalletApp(wx.Frame):
             'Confirm Password_Input': self.txt_confirm_password.GetValue(),
         }
 
-        if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
+        is_valid, error_message = self.validate_password(input_map['Password_Input'])
+        if not is_valid:
+            logger.error(error_message)
+            wx.MessageBox(error_message, 'Error', wx.OK | wx.ICON_ERROR)
+        elif self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
             logger.error("Passwords Do Not Match! Please Retry.")
             wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
         elif any(not value for value in input_map.values()):
@@ -978,6 +999,8 @@ class WalletApp(wx.Frame):
             self.btn_login.SetLabel("Login")
             self.btn_login.Update()
             return
+        
+        self.enable_menus()
         
         self.wallet = self.task_manager.user_wallet
         classic_address = self.wallet.classic_address
@@ -1118,14 +1141,16 @@ class WalletApp(wx.Frame):
         pft_balance_row_sizer.Add(self.btn_wallet_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         self.summary_sizer.Add(pft_balance_row_sizer, 0, wx.EXPAND)
 
-        # Create a horizontal sizer for the address and show secret button
-        address_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        address_row_sizer.Add(self.lbl_address, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        address_row_sizer.AddStretchSpacer()
-        self.btn_show_secret = wx.Button(self.summary_tab, label="Show Secret")
-        self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
-        address_row_sizer.Add(self.btn_show_secret, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        self.summary_sizer.Add(address_row_sizer, 0, wx.EXPAND)
+        self.summary_sizer.Add(self.lbl_address, 0, flag=wx.ALL, border=5)
+
+        # # Create a horizontal sizer for the address and show secret button
+        # address_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        # address_row_sizer.Add(self.lbl_address, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        # address_row_sizer.AddStretchSpacer()
+        # self.btn_show_secret = wx.Button(self.summary_tab, label="Show Secret")
+        # self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
+        # address_row_sizer.Add(self.btn_show_secret, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        # self.summary_sizer.Add(address_row_sizer, 0, wx.EXPAND)
 
         # Create a heading for Key Account Details
         lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
@@ -1996,10 +2021,7 @@ class WalletApp(wx.Frame):
         self.btn_submit_pft_payment.Update()
 
     def on_show_secret(self, event):
-        self.btn_show_secret.SetLabel("Showing...")
-        self.btn_show_secret.Update()
-
-        dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your seed.")
+        dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your secret.")
 
         if dialog.ShowModal() == wx.ID_OK:
             password = dialog.GetValue()
@@ -2024,8 +2046,64 @@ class WalletApp(wx.Frame):
         else:
             dialog.Destroy()
 
-        self.btn_show_secret.SetLabel("Show Secret")
-        self.btn_show_secret.Update()
+    def validate_password(self, password):
+        """Validate password requirements"""
+        if len(password) < 8:
+            return False, "Password must be at least 8 characters long"
+        return True, ""
+
+    def on_change_password(self, event):
+        """Handle password change request"""
+        dialog = ChangePasswordDialog(self)
+        while True:  # Keep dialog open until success or cancel
+            if dialog.ShowModal() == wx.ID_OK:
+                try:
+                    current_password = dialog.current_password.GetValue()
+                    new_password = dialog.new_password.GetValue()
+                    confirm_password = dialog.confirm_password.GetValue()
+
+                    # Verify current password
+                    if not self.task_manager.verify_password(current_password):
+                        raise ValueError("Incorrect password")
+
+                    # Validate new password
+                    is_valid, error_message = self.validate_password(new_password)
+                    if not is_valid:
+                        raise ValueError(error_message)
+                        
+                    # Check if passwords match
+                    if new_password != confirm_password:
+                        raise ValueError("New passwords do not match")
+                        
+                    # Attempt password change
+                    success = self.task_manager.credential_manager.change_password(
+                        current_password, new_password
+                    )
+                    
+                    if success:
+                        wx.MessageBox(
+                            "Password changed successfully!", 
+                            "Success",
+                            wx.OK | wx.ICON_INFORMATION
+                        )
+                        break
+                        
+                except ValueError as e:
+                    wx.MessageBox(
+                        str(e),
+                        "Error",
+                        wx.OK | wx.ICON_ERROR
+                    )
+                except Exception as e:
+                    wx.MessageBox(
+                        f"An error occurred: {e}",
+                        "Error",
+                        wx.OK | wx.ICON_ERROR
+                    )
+            else: 
+                break 
+        dialog.Destroy()
+
 
     def format_response(self, response):
         if isinstance(response, list):
@@ -2158,6 +2236,42 @@ class SelectableMessageDialog(wx.Dialog):
         </html>
         """
         self.html_window.SetPage(html_content)
+
+class ChangePasswordDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Change Password")
+
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Current password
+        current_label = wx.StaticText(panel, label="Current Password:")
+        self.current_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        sizer.Add(current_label, 0, wx.ALL, 5)
+        sizer.Add(self.current_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+
+        # New password
+        new_label = wx.StaticText(panel, label="New Password:")
+        self.new_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        sizer.Add(new_label, 0, wx.ALL, 5)
+        sizer.Add(self.new_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        
+        # Confirm password
+        confirm_label = wx.StaticText(panel, label="Confirm New Password:")
+        self.confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        sizer.Add(confirm_label, 0, wx.ALL, 5)
+        sizer.Add(self.confirm_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        
+        # Buttons
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        ok_button = wx.Button(panel, wx.ID_OK, "Change Password")
+        cancel_button = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        button_sizer.Add(ok_button, 0, wx.ALL, 5)
+        button_sizer.Add(cancel_button, 0, wx.ALL, 5)
+        sizer.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+
+        panel.SetSizer(sizer)
+        self.Center()
 
 def main():
     logger.info("Starting Post Fiat Wallet")
