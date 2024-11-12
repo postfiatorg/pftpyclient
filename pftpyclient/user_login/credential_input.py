@@ -98,6 +98,34 @@ class CredentialManager:
                 os.remove(backup_path)
             logger.error(f"Error changing password: {e}")
             raise Exception(f"Error changing password: {e}")
+        
+    def clear_credentials(self):
+        """Securely clear all credentials from memory"""
+        try:
+            # Clear decrypted credentials
+            if hasattr(self, 'pw_map'):
+                for key in self.pw_map:
+                    self.pw_map[key] = '0' * len(self.pw_map[key])  # overwrite with zeros
+                self.pw_map.clear()
+                del self.pw_map
+
+            # Clear encryption password
+            if hasattr(self, 'pw_initiator'):
+                self.pw_initiator = '0' * len(self.pw_initiator)  # overwrite with zeros
+                del self.pw_initiator
+
+            # Clear other sensitive data
+            self.postfiat_username = None
+            self.wallet_address_name = None
+            self.wallet_secret_name = None
+            self.google_doc_name = None
+            self.key_variables = None
+
+            logger.debug("Credentials cleared from memory")
+
+        except Exception as e:
+            logger.error(f"Error clearing credentials: {e}")
+            raise Exception(f"Error clearing credentials: {e}")
     
 def _read_creds(credential_file_path):
     with open(credential_file_path, 'r') as f:

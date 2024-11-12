@@ -6,7 +6,7 @@ import wx.html
 import xrpl
 from xrpl.wallet import Wallet
 import asyncio
-from threading import Thread
+from threading import Thread, Event
 import wx.lib.newevent
 import nest_asyncio
 from pftpyclient.task_manager.wallet_state import (
@@ -38,7 +38,7 @@ from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
 import pandas as pd
-import inspect
+from enum import Enum, auto
 # Configure the logger at module level
 wx_sink = configure_logger(
     log_to_file=True,
@@ -82,6 +82,12 @@ nest_asyncio.apply()
 
 UpdateGridEvent, EVT_UPDATE_GRID = wx.lib.newevent.NewEvent()
 
+class WalletUIState(Enum):
+    IDLE = auto()
+    BUSY = auto()
+    SYNCING = auto()
+    TRANSACTION_PENDING = auto()
+
 class PostFiatWalletApp(wx.App):
     def OnInit(self):
         frame = WalletApp()
@@ -102,19 +108,37 @@ class XRPLMonitorThread(Thread):
         self.loop = asyncio.new_event_loop()
         self.context = None
         self.expecting_state_change = False
+        self._stop_event = Event()
 
     def run(self):
+        """Thread entry point"""
         asyncio.set_event_loop(self.loop)
-        self.context = self.loop.run_until_complete(self.monitor())
+        try:
+            self.context = self.loop.run_until_complete(self.monitor())
+        except Exception as e:
+            if not self.stopped():
+                logger.error(f"Unexpected error in XRPLMonitorThread: {e}")
+        finally:
+            self.loop.close()
+
+    def stop(self):
+        """Signal the thread to stop"""
+        self._stop_event.set()
+
+    def stopped(self):
+        """Check if the thread has been signaled to stop"""
+        return self._stop_event.is_set()
 
     async def monitor(self):
-        while True:
-            try:
+        """Main monitoring coroutine"""
+        try:
+            while not self.stopped():
                 await self.watch_xrpl_account(self.gui.wallet.classic_address, self.gui.wallet)
-            except Exception as e:
-                logger.error(f"Error in monitor: {e}. Switching to next node.")
-                self.switch_node()
-                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.debug("Monitor task cancelled")
+        except Exception as e:
+            if not self.stopped():
+                logger.error(f"Unexpected error in monitor: {e}")
     
     def switch_node(self):
         self.current_node_index = (self.current_node_index + 1) % len(self.nodes)
@@ -126,7 +150,7 @@ class XRPLMonitorThread(Thread):
         self.wallet = wallet
         check_interval = 10
 
-        while True:
+        while not self.stopped():
             try:
                 async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
                     while True:
@@ -193,6 +217,8 @@ class XRPLMonitorThread(Thread):
                                 await asyncio.sleep(check_interval)
 
             except Exception as e:
+                if self.stopped():
+                    break
                 logger.error(f"Error in watch_xrpl_account: {e}")
 
     async def on_connected(self):
@@ -392,7 +418,9 @@ class WalletApp(wx.Frame):
 
         # File menu
         file_menu = wx.Menu()
+        logout_item = file_menu.Append(wx.ID_ANY, "Logout", "Return to login screen")
         quit_item = file_menu.Append(wx.ID_EXIT, "Quit", "Quit the application")
+        self.Bind(wx.EVT_MENU, self.on_logout, logout_item)
         self.Bind(wx.EVT_MENU, self.on_close, quit_item)
         self.menubar.Append(file_menu, "File")
 
@@ -449,24 +477,53 @@ class WalletApp(wx.Frame):
         self.summary_sizer = wx.BoxSizer(wx.VERTICAL)
         self.summary_tab.SetSizer(self.summary_sizer)
 
-        # Create Summary tab elements but don't add them to sizer yet
+        # Create Summary tab elements
+        username_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
-        self.lbl_xrp_balance = wx.StaticText(self.summary_tab, label="XRP Balance: ")
-        self.lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: ")
-        self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
-
         self.lbl_wallet_state = wx.StaticText(self.summary_tab, label="Wallet State: ")
+        username_row_sizer.Add(self.lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        username_row_sizer.AddStretchSpacer()
+        username_row_sizer.Add(self.lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_sizer.Add(username_row_sizer, 0, wx.EXPAND)
+
+        # Create XRP balance row
+        xrp_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_xrp_balance = wx.StaticText(self.summary_tab, label="XRP Balance: ")
         self.lbl_next_action = wx.StaticText(self.summary_tab, label="Next Action: ")
+        xrp_balance_row_sizer.Add(self.lbl_xrp_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        xrp_balance_row_sizer.AddStretchSpacer()
+        xrp_balance_row_sizer.Add(self.lbl_next_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_sizer.Add(xrp_balance_row_sizer, 0, wx.EXPAND)
+
+        # Create PFT balance row
+        pft_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: ")
         self.btn_wallet_action = wx.Button(self.summary_tab, label="Take Action")
+        pft_balance_row_sizer.Add(self.lbl_pft_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        pft_balance_row_sizer.AddStretchSpacer()
+        pft_balance_row_sizer.Add(self.btn_wallet_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_sizer.Add(pft_balance_row_sizer, 0, wx.EXPAND)
+
+        # Create address section
+        self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
+        self.summary_sizer.Add(self.lbl_address, 0, flag=wx.ALL, border=5)
+
+        # Bind wallet action button
         self.btn_wallet_action.Bind(wx.EVT_BUTTON, self.on_take_action)
 
+        # Set font weights
         font = self.lbl_next_action.GetFont()
         font.SetWeight(wx.FONTWEIGHT_BOLD)
         self.lbl_next_action.SetFont(font)
         self.btn_wallet_action.SetFont(font)
 
-        # Add grid for Key Account Details
+        # Create Key Account Details section
+        self.lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
+        self.summary_sizer.Add(self.lbl_key_details, 0, flag=wx.ALL, border=5)
         self.summary_grid = self.setup_grid(gridlib.Grid(self.summary_tab), 'summary')
+        self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
+
+        self.summary_tab.SetSizer(self.summary_sizer)
 
         # Store reference to summary tab page
         self.tab_pages["Summary"] = self.summary_tab
@@ -679,6 +736,13 @@ class WalletApp(wx.Frame):
         # Store reference to log tab page
         self.tab_pages["Log"] = self.log_tab
 
+        #################################
+
+        self.status_bar = self.CreateStatusBar()
+        self.status_bar.SetFieldsCount(2)
+        self.status_bar.SetStatusWidths([-3, -1])  # 75% for message, 25% for state
+        self.set_wallet_ui_state(WalletUIState.IDLE)
+
     def create_login_panel(self):
         panel = wx.Panel(self.panel)
         main_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -703,24 +767,24 @@ class WalletApp(wx.Frame):
         box_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Username
-        self.lbl_user = wx.StaticText(box, label="Username:")
-        box_sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
+        self.login_lbl_username = wx.StaticText(box, label="Username:")
+        box_sizer.Add(self.login_lbl_username, flag=wx.ALL, border=5)
 
         # Create combobox for username dropdown
-        self.txt_user = wx.ComboBox(box, style=wx.CB_DROPDOWN)
-        box_sizer.Add(self.txt_user, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        self.login_txt_username = wx.ComboBox(box, style=wx.CB_DROPDOWN)
+        box_sizer.Add(self.login_txt_username, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Password
-        self.lbl_pass = wx.StaticText(box, label="Password:")
-        box_sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
-        self.txt_pass = wx.TextCtrl(box, style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
-        box_sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
+        self.login_lbl_password = wx.StaticText(box, label="Password:")
+        box_sizer.Add(self.login_lbl_password, flag=wx.ALL, border=5)
+        self.login_txt_password = wx.TextCtrl(box, style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
+        box_sizer.Add(self.login_txt_password, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Error label
-        self.error_label = wx.StaticText(box, label="")
-        self.error_label.SetForegroundColour(wx.RED)
-        box_sizer.Add(self.error_label, flag=wx.EXPAND |wx.ALL, border=5)
-        # self.error_label.Hide()
+        self.login_error_label = wx.StaticText(box, label="")
+        self.login_error_label.SetForegroundColour(wx.RED)
+        box_sizer.Add(self.login_error_label, flag=wx.EXPAND |wx.ALL, border=5)
+        # self.login_error_label.Hide()
 
         # Login button
         self.btn_login = wx.Button(box, label="Login")
@@ -748,14 +812,14 @@ class WalletApp(wx.Frame):
         panel.SetSizer(main_sizer)
 
         # Bind events
-        self.txt_user.Bind(wx.EVT_COMBOBOX_DROPDOWN, self.on_dropdown_opened)
-        self.txt_user.Bind(wx.EVT_COMBOBOX, self.on_username_selected)
-        self.txt_user.Bind(wx.EVT_TEXT, self.on_clear_error)
-        self.txt_pass.Bind(wx.EVT_TEXT, self.on_clear_error)
+        self.login_txt_username.Bind(wx.EVT_COMBOBOX_DROPDOWN, self.on_dropdown_opened)
+        self.login_txt_username.Bind(wx.EVT_COMBOBOX, self.on_username_selected)
+        self.login_txt_username.Bind(wx.EVT_TEXT, self.on_clear_error)
+        self.login_txt_password.Bind(wx.EVT_TEXT, self.on_clear_error)
 
         # Add Enter key bindings
-        self.txt_user.Bind(wx.EVT_TEXT_ENTER, self.on_login)
-        self.txt_pass.Bind(wx.EVT_TEXT_ENTER, self.on_login)
+        self.login_txt_username.Bind(wx.EVT_TEXT_ENTER, self.on_login)
+        self.login_txt_password.Bind(wx.EVT_TEXT_ENTER, self.on_login)
 
         self.populate_username_dropdown()
 
@@ -764,15 +828,15 @@ class WalletApp(wx.Frame):
     def populate_username_dropdown(self):
         """Populates the username dropdown with cached usernames"""
         try:
-            current_value = self.txt_user.GetValue()
+            current_value = self.login_txt_username.GetValue()
             cached_usernames = get_cached_usernames()
-            self.txt_user.Clear()
-            self.txt_user.AppendItems(cached_usernames)
+            self.login_txt_username.Clear()
+            self.login_txt_username.AppendItems(cached_usernames)
 
             if current_value and current_value in cached_usernames:
-                self.txt_user.SetValue(current_value)
+                self.login_txt_username.SetValue(current_value)
             elif cached_usernames:
-                self.txt_user.SetValue(cached_usernames[0])
+                self.login_txt_username.SetValue(cached_usernames[0])
         except Exception as e:
             logger.error(f"Error populating username dropdown: {e}")
             self.show_error("Error loading cached usernames")
@@ -784,7 +848,7 @@ class WalletApp(wx.Frame):
 
     def on_username_selected(self, event):
         """Handle username selection from dropdown"""
-        self.txt_pass.SetFocus()
+        self.login_txt_password.SetFocus()
         self.on_clear_error(event)
     
     def create_user_details_panel(self):
@@ -802,17 +866,17 @@ class WalletApp(wx.Frame):
         user_details_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # XRP Address
-        self.lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
-        user_details_sizer.Add(self.lbl_xrp_address, flag=wx.ALL, border=5)
-        self.txt_xrp_address = wx.TextCtrl(panel)
-        user_details_sizer.Add(self.txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
+        user_details_sizer.Add(self.create_lbl_xrp_address, flag=wx.ALL, border=5)
+        self.create_txt_xrp_address = wx.TextCtrl(panel)
+        user_details_sizer.Add(self.create_txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
 
         # XRP Secret
         secret_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
-        user_details_sizer.Add(self.lbl_xrp_secret, flag=wx.ALL, border=5)
-        self.txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)  # TODO: make a checkbox to show/hide the secret
-        secret_sizer.Add(self.txt_xrp_secret, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
+        user_details_sizer.Add(self.create_lbl_xrp_secret, flag=wx.ALL, border=5)
+        self.create_txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)  # TODO: make a checkbox to show/hide the secret
+        secret_sizer.Add(self.create_txt_xrp_secret, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
         self.chk_show_secret = wx.CheckBox(panel, label="Show Secret")
         secret_sizer.Add(self.chk_show_secret, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         user_details_sizer.Add(secret_sizer, flag=wx.EXPAND)
@@ -820,25 +884,25 @@ class WalletApp(wx.Frame):
         self.chk_show_secret.Bind(wx.EVT_CHECKBOX, self.on_toggle_secret_visibility_user_details)
 
         # Username
-        self.lbl_username = wx.StaticText(panel, label="Username:")
-        user_details_sizer.Add(self.lbl_username, flag=wx.ALL, border=5)
-        self.txt_username = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
-        user_details_sizer.Add(self.txt_username, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_username = wx.StaticText(panel, label="Username:")
+        user_details_sizer.Add(self.create_lbl_username, flag=wx.ALL, border=5)
+        self.create_txt_username = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+        user_details_sizer.Add(self.create_txt_username, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Bind event to force lowercase
-        self.txt_username.Bind(wx.EVT_TEXT, self.on_force_lowercase)
+        self.create_txt_username.Bind(wx.EVT_TEXT, self.on_force_lowercase)
 
         # Password
-        self.lbl_password = wx.StaticText(panel, label="Password (minimum 8 characters):")
-        user_details_sizer.Add(self.lbl_password, flag=wx.ALL, border=5)
-        self.txt_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        user_details_sizer.Add(self.txt_password, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_password = wx.StaticText(panel, label="Password (minimum 8 characters):")
+        user_details_sizer.Add(self.create_lbl_password, flag=wx.ALL, border=5)
+        self.create_txt_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        user_details_sizer.Add(self.create_txt_password, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Confirm Password
-        self.lbl_confirm_password = wx.StaticText(panel, label="Confirm Password:")
-        user_details_sizer.Add(self.lbl_confirm_password, flag=wx.ALL, border=5)
-        self.txt_confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        user_details_sizer.Add(self.txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_confirm_password = wx.StaticText(panel, label="Confirm Password:")
+        user_details_sizer.Add(self.create_lbl_confirm_password, flag=wx.ALL, border=5)
+        self.create_txt_confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        user_details_sizer.Add(self.create_txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Tooltips
         self.tooltip_xrp_address = wx.ToolTip("This is your XRP address. It is used to receive XRP or PFT.")
@@ -846,13 +910,11 @@ class WalletApp(wx.Frame):
         self.tooltip_username = wx.ToolTip("Set a username that you will use to log in with. You can use lowercase letters, numbers, and underscores.")
         self.tooltip_password = wx.ToolTip("Set a password that you will use to log in with. This password is used to encrypt your XRP address and secret.")
         self.tooltip_confirm_password = wx.ToolTip("Confirm your password.")
-        # self.tooltip_google_doc = wx.ToolTip("This is the link to your Google Doc. 1) It must be a shareable link. 2) The first line of the document must be your XRP address.")
-        self.txt_xrp_address.SetToolTip(self.tooltip_xrp_address)
-        self.txt_xrp_secret.SetToolTip(self.tooltip_xrp_secret)
-        self.txt_username.SetToolTip(self.tooltip_username)
-        self.txt_password.SetToolTip(self.tooltip_password)
-        self.txt_confirm_password.SetToolTip(self.tooltip_confirm_password)
-        # self.txt_google_doc.SetToolTip(self.tooltip_google_doc)
+        self.create_txt_xrp_address.SetToolTip(self.tooltip_xrp_address)
+        self.create_txt_xrp_secret.SetToolTip(self.tooltip_xrp_secret)
+        self.create_txt_username.SetToolTip(self.tooltip_username)
+        self.create_txt_password.SetToolTip(self.tooltip_password)
+        self.create_txt_confirm_password.SetToolTip(self.tooltip_confirm_password)
 
         # Buttons
         wallet_buttons_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -866,9 +928,9 @@ class WalletApp(wx.Frame):
 
         user_details_sizer.Add(wallet_buttons_sizer, flag=wx.EXPAND | wx.ALL, border=5)
 
-        self.btn_existing_user = wx.Button(panel, label="Cache Credentials")
-        user_details_sizer.Add(self.btn_existing_user, flag=wx.EXPAND, border=15)
-        self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
+        self.btn_cache_user = wx.Button(panel, label="Cache Credentials")
+        user_details_sizer.Add(self.btn_cache_user, flag=wx.EXPAND, border=15)
+        self.btn_cache_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
 
         sizer.Add(user_details_sizer, 1, wx.EXPAND | wx.ALL, 10)
 
@@ -974,11 +1036,12 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
 
     def on_login(self, event):
+        self.set_wallet_ui_state(WalletUIState.BUSY, "Logging in...")
         self.btn_login.SetLabel("Logging in...")
         self.btn_login.Update()
 
-        username = self.txt_user.GetValue()
-        password = self.txt_pass.GetValue()
+        username = self.login_txt_username.GetValue()
+        password = self.login_txt_password.GetValue()
 
         try:
             self.task_manager = PostFiatTaskManager(
@@ -1013,8 +1076,7 @@ class WalletApp(wx.Frame):
         self.login_panel.Hide()
         self.tabs.Show()
 
-        # TODO: rename method to better reflect its function
-        self.populate_summary_tab(username, classic_address)
+        self.update_account_display(username, classic_address)
 
         # Update layout and ensure correct sizing
         self.panel.Layout()
@@ -1031,6 +1093,8 @@ class WalletApp(wx.Frame):
         # Start timers
         self.start_pft_update_timer()
         self.start_transaction_update_timer()
+
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
@@ -1098,87 +1162,41 @@ class WalletApp(wx.Frame):
         self.Refresh()
 
     def show_error(self, message):
-        self.error_label.SetLabel(message)
+        self.login_error_label.SetLabel(message)
 
         # Simple shake animation
-        original_pos = self.error_label.GetPosition()
+        original_pos = self.login_error_label.GetPosition()
         for i in range(5):
-            self.error_label.Move(original_pos.x + 2, original_pos.y)
+            self.login_error_label.Move(original_pos.x + 2, original_pos.y)
             wx.MilliSleep(40)
-            self.error_label.Move(original_pos.x - 2, original_pos.y)
+            self.login_error_label.Move(original_pos.x - 2, original_pos.y)
             wx.MilliSleep(40)
-        self.error_label.Move(original_pos)
+        self.login_error_label.Move(original_pos)
 
         self.login_panel.Layout()
 
     def on_clear_error(self, event):
-        self.error_label.SetLabel("")
+        self.login_error_label.SetLabel("")
         event.Skip()
 
-    # TODO: rename method to better reflect its function
-    def populate_summary_tab(self, username, classic_address):
-        # Clear existing content
-        self.summary_sizer.Clear(True)
+    @PerformanceMonitor.measure('update_account_display')
+    def update_account_display(self, username, classic_address):
+        """Update all account-related display elements"""
+        logger.debug(f"Updating account display for {username}")
 
-        # Create a horizontal box sizer for the username and wallet state
-        username_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        username_row_sizer.Add(self.lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        username_row_sizer.AddStretchSpacer()
-        username_row_sizer.Add(self.lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        self.summary_sizer.Add(username_row_sizer, 0, wx.EXPAND)
-
-        # Create a horizontal sizer for the xrp balance and next action
-        xrp_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        xrp_balance_row_sizer.Add(self.lbl_xrp_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        xrp_balance_row_sizer.AddStretchSpacer()
-        xrp_balance_row_sizer.Add(self.lbl_next_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        self.summary_sizer.Add(xrp_balance_row_sizer, 0, wx.EXPAND)
-
-        # Create a horizontal sizer for the PFT balance and take action button
-        pft_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        pft_balance_row_sizer.Add(self.lbl_pft_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        pft_balance_row_sizer.AddStretchSpacer()
-        pft_balance_row_sizer.Add(self.btn_wallet_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        self.summary_sizer.Add(pft_balance_row_sizer, 0, wx.EXPAND)
-
-        self.summary_sizer.Add(self.lbl_address, 0, flag=wx.ALL, border=5)
-
-        # # Create a horizontal sizer for the address and show secret button
-        # address_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        # address_row_sizer.Add(self.lbl_address, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        # address_row_sizer.AddStretchSpacer()
-        # self.btn_show_secret = wx.Button(self.summary_tab, label="Show Secret")
-        # self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
-        # address_row_sizer.Add(self.btn_show_secret, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        # self.summary_sizer.Add(address_row_sizer, 0, wx.EXPAND)
-
-        # Create a heading for Key Account Details
-        lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
-        self.summary_sizer.Add(lbl_key_details, flag=wx.ALL, border=5)
-
-        self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
-
-        # Update labels
+        # Update basic account info
         self.lbl_username.SetLabel(f"Username: {username}")
         self.lbl_address.SetLabel(f"XRP Address: {classic_address}")
 
-        # Update account info
-        self.update_account_info()
+        xrp_balance = self.task_manager.get_xrp_balance()
+        xrp_balance = xrpl.utils.drops_to_xrp(str(xrp_balance))
+        self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
-    @PerformanceMonitor.measure('update_account_info')
-    def update_account_info(self):
-        if self.task_manager:
-            xrp_balance = self.task_manager.get_xrp_balance()
-            logger.debug(f"XRP Balance: {xrp_balance}")
-            xrp_balance = xrpl.utils.drops_to_xrp(str(xrp_balance))
-            self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
+        # PFT balance pending update
+        self.lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
 
-            # PFT balance update (placeholder, as it's not streamed)
-            self.lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
-
-            if hasattr(self.task_manager, 'wallet_state'):
-                self.lbl_wallet_state.SetLabel(f"Wallet State: {self.task_manager.wallet_state.value}")
-                self.lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
+        self.lbl_wallet_state.SetLabel(f"Wallet State: {self.task_manager.wallet_state.value}")
+        self.lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
 
     def on_take_action(self, event):
         """Handle wallet action button click based on current state"""
@@ -1436,13 +1454,16 @@ class WalletApp(wx.Frame):
     def _sync_and_refresh(self):
         """Internal method to sync transactions and refresh grids"""
         try:
+            self.set_wallet_ui_state(WalletUIState.SYNCING, "Syncing transactions...")
             if self.task_manager.sync_transactions():
                 logger.debug("New transactions found, updating grids")
                 self.refresh_grids()
             else:
                 logger.debug("No new transactions found, skipping grid updates.")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
         except Exception as e:
             logger.error(f"Error during sync and refresh cycle: {e}")
+            self.set_wallet_ui_state(WalletUIState.IDLE, f"Sync error: {e}")
             raise
 
     def on_transaction_update_timer(self, _):
@@ -1553,18 +1574,14 @@ class WalletApp(wx.Frame):
 
     @PerformanceMonitor.measure('on_pft_update_timer')
     def on_pft_update_timer(self, event):
+        self.set_wallet_ui_state(WalletUIState.SYNCING, "Updating token balance...")
         if self.wallet:
             self.update_tokens(self.wallet.classic_address)
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     @PerformanceMonitor.measure('populate_grid_generic')
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
         """Generic grid population method that respects zoom settings"""
-        # frame = inspect.currentframe()
-        # caller_frame = frame.f_back
-        # while caller_frame.f_code.co_name == "wrapper":
-        #     caller_frame = caller_frame.f_back
-        # caller = caller_frame.f_code.co_name
-        # logger.debug(f"populate_grid_generic called from {caller} for grid {grid_name}", stack_info=True)
 
         if data.empty:
             logger.debug(f"No data to populate {grid_name} grid")
@@ -1729,6 +1746,7 @@ class WalletApp(wx.Frame):
         event.Skip()
 
     def on_request_task(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Requesting Task...")
         self.btn_request_task.SetLabel("Requesting Task...")
         self.btn_request_task.Update()
 
@@ -1747,8 +1765,10 @@ class WalletApp(wx.Frame):
 
         self.btn_request_task.SetLabel("Request Task")
         self.btn_request_task.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_accept_task(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Accepting Task...")
         self.btn_accept_task.SetLabel("Accepting Task...")
         self.btn_accept_task.Update()
 
@@ -1783,8 +1803,10 @@ class WalletApp(wx.Frame):
 
         self.btn_accept_task.SetLabel("Accept Task")
         self.btn_accept_task.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_refuse_task(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Refusing Task...")
         self.btn_refuse_task.SetLabel("Refusing Task...")
         self.btn_refuse_task.Update()
 
@@ -1815,8 +1837,10 @@ class WalletApp(wx.Frame):
 
         self.btn_refuse_task.SetLabel("Refuse Task")
         self.btn_refuse_task.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_for_verification(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting for Verification...")
         self.btn_submit_for_verification.SetLabel("Submitting for Verification...")
         self.btn_submit_for_verification.Update()
 
@@ -1854,8 +1878,10 @@ class WalletApp(wx.Frame):
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
         self.btn_submit_for_verification.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_verification_details(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Verification Details...")
         self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
         self.btn_submit_verification_details.Update()
 
@@ -1886,8 +1912,10 @@ class WalletApp(wx.Frame):
         self.txt_verification_details.SetValue("")
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_log_pomodoro(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Logging Pomodoro...")
         self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
         self.btn_log_pomodoro.Update()
 
@@ -1904,9 +1932,11 @@ class WalletApp(wx.Frame):
         self.txt_verification_details.SetValue("")
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
         self.btn_log_pomodoro.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_memo(self, event):
         """Submits a memo to the remembrancer."""
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Memo...")
         self.btn_submit_memo.SetLabel("Submitting...")
         self.btn_submit_memo.Update()
 
@@ -1963,8 +1993,10 @@ class WalletApp(wx.Frame):
             
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.txt_memo_input.SetValue("")
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_xrp_payment(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting XRP Payment...")
         self.btn_submit_xrp_payment.SetLabel("Submitting...")
         self.btn_submit_xrp_payment.Update()
 
@@ -1987,8 +2019,10 @@ class WalletApp(wx.Frame):
 
         self.btn_submit_xrp_payment.SetLabel("Submit Payment")
         self.btn_submit_xrp_payment.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_pft_payment(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting PFT Payment...")
         self.btn_submit_pft_payment.SetLabel("Submitting...")
         self.btn_submit_pft_payment.Update()
 
@@ -2019,7 +2053,7 @@ class WalletApp(wx.Frame):
 
         self.btn_submit_pft_payment.SetLabel("Submit Payment")
         self.btn_submit_pft_payment.Update()
-
+        self.set_wallet_ui_state(WalletUIState.IDLE)
     def on_show_secret(self, event):
         dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your secret.")
 
@@ -2192,6 +2226,94 @@ class WalletApp(wx.Frame):
         
             Thread(target=monitor_thread, daemon=True).start()
 
+    def set_wallet_ui_state(self, state: WalletUIState, message: str = ""):
+        """Update the status bar with current wallet state"""
+        self.current_ui_state = state
+        status_text = message or f"Wallet state: {state.name.lower()}"
+        self.status_bar.SetStatusText(status_text, 0)
+        self.status_bar.SetStatusText(state.name, 1)
+
+    def is_wallet_busy(self):
+        """Check if wallet is in a busy state"""
+        return hasattr(self, 'current_ui_state') and self.current_ui_state != WalletUIState.IDLE
+    
+    def on_logout(self, event):
+        """Handle logout request"""
+        if self.is_wallet_busy():
+            wx.MessageBox("Please wait for the current operation to complete before logging out.", "Wallet Busy", wx.OK | wx.ICON_WARNING)
+            return
+
+        if wx.YES == wx.MessageBox("Are you sure you want to logout?", "Confirm Logout", wx.YES_NO | wx.ICON_QUESTION):
+            self.logout()
+
+    def logout(self):
+        """Perform logout operations and reset UI"""
+        try:
+
+            # Stop background processes
+            if hasattr(self, 'worker') and self.worker:
+                # Signal the worker to stop
+                self.worker.stop()
+
+                # Cancel any pending tasks
+                pending_tasks = asyncio.all_tasks(self.worker.loop)
+                for task in pending_tasks:
+                    task.cancel()
+
+                # Run the loop one last time to process cancellations
+                if pending_tasks:
+                    try:
+                        self.worker.loop.call_soon_threadsafe(
+                            lambda: self.worker.loop.stop()
+                        )
+                    except Exception as e:
+                        pass  # Ignore any errors during loop stop
+            
+                # Wait for thread to complete (with timeout)
+                self.worker.join(timeout=2)
+                if self.worker.is_alive():
+                    logger.error("Worker thread did not stop gracefully")
+                self.worker = None
+
+            # Stop timers
+            if hasattr(self, 'pft_update_timer'):
+                logger.debug("Stopping PFT update timer")
+                self.pft_update_timer.Stop()
+
+            if hasattr(self, 'tx_update_timer'):
+                logger.debug("Stopping TX update timer")
+                self.tx_update_timer.Stop()
+
+            # Clear sensitive data
+            if hasattr(self, 'task_manager'):
+                logger.debug("Clearing credentials")
+                self.task_manager.credential_manager.clear_credentials()
+                self.task_manager = None
+
+            if hasattr(self, 'wallet'):
+                logger.debug("Clearing wallet")
+                self.wallet = None
+
+            self.tabs.Hide()
+
+            # Reset menu state
+            self.menubar.EnableTop(self.menubar.FindMenu("Account"), False)
+
+            logger.debug("Logging out...")
+
+            # Show login panel
+            self.btn_login.SetLabel("Login")
+            self.btn_login.Update()
+            self.login_panel.Show()
+            self.login_txt_password.SetValue("")            
+            self.login_txt_password.Update()
+
+            # Reset status bar
+            self.set_wallet_ui_state(WalletUIState.IDLE, "Logged out")
+
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+            wx.MessageBox(f"Error during logout: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
