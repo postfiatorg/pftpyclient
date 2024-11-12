@@ -126,6 +126,45 @@ class CredentialManager:
         except Exception as e:
             logger.error(f"Error clearing credentials: {e}")
             raise Exception(f"Error clearing credentials: {e}")
+        
+    def delete_credentials(self):
+        """Delete all credentials for the current user"""
+        try:
+            # Get all existing credentials
+            existing_cred_map = _get_cred_map()
+
+            # Create backup
+            backup_path = self.credential_file_path.with_suffix('.txt_backup')
+            shutil.copy2(self.credential_file_path, backup_path)
+
+            try:
+                # Write updated credential file without current user's credentials
+                with open(self.credential_file_path, 'w') as f:
+                    for key, value in existing_cred_map.items():
+                        if key not in self.key_variables:
+                            f.write(f'\nvariable___{key}\n{value}')
+
+                # Clear credentials from memory
+                self.clear_credentials()
+
+                # Remove backup file after successful deletion
+                if backup_path.exists():
+                    os.remove(backup_path)
+
+                logger.info(f"Successfully deleted account for user: {self.postfiat_username}")
+                return True
+            
+            except Exception as e:
+                # Restore from backup if anything fails
+                if backup_path.exists():
+                    shutil.copy2(backup_path, self.credential_file_path)
+                    os.remove(backup_path)
+                logger.error(f"Error deleting account: {e}")
+                raise Exception(f"Error deleting account: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error deleting account: {e}")
+            raise Exception(f"Error deleting account: {e}")
     
 def _read_creds(credential_file_path):
     with open(credential_file_path, 'r') as f:

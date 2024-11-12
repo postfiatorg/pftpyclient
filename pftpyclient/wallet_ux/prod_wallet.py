@@ -436,11 +436,13 @@ class WalletApp(wx.Frame):
         self.account_menu = wx.Menu()
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
+        self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
         self.menubar.Append(self.account_menu, "Account")
 
         # Bind menu events
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
+        self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
 
         # Extras menu
         extras_menu = wx.Menu()
@@ -951,39 +953,39 @@ class WalletApp(wx.Frame):
         return panel
     
     def on_force_lowercase(self, event):
-        value = self.txt_username.GetValue()
+        value = self.create_txt_username.GetValue()
         lowercase_value = value.lower()
         if value != lowercase_value:
-            self.txt_username.SetValue(lowercase_value)
-            self.txt_username.SetInsertionPointEnd()
+            self.create_txt_username.SetValue(lowercase_value)
+            self.create_txt_username.SetInsertionPointEnd()
     
     def on_toggle_secret_visibility_user_details(self, event):
         if self.chk_show_secret.IsChecked():
-            self.txt_xrp_secret.SetWindowStyle(wx.TE_PROCESS_ENTER)  # Default style
+            self.create_txt_xrp_secret.SetWindowStyle(wx.TE_PROCESS_ENTER)  # Default style
         else:
-            self.txt_xrp_secret.SetWindowStyle(wx.TE_PASSWORD)
+            self.create_txt_xrp_secret.SetWindowStyle(wx.TE_PASSWORD)
 
         # Store the current value and cursor position
-        current_value = self.txt_xrp_secret.GetValue()
+        current_value = self.create_txt_xrp_secret.GetValue()
 
         # Recreate the text control with the new style
-        new_txt_xrp_secret = wx.TextCtrl(self.txt_xrp_secret.GetParent(), 
+        new_txt_xrp_secret = wx.TextCtrl(self.create_txt_xrp_secret.GetParent(), 
                                         value=current_value,
-                                        style=self.txt_xrp_secret.GetWindowStyle())
+                                        style=self.create_txt_xrp_secret.GetWindowStyle())
         
         # Replace the old control with the new one in the sizer
-        self.txt_xrp_secret.GetContainingSizer().Replace(self.txt_xrp_secret, new_txt_xrp_secret)
-        self.txt_xrp_secret.Destroy()
-        self.txt_xrp_secret = new_txt_xrp_secret
+        self.create_txt_xrp_secret.GetContainingSizer().Replace(self.create_txt_xrp_secret, new_txt_xrp_secret)
+        self.create_txt_xrp_secret.Destroy()
+        self.create_txt_xrp_secret = new_txt_xrp_secret
 
         # Refresh the layout
-        self.txt_xrp_secret.GetParent().Layout()
+        self.create_txt_xrp_secret.GetParent().Layout()
 
     def on_generate_wallet(self, event):
         # Generate a new XRP wallet
         self.wallet = Wallet.create()
-        self.txt_xrp_address.SetValue(self.wallet.classic_address)
-        self.txt_xrp_secret.SetValue(self.wallet.seed)
+        self.create_txt_xrp_address.SetValue(self.wallet.classic_address)
+        self.create_txt_xrp_secret.SetValue(self.wallet.seed)
 
     def on_restore_wallet(self, event):
         """Restore wallet from existing seed"""
@@ -995,8 +997,8 @@ class WalletApp(wx.Frame):
                 wallet = Wallet.from_seed(seed)
 
                 # Update the UI with the restored wallet details
-                self.txt_xrp_address.SetValue(wallet.classic_address)
-                self.txt_xrp_secret.SetValue(wallet.seed)
+                self.create_txt_xrp_address.SetValue(wallet.classic_address)
+                self.create_txt_xrp_secret.SetValue(wallet.seed)
 
                 wx.MessageBox("Wallet restored successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
 
@@ -1011,18 +1013,18 @@ class WalletApp(wx.Frame):
         logger.debug("User clicked Cache Credentials button")
         """Caches the user's credentials"""
         input_map = {
-            'Username_Input': self.txt_username.GetValue(),
-            'Password_Input': self.txt_password.GetValue(),
-            'XRP Address_Input': self.txt_xrp_address.GetValue(),
-            'XRP Secret_Input': self.txt_xrp_secret.GetValue(),
-            'Confirm Password_Input': self.txt_confirm_password.GetValue(),
+            'Username_Input': self.create_txt_username.GetValue(),
+            'Password_Input': self.create_txt_password.GetValue(),
+            'XRP Address_Input': self.create_txt_xrp_address.GetValue(),
+            'XRP Secret_Input': self.create_txt_xrp_secret.GetValue(),
+            'Confirm Password_Input': self.create_txt_confirm_password.GetValue(),
         }
 
         is_valid, error_message = self.validate_password(input_map['Password_Input'])
         if not is_valid:
             logger.error(error_message)
             wx.MessageBox(error_message, 'Error', wx.OK | wx.ICON_ERROR)
-        elif self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
+        elif self.create_txt_password.GetValue() != self.create_txt_confirm_password.GetValue():
             logger.error("Passwords Do Not Match! Please Retry.")
             wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
         elif any(not value for value in input_map.values()):
@@ -2153,6 +2155,41 @@ class WalletApp(wx.Frame):
                 break 
         dialog.Destroy()
 
+    def on_delete_credentials(self, event):
+        """Handle delete credentials request"""
+        logger.info("Credentials deletion requested")
+        
+        dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to delete your account.")
+
+        if dialog.ShowModal() == wx.ID_OK:
+            password = dialog.GetValue()
+            dialog.Destroy()
+
+            if self.task_manager.verify_password(password):
+                delete_dialog = DeleteCredentialsDialog(self)
+                if delete_dialog.ShowModal() == wx.ID_OK:
+                    try:
+                        # Attempt to delete account
+                        self.task_manager.credential_manager.delete_credentials()
+
+                        logger.info("Account deleted successfully")
+                        wx.MessageBox("Your credentials have been deleted.\nYou will now be logged out.", 
+                                      "Account Deleted", 
+                                      wx.OK | wx.ICON_INFORMATION)
+                        
+                        delete_dialog.Destroy()
+                        self.logout()
+
+                    except Exception as e:
+                        logger.error(f"Error deleting credentials: {e}")
+                        wx.MessageBox(f"Error deleting credentials: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                else:
+                    delete_dialog.Destroy()
+            else:
+                wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
+
+        else:
+            dialog.Destroy()
 
     def format_response(self, response):
         if isinstance(response, list):
@@ -2421,6 +2458,81 @@ class ChangePasswordDialog(wx.Dialog):
 
         panel.SetSizer(sizer)
         self.Center()
+
+class DeleteCredentialsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Delete Credentials")
+        self.InitUI()
+
+    def InitUI(self):
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Warning icon and text
+        warning_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        warning_bitmap = wx.ArtProvider.GetBitmap(wx.ART_WARNING, size=(32, 32))
+        warning_icon = wx.StaticBitmap(self, bitmap=warning_bitmap)
+        warning_sizer.Add(warning_icon, 0, wx.ALL, 5)
+
+        warning_text = (
+            "WARNING: This action cannot be undone!\n\n"
+            "• All local credentials will be deleted for this account.\n"
+            "• Your XRP wallet will remain on the XRPL but you will lose access\n"
+            "• Any PFT tokens in your wallet will become inaccessible\n\n"
+            "MAKE SURE YOU HAVE BACKED UP YOUR XRP SECRET KEY\n"
+            "BEFORE PROCEEDING!\n\n"
+        )
+
+        warning_label = wx.StaticText(self, label=warning_text)
+        warning_label.Wrap(400)
+        warning_sizer.Add(warning_label, 1, wx.ALL, 5)
+        main_sizer.Add(warning_sizer, 0, wx.EXPAND | wx.ALL, 10)
+
+        # Confirmation text input
+        confirm_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        confirm_label = wx.StaticText(self, label="Type DELETE to confirm:")
+        self.confirm_input = wx.TextCtrl(self)
+        
+        confirm_sizer.Add(confirm_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        confirm_sizer.Add(self.confirm_input, 1, wx.EXPAND, 10)
+        main_sizer.Add(confirm_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Buttons
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        warning_bitmap = wx.ArtProvider.GetBitmap(wx.ART_WARNING, size=(16, 16))
+        warning_icon = wx.StaticBitmap(self, bitmap=warning_bitmap)
+        self.delete_button = wx.Button(self, label="Delete Account")
+        cancel_button = wx.Button(self, label="Cancel")
+
+        button_sizer.Add(warning_icon, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        button_sizer.Add(self.delete_button, 1, wx.ALL, 5)
+        button_sizer.Add(cancel_button, 1, wx.ALL, 5)
+        main_sizer.Add(button_sizer, 0, wx.ALL | wx.EXPAND, 5)
+
+        self.SetSizer(main_sizer)
+
+        # Bind events
+        self.delete_button.Bind(wx.EVT_BUTTON, self.on_delete)
+        cancel_button.Bind(wx.EVT_BUTTON, self.on_cancel)
+        self.confirm_input.Bind(wx.EVT_TEXT, self.on_text_change)
+
+        # Initially disable delete button
+        self.delete_button.Enable(False)
+
+        # Set initial size
+        self.SetSize(self.GetBestSize())
+
+    def on_text_change(self, event):
+        """Enable delete button only when confirmation text matches exactly"""
+        self.delete_button.Enable(
+            self.confirm_input.GetValue() == "DELETE"
+        )
+
+    def on_delete(self, event):
+        self.EndModal(wx.ID_OK)
+
+    def on_cancel(self, event):
+        self.EndModal(wx.ID_CANCEL)
+
 
 class PreferencesDialog(wx.Dialog):
     def __init__(self, parent):
