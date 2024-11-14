@@ -2361,6 +2361,12 @@ class WalletApp(wx.Frame):
                 logger.debug("Clearing wallet")
                 self.wallet = None
 
+            # Clear grids
+            logger.debug("Clearing grids")
+            for grid in [self.summary_grid, self.proposals_grid, self.verification_grid, self.rewards_grid, self.memos_grid]:
+                if grid.GetNumberRows() > 0:
+                    grid.DeleteRows(0, grid.GetNumberRows())
+
             self.tabs.Hide()
 
             # Reset menu state
