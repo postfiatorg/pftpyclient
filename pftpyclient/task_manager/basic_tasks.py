@@ -28,13 +28,28 @@ from decimal import Decimal
 import hashlib
 import base64
 import brotli
-
+from pftpyclient.task_manager.wallet_state import (
+    WalletState, 
+    requires_wallet_state,
+    FUNDED_STATES,
+    TRUSTLINED_STATES,
+    INITIATED_STATES,
+    GOOGLE_DOC_SENT_STATES,
+    PFT_STATES
+)
+from pftpyclient.performance.monitor import PerformanceMonitor
+from pftpyclient.configuration.configuration import ConfigurationManager
 nest_asyncio.apply()
 
 MAX_CHUNK_SIZE = 760
 
+SAVE_MEMOS = False
+SAVE_TASKS = False
+
+AUTO_INITIALIZE = False
+
 class WalletInitiationFunctions:
-    def __init__(self, input_map, user_commitment=""):
+    def __init__(self, input_map, network_url, user_commitment=""):
         """
         input_map = {
             'Username_Input': Username,
@@ -44,43 +59,29 @@ class WalletInitiationFunctions:
             'XRP Secret_Input': XRP Secret,
         }
         """
-        self.mainnet_url="https://s2.ripple.com:51234"
+        self.network_url = network_url
         self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
         self.username = input_map['Username_Input']
-        self.google_doc_share_link = input_map['Google Doc Share Link_Input']
+        self.google_doc_share_link = input_map.get('Google Doc Share Link_Input', None)
         self.xrp_address = input_map['XRP Address_Input']
         self.wallet = xrpl.wallet.Wallet.from_seed(input_map['XRP Secret_Input'])
         self.user_commitment = user_commitment
         self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
 
     def get_xrp_balance(self):
-        return get_xrp_balance(self.mainnet_url, self.wallet.classic_address)
+        return get_xrp_balance(self.network_url, self.wallet.classic_address)
 
     def handle_trust_line(self):
-        return handle_trust_line(self.mainnet_url, self.pft_issuer, self.wallet)
+        return handle_trust_line(self.network_url, self.pft_issuer, self.wallet)
+    
+    def get_google_doc_text(self, share_link):
+        return get_google_doc_text(share_link)
 
-    def get_google_doc_text(self,share_link):
-        """ Gets the Google Doc Text """ 
-        # Extract the document ID from the share link
-        doc_id = share_link.split('/')[5]
-    
-        # Construct the Google Docs API URL
-        url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
-    
-        # Send a GET request to the API URL
-        response = requests.get(url)
-    
-        # Check if the request was successful
-        if response.status_code == 200:
-            # Return the plain text content of the document
-            return response.text
-        else:
-            # Return an error message if the request was unsuccessful
-            return f"Failed to retrieve the document. Status code: {response.status_code}"
-
+    @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('send_initiation_rite')
     def send_initiation_rite(self):
         memo = construct_initiation_rite_memo(user=self.username, commitment=self.user_commitment)
-        return send_xrp(mainnet_url=self.mainnet_url,
+        return send_xrp(network_url=self.network_url,
                         wallet=self.wallet, 
                         amount=1, 
                         destination=self.default_node, 
@@ -88,7 +89,7 @@ class WalletInitiationFunctions:
 
     def get_account_info(self, accountId):
         """get_account_info"""
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+        client = xrpl.clients.JsonRpcClient(self.network_url)
         acct_info = xrpl.models.requests.account_info.AccountInfo(
             account=accountId,
             ledger_index="validated"
@@ -114,31 +115,12 @@ class WalletInitiationFunctions:
             raise GoogleDocIsNotSharedException(self.google_doc_share_link)
         
         # Check 4: google doc contains the correct XRP address at the top
-        if self.retrieve_xrp_address_from_google_doc(google_doc_text) != self.xrp_address:
+        if retrieve_xrp_address_from_google_doc(google_doc_text) != self.xrp_address:
             raise GoogleDocDoesNotContainXrpAddressException(self.xrp_address)
         
         # Check 5: XRP address has a balance
         if self.get_xrp_balance() == 0:
             raise GoogleDocIsNotFundedException(self.google_doc_share_link)
-
-    @staticmethod
-    def retrieve_xrp_address_from_google_doc(google_doc_text):
-        """ Retreives the XRP address from the google doc """
-        # Split the text into lines
-        lines = google_doc_text.split('\n')      
-
-        # Regular expression for XRP address
-        xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
-
-        wallet_at_front_of_doc = None
-        # look through the first 5 lines for an XRP address
-        for line in lines[:5]:
-            match = re.search(xrp_address_pattern, line)
-            if match:
-                wallet_at_front_of_doc = match.group()
-                break
-
-        return wallet_at_front_of_doc
     
     @staticmethod
     def cache_credentials(input_map):
@@ -147,68 +129,143 @@ class WalletInitiationFunctions:
 
 class PostFiatTaskManager:
     
-    def __init__(self,username,password):
+    def __init__(self, username, password, network_url, config: ConfigurationManager):
         self.credential_manager=CredentialManager(username,password)
         self.pw_map = self.credential_manager.decrypt_creds(self.credential_manager.pw_initiator)
-        self.mainnet_url= "https://s2.ripple.com:51234"
+        self.network_url= network_url
         self.treasury_wallet_address = 'r46SUhCzyGE4KwBnKQ6LmDmJcECCqdKy4q'
         self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
         self.trust_line_default = '100000000'
-        self.user_wallet = self.spawn_user_wallet()
-        self.google_doc_link = self.pw_map[self.credential_manager.google_doc_name]
-        
-        # TODO: Find a use for this or delete
-        # self.user_google_doc = self.pw_map[self.credential_manager.google_doc_name]
-
-        self.tx_history_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.csv")
-
         self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
+        self.user_wallet = self.spawn_user_wallet()
+        self.google_doc_link = self.pw_map.get(self.credential_manager.google_doc_name, None)
 
+        self.config = config
+
+        file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
+
+        # initialize dataframes
+        self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.{file_extension}")
+        self.memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.{file_extension}")  # only used for debugging
+        self.tasks_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.{file_extension}")  # only used for debugging
         self.transactions = pd.DataFrame()
         self.memos = pd.DataFrame()
         self.tasks = pd.DataFrame()
 
+        # Initialize client for blockchain queries
+        self.client = xrpl.clients.JsonRpcClient(self.network_url)
+        
+        # Initialize transactions
         self.sync_transactions()
 
-        # for debugging purposes only
-        self.memos_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.csv")
-        self.tasks_csv_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.csv")
-        self.save_memos_to_csv()
-        self.save_tasks_to_csv()
-
-        # CHECKS
-        # checks if the user has a trust line to the PFT token, and creates one if not
-        self.handle_trust_line()
-
-        # check if the user has sent a genesis to the node, and sends one if not
-        self.handle_genesis()
-
-        # TODO: Prompt user for google doc through the UI, not through the code
-        # check if the user has sent a google doc to the node, and sends one if not
-        self.handle_google_doc()
+        # Initialize wallet state based on account status
+        self.wallet_state = self.determine_wallet_state()
+        
+        if AUTO_INITIALIZE:
+            self.handle_trust_line()
+            self.handle_google_doc()
+            self.handle_genesis()
 
     def get_xrp_balance(self):
-        return get_xrp_balance(self.mainnet_url, self.user_wallet.classic_address)
+        return get_xrp_balance(self.network_url, self.user_wallet.classic_address)
+    
+    def determine_wallet_state(self):
+        """Determine the current state of the wallet based on blockhain"""
+        logger.debug(f"Determining wallet state for {self.user_wallet.classic_address}")
+        client = xrpl.clients.JsonRpcClient(self.network_url)
+        wallet_state = WalletState.UNFUNDED
+        try:
+            # Check if account exists on XRPL
+            response = client.request(
+                xrpl.models.requests.AccountInfo(
+                    account=self.user_wallet.classic_address,
+                    ledger_index="validated"
+                )
+            )
 
-    ## GENERIC UTILITY FUNCTIONS 
+            if response.is_successful() and 'account_data' in response.result:
+                balance = int(response.result['account_data']['Balance'])
+                if balance > 0:
+                    wallet_state = WalletState.FUNDED
+                    if self.has_trust_line():
+                        wallet_state = WalletState.TRUSTLINED
+                        if self.initiation_rite_sent():
+                            wallet_state = WalletState.INITIATED
+                            if self.google_doc_sent():
+                                wallet_state = WalletState.GOOGLE_DOC_SENT
+                                if self.genesis_sent():
+                                    wallet_state = WalletState.ACTIVE
+            else:
+                logger.warning(f"Account {self.user_wallet.classic_address} does not exist on XRPL")
 
-    def save_dataframe_to_csv(self, df, filepath, description):
+            return wallet_state
+        
+        except xrpl.clients.XRPLRequestFailureException as e:
+            logger.error(f"Error determining wallet state: {e}")
+            return wallet_state
+        
+    def get_required_action(self):
+        """Returns the next required action to take to unlock the wallet"""
+        match self.wallet_state:
+            case WalletState.UNFUNDED:
+                return "Fund wallet with XRP"
+            case WalletState.FUNDED:
+                return "Set PFT trust line"
+            case WalletState.TRUSTLINED:
+                return "Send initiation rite"
+            case WalletState.INITIATED:
+                return "Send google doc link"
+            case WalletState.GOOGLE_DOC_SENT:
+                return "Send genesis"
+            case WalletState.ACTIVE:
+                return "No action required, Wallet is fully initialized"
+            case _:
+                return "Unknown wallet state"
+
+    def has_trust_line(self):
+        """Checks if the user has a trust line"""
+        logger.debug(f"Checking if user has a trust line")
+        return has_trust_line(self.network_url, self.pft_issuer, self.user_wallet)
+        
+    @requires_wallet_state(TRUSTLINED_STATES)
+    def send_initiation_rite(self, commitment):
+        memo = construct_initiation_rite_memo(user=self.credential_manager.postfiat_username, commitment=commitment)
+        return send_xrp(network_url=self.network_url,
+                        wallet=self.user_wallet, 
+                        amount=1, 
+                        destination=self.default_node, 
+                        memo=memo)
+
+    def save_dataframe(self, df, filepath, description):
         """
-        Generic method to save a dataframe to a CSV file with error handling and logging
+        Generic method to save a dataframe with error handling and logging
         
         :param dataframe: pandas Dataframe to save
-        :param filepath: str, path to the CSV file
+        :param filepath: str, path to the file (will adjust extension based on format)
         :param description: str, description of the data being saved (i.e. "transactions" or "memos")
         """
         try:
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-            # save to a temporary file first, and then replace the existing file if successful
-            temp_filepath = f"{filepath}.tmp"
-            df.to_csv(temp_filepath, index=False)
-            os.replace(temp_filepath, filepath)
+            # Get base path without extension
+            base_path = os.path.splitext(filepath)[0]
 
-            logger.info(f"Successfully saved {description} to {filepath}")
+            # Determine format from preferences
+            format_type = self.config.get_global_config('transaction_cache_format')
+
+            if format_type == 'pickle':
+                final_path = f"{base_path}.pkl"
+                temp_path = f"{final_path}.tmp"
+                df.to_pickle(temp_path)
+            else:
+                final_path = f"{base_path}.csv"
+                temp_path = f"{final_path}.tmp"
+                df.to_csv(temp_path, index=False)
+
+            # Rplace existing file if save was successful
+            os.replace(temp_path, final_path)
+            logger.info(f"Successfully saved {description} to {final_path}")
+
         except PermissionError:
             logger.error(f"Permission denied when trying to save {description} to {filepath}")
         except IOError as e:
@@ -218,28 +275,43 @@ class PostFiatTaskManager:
         except Exception as e:
             logger.error(f"Unexpected error saving {description} to {filepath}: {e}")
 
-    def save_transactions_to_csv(self):
-        self.save_dataframe_to_csv(self.transactions, self.tx_history_csv_filepath, "transactions")
+    @PerformanceMonitor.measure('save_transactions')
+    def save_transactions(self):
+        self.save_dataframe(self.transactions, self.tx_history_filepath, "transactions")
 
-    def save_memos_to_csv(self):
-        self.save_dataframe_to_csv(self.memos, self.memos_csv_filepath, "memos")
+    @PerformanceMonitor.measure('save_memos')
+    def save_memos(self):
+        self.save_dataframe(self.memos, self.memos_filepath, "memos")
 
-    def save_tasks_to_csv(self):
-        self.save_dataframe_to_csv(self.tasks, self.tasks_csv_filepath, "tasks")
+    @PerformanceMonitor.measure('save_tasks')
+    def save_tasks(self):
+        self.save_dataframe(self.tasks, self.tasks_filepath, "tasks")
 
-    def load_transactions_from_csv(self):
-        """ Loads the transactions from the CSV file into a dataframe, and deserializes some columns"""
+    @PerformanceMonitor.measure('load_transactions')
+    def load_transactions(self):
+        """ Loads the transactions from file into a dataframe, and deserializes some columns"""
         tx_df = None
-        file_path = self.tx_history_csv_filepath
+        base_path = os.path.splitext(self.tx_history_filepath)[0]
+        format_type = self.config.get_global_config('transaction_cache_format')
+        
+        # Determine which file to try loading
+        if format_type == 'pickle':
+            file_path = f"{base_path}.pkl"
+        else:
+            file_path = f"{base_path}.csv"
+
         if os.path.exists(file_path):
             logger.debug(f"Loading transactions from {file_path}")
             try:
-                tx_df = pd.read_csv(file_path)
+                if format_type == 'pickle':
+                    tx_df = pd.read_pickle(file_path)
+                else:
+                    tx_df = pd.read_csv(file_path)
 
-                # deserialize columns
-                for col in ['meta', 'tx_json']:
-                    if col in tx_df.columns:
-                        tx_df[col] = tx_df[col].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else x)
+                    # deserialize columns for CSV
+                    for col in ['meta', 'tx_json']:
+                        if col in tx_df.columns:
+                            tx_df[col] = tx_df[col].apply(lambda x: ast.literal_eval(x) if pd.notna(x) else x)
 
             except pd.errors.EmptyDataError:
                 logger.warning(f"The file {file_path} is empty. Creating a new DataFrame.")
@@ -254,9 +326,10 @@ class PostFiatTaskManager:
             else:
                 return tx_df
 
-        logger.warning(f"No existing transaction history file found at {self.tx_history_csv_filepath}")
+        logger.warning(f"No existing transaction history file found at {self.tx_history_filepath}")
         return pd.DataFrame() # empty dataframe if file does not exist
     
+    @PerformanceMonitor.measure('get_new_transactions')
     def get_new_transactions(self, last_known_ledger_index):
         """Retrieves new transactions from the node after the last known transaction date"""
         logger.debug(f"Getting new transactions after ledger index {last_known_ledger_index}")
@@ -267,34 +340,57 @@ class PostFiatTaskManager:
             limit=1000  # adjust as needed
         )
 
-    def sync_transactions(self):
+    @PerformanceMonitor.measure('sync_transactions')
+    def sync_transactions(self) -> bool:
         """ Checks for new transactions and caches them locally. Also triggers memo update"""
         logger.debug("Updating transactions")
 
+        # Check if account exists and is funded before proceeding
+        try:
+            response = self.client.request(
+                xrpl.models.requests.AccountInfo(
+                    account=self.user_wallet.classic_address,
+                    ledger_index="validated"
+                )
+            )
+            if not response.is_successful():
+                logger.debug("Account not found or not funded, skipping transaction sync")
+                return
+        except Exception as e:
+            logger.error(f"Error checking account status: {e}")
+            return
+
         # Attempt to load transactions from local csv
         if self.transactions.empty: 
-            new_tx_df = self.load_transactions_from_csv()
+            loaded_tx_df = self.load_transactions()
+            if not loaded_tx_df.empty:
+                logger.debug(f"Loaded {len(loaded_tx_df)} transactions from {self.tx_history_filepath}")
+                self.transactions = loaded_tx_df
+                self.sync_memos(loaded_tx_df)
 
         # Choose ledger index to start sync from
         if self.transactions.empty:
-            last_known_ledger_index = -1
+            next_ledger_index = -1
         else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
-            last_known_ledger_index = self.transactions['ledger_index'].max() + 1
-            logger.debug(f"Last known ledger index: {last_known_ledger_index}")
+            next_ledger_index = self.transactions['ledger_index'].max() + 1
+            logger.debug(f"Next ledger index: {next_ledger_index}")
 
         # fetch new transactions from the node
-        new_tx_list = self.get_new_transactions(last_known_ledger_index)
+        new_tx_list = self.get_new_transactions(next_ledger_index)
 
         # Add new transactions to the dataframe
         if new_tx_list:
             logger.debug(f"Adding {len(new_tx_list)} new transactions...")
             new_tx_df = pd.DataFrame(new_tx_list)
             self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
-            self.save_transactions_to_csv()
+            self.save_transactions()
             self.sync_memos(new_tx_df)
+            return True
         else:
             logger.debug("No new transactions found. Finished updating local tx history")
-        
+            return False
+
+    @PerformanceMonitor.measure('sync_memos')
     def sync_memos(self, new_tx_df):
         """ Updates the memos dataframe with new memos from the new transactions. Memos are serialized into dicts"""
         # flag rows with memos
@@ -332,8 +428,13 @@ class PostFiatTaskManager:
 
         logger.debug(f"Added {len(new_memo_df)} memos to local memos dataframe")
 
+        # for debugging purposes only
+        if SAVE_MEMOS:
+            self.save_memos()
+
         self.sync_tasks(new_memo_df)
 
+    @PerformanceMonitor.measure('sync_tasks')
     def sync_tasks(self, new_memo_df):
         """ Updates the tasks dataframe with new tasks from the new memos.
         Task dataframe contains columns: user,task_id,full_output,hash,node_account,datetime,task_type"""
@@ -358,6 +459,10 @@ class PostFiatTaskManager:
 
             # Concatenate new tasks to existing tasks and drop duplicates
             self.tasks = pd.concat([self.tasks, new_task_df], ignore_index=True).drop_duplicates(subset=['hash'])
+
+            # for debugging purposes only
+            if SAVE_TASKS:
+                self.save_tasks()
         else:
             logger.debug("No new tasks to sync")
 
@@ -407,8 +512,9 @@ class PostFiatTaskManager:
         output = output.replace(' ',"_")
         return output
     
+    @PerformanceMonitor.measure('send_xrp')
     def send_xrp(self, amount, destination, memo=""):
-        return send_xrp(self.mainnet_url, self.user_wallet, amount, destination, memo)
+        return send_xrp(self.network_url, self.user_wallet, amount, destination, memo)
 
     def convert_memo_dict(self, memo_dict):
         """Constructs a memo object with user, task_id, and full_output from hex-encoded values."""
@@ -422,7 +528,6 @@ class PostFiatTaskManager:
             key: self.hex_to_text(memo_dict.get(value, ''))
             for key, value in fields.items()
         }
-    ## BLOCKCHAIN FUNCTIONS
 
     def spawn_user_wallet(self):
         """ This takes the credential manager and loads the wallet from the
@@ -431,9 +536,11 @@ class PostFiatTaskManager:
         live_wallet = xrpl.wallet.Wallet.from_seed(seed)
         return live_wallet
 
+    @requires_wallet_state(FUNDED_STATES)
     def handle_trust_line(self):
-        handle_trust_line(self.mainnet_url, self.pft_issuer, self.user_wallet)
+        handle_trust_line(self.network_url, self.pft_issuer, self.user_wallet)
 
+    @PerformanceMonitor.measure('send_pft')
     def send_pft(self, amount, destination, memo=""):
         """ Sends PFT tokens to a destination address with optional memo. 
         If the memo is over 1 KB, it is split into multiple memos and response will be a list of responses"""
@@ -461,7 +568,7 @@ class PostFiatTaskManager:
 
     def _send_pft_single(self, amount, destination, memo):
         """Helper method to send a single PFT transaction"""
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+        client = xrpl.clients.JsonRpcClient(self.network_url)
 
         # Handle memo
         if isinstance(memo, Memo):
@@ -503,6 +610,7 @@ class PostFiatTaskManager:
 
         return response
     
+    @PerformanceMonitor.measure('send_memo')
     def send_memo(self, destination, memo: str, compress=True):
         """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE"""
 
@@ -539,7 +647,7 @@ class PostFiatTaskManager:
     
     def _send_memo_single(self, destination, memo):
         """ Sends a memo to a destination. """
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+        client = xrpl.clients.JsonRpcClient(self.network_url)
 
         # Handle memo 
         if isinstance(memo, Memo):
@@ -597,7 +705,7 @@ class PostFiatTaskManager:
                                     ledger_index_min=-1,
                                     ledger_index_max=-1, 
                                     limit=10):
-            client = xrpl.clients.JsonRpcClient(self.mainnet_url) # Using a public server; adjust as necessary
+            client = xrpl.clients.JsonRpcClient(self.network_url) # Using a public server; adjust as necessary
         
             request = AccountTx(
                 account=account_address,
@@ -621,7 +729,7 @@ class PostFiatTaskManager:
                                 limit=10
                                 ):
         logger.debug(f"Getting transactions for account {account_address} with ledger index min {ledger_index_min} and max {ledger_index_max} and limit {limit}")
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+        client = xrpl.clients.JsonRpcClient(self.network_url)
         all_transactions = []
         marker = None
         previous_marker = None
@@ -692,7 +800,7 @@ class PostFiatTaskManager:
                                 max_attempts=3,
                                 retry_delay=.2):
 
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)  # Using a public server; adjust as necessary
+        client = xrpl.clients.JsonRpcClient(self.network_url)  # Using a public server; adjust as necessary
         all_transactions = []  # List to store all transactions
 
         # Fetch transactions using marker pagination
@@ -797,24 +905,39 @@ class PostFiatTaskManager:
    
         return node_output_df[node_output_df['valid_task_id']>0]
     
+    def get_user_initiation_rites_destinations(self):
+        """Returns all the addresses that have received a user initiation rite"""
+        all_user_initiation_rites = self.memos[self.memos['memo_data'].apply(lambda x: x.get('task_id') == 'INITIATION_RITE')]
+        return list(all_user_initiation_rites['destination'])
+    
+    def initiation_rite_sent(self):
+        logger.debug("Checking if user has sent initiation rite...")
+
+        # Check if memos dataframe is empty or missing required columns
+        if self.memos.empty or not all(col in self.memos.columns for col in ['destination', 'memo_data']):
+            logger.debug("Memos dataframe is empty or missing required columns, returning False")
+            return False
+
+        user_initiation_rites_destinations = self.get_user_initiation_rites_destinations()
+        return self.default_node in user_initiation_rites_destinations
+
     def get_user_genesis_destinations(self):
         """ Returns all the addresses that have received a user genesis transaction"""
-        all_user_genesis_transactions = self.memos[self.memos['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
-        all_user_genesis_destinations = list(all_user_genesis_transactions['destination'])
-        return {'destinations': all_user_genesis_destinations, 'raw_details': all_user_genesis_transactions}
+        all_user_genesis = self.memos[self.memos['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
+        return list(all_user_genesis['destination'])
+
+    def genesis_sent(self):
+        user_genesis_destinations = self.get_user_genesis_destinations()
+        return self.default_node in user_genesis_destinations
     
+    @requires_wallet_state(INITIATED_STATES)
     def handle_genesis(self):
         """ Checks if the user has sent a genesis to the node, and sends one if not """
         if not self.genesis_sent():
-            logger.debug("User has not sent genesis...")
+            logger.debug("Genesis not found amongst outgoing memos.")
             self.send_genesis()
         else:
             logger.debug("User has already sent genesis, skipping...")
-
-    def genesis_sent(self):
-        logger.debug("Checking if user has sent genesis...")
-        user_genesis = self.get_user_genesis_destinations()
-        return self.default_node in user_genesis['destinations']
     
     def send_genesis(self):
         """ Sends a user genesis transaction to the default node 
@@ -828,17 +951,70 @@ class PostFiatTaskManager:
         )
         self.send_pft(amount=7, destination=self.default_node, memo=genesis_memo)
 
+    def check_if_google_doc_is_valid(self, google_doc_link):
+        """ Checks if the google doc is valid by """
+
+        # Check 1: google doc is a valid url
+        if not google_doc_link.startswith('https://docs.google.com/document/d/'):
+            raise InvalidGoogleDocException(google_doc_link)
+        
+        google_doc_text = get_google_doc_text(google_doc_link)
+
+        # Check 2: google doc exists
+        if google_doc_text == "Failed to retrieve the document. Status code: 404":
+            raise GoogleDocNotFoundException(google_doc_link)
+
+        # Check 3: google doc is shared
+        if google_doc_text == "Failed to retrieve the document. Status code: 401":
+            raise GoogleDocIsNotSharedException(google_doc_link)
+        
+        # Check 4: google doc contains the correct XRP address at the top
+        if retrieve_xrp_address_from_google_doc(google_doc_text) != self.user_wallet.classic_address:
+            raise GoogleDocDoesNotContainXrpAddressException(self.user_wallet.classic_address)
+        
+        # Check 5: XRP address has a balance
+        if self.get_xrp_balance() == 0:
+            raise GoogleDocIsNotFundedException(google_doc_link)    
+    
+    def google_doc_sent(self):
+        """Checks if the user has sent a google doc context link"""
+        return self.get_latest_outgoing_context_doc_link() is not None
+    
+    @requires_wallet_state(INITIATED_STATES)
+    def handle_google_doc_setup(self, google_doc_link):
+        """Validates, caches, and sends the Google Doc link"""
+        logger.info("Setting up Google Doc...")
+
+        # Validate the Google Doc
+        self.check_if_google_doc_is_valid(google_doc_link)
+        
+        # Cache the Google Doc link
+        try:
+            self.credential_manager.enter_and_encrypt_credential(
+                credentials_dict={
+                    f'{self.credential_manager.postfiat_username}__googledoc': google_doc_link
+                }
+            )
+            self.google_doc_link = google_doc_link
+        except Exception as e:
+            logger.error(f"Error caching Google Doc link: {e}")
+            return
+        
+        # Send the Google Doc link to the node
+        self.handle_google_doc()
+    
+    @requires_wallet_state(INITIATED_STATES)
     def handle_google_doc(self):
         """Checks for google doc and prompts user to send if not found"""
-        logger.debug("Checking if Google Doc context link has already been sent...")
+        if self.google_doc_link is None:
+            logger.warning("Google Doc link not found in credentials")
+            return
 
-        link = self.get_latest_outgoing_context_doc_link()
-
-        if link:
-            logger.debug(f"Google Doc already sent: {link}")
-        else:
+        if not self.google_doc_sent():
             logger.debug("Google Doc context link not found amongst outgoing memos.")
             self.send_google_doc()
+        else:
+            logger.debug("User has already sent a Google Doc context link, skipping...")
     
     def send_google_doc(self):
         """ Sends the Google Doc context link to the node """
@@ -848,6 +1024,8 @@ class PostFiatTaskManager:
         self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
         logger.debug("Google Doc context link sent.")
 
+    @requires_wallet_state(WalletState.ACTIVE)
+    @PerformanceMonitor.measure('get_proposals_df')
     def get_proposals_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
@@ -893,6 +1071,8 @@ class PostFiatTaskManager:
 
         return result_df
     
+    @requires_wallet_state(WalletState.ACTIVE)
+    @PerformanceMonitor.measure('get_verification_df')
     def get_verification_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
@@ -926,6 +1106,8 @@ class PostFiatTaskManager:
 
         return result_df
     
+    @requires_wallet_state(WalletState.ACTIVE)
+    @PerformanceMonitor.measure('get_rewards_df')
     def get_rewards_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
 
@@ -972,12 +1154,18 @@ class PostFiatTaskManager:
 
         return result_df
     
+    @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('get_memos_df')
     def get_memos_df(self):
 
         def remove_chunks(text):
             # Use regular expression to remove all occurrences of chunk_1__, chunk_2__, etc.
             cleaned_text = re.sub(r'chunk_\d+__', '', text)
             return cleaned_text
+        
+        if self.tasks is None or self.tasks.empty or "task_type" not in self.tasks.columns:
+            logger.debug("No self.tasks found to get memos from, returning empty dataframe")
+            return pd.DataFrame()
 
         # Filter tasks with task_type in ['MEMO']
         chunked_memos = self.tasks[self.tasks['task_type'].isin(['MEMO'])].copy()
@@ -1007,6 +1195,7 @@ class PostFiatTaskManager:
         
         return memos
 
+    @PerformanceMonitor.measure('send_acceptance_for_task_id')
     def send_acceptance_for_task_id(self, task_id, acceptance_string):
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
@@ -1025,6 +1214,7 @@ class PostFiatTaskManager:
         logger.debug(f"send_acceptance_for_task_id response: {response}")
         return response
 
+    @PerformanceMonitor.measure('send_refusal_for_task')
     def send_refusal_for_task(self, task_id, refusal_reason):
         # TODO - rewrite this to use the get_task and get_task_state methods
         """ 
@@ -1061,6 +1251,7 @@ class PostFiatTaskManager:
         logger.debug(f"send_refusal_for_task response: {response}")
         return response
 
+    @PerformanceMonitor.measure('request_post_fiat')
     def request_post_fiat(self, request_message ):
         """ 
         This requests a task known as a Post Fiat from the default node you are on
@@ -1090,6 +1281,7 @@ class PostFiatTaskManager:
         logger.debug(f"request_post_fiat response: {response}")
         return response
 
+    @PerformanceMonitor.measure('submit_initial_completion')
     def submit_initial_completion(self, completion_string, task_id):
         """
         This function sends an initial completion for a given task back to a node.
@@ -1118,6 +1310,7 @@ class PostFiatTaskManager:
         logger.debug(f"submit_initial_completion Response: {response}")
         return response
         
+    @PerformanceMonitor.measure('send_verification_response')
     def send_verification_response(self, response_string, task_id):
         """
         This function sends a verification response for a given task back to a node.
@@ -1149,7 +1342,7 @@ class PostFiatTaskManager:
     ## WALLET UX POPULATION 
     def ux__1_get_user_pft_balance(self):
         """Returns the balance of PFT for the user."""
-        client = xrpl.clients.JsonRpcClient(self.mainnet_url)
+        client = xrpl.clients.JsonRpcClient(self.network_url)
         account_lines = xrpl.models.requests.AccountLines(
             account=self.user_wallet.classic_address,
             ledger_index="validated"
@@ -1161,7 +1354,10 @@ class PostFiatTaskManager:
                 return float(line['balance'])
         return 0.0
 
+    @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('process_account_info')
     def process_account_info(self):
+        logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
         # Slicing data based on conditions
         google_doc_slice = self.memos[self.memos['memo_data'].apply(lambda x: 
@@ -1251,6 +1447,7 @@ class PostFiatTaskManager:
         output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
         return output_string
 
+    @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
         pomodoro_id = task_id.replace('__','==')
         memo_to_send = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username,
@@ -1263,6 +1460,24 @@ class PostFiatTaskManager:
         pomodoros_only = task_id_only[task_id_only['memo_data'].apply(lambda x: '==' in x['task_id'])].copy()
         pomodoros_only['parent_task_id']=pomodoros_only['memo_data'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
+    
+    def verify_password(self, password):
+        """
+        Verify if the provided password is correct by attempting to decrypt credentials
+
+        Args: 
+            password (str): The password to verify
+
+        Returns:
+            bool: True if the password is correct, False otherwise
+        """
+        try: 
+            # Attempt to decrypt credentials with provided password
+            self.credential_manager.decrypt_creds(password)
+            return True
+        except Exception as e:
+            logger.error(f"Password verification failed: {e}")
+            return False
     
 def is_over_1kb(string):
     # 1KB = 1024 bytes
@@ -1294,8 +1509,8 @@ def construct_memo(user, memo_type, memo_data):
         memo_format=to_hex(user)
     )
 
-def get_xrp_balance(mainnet_url, address):
-    client = xrpl.clients.JsonRpcClient(mainnet_url)
+def get_xrp_balance(network_url, address):
+    client = xrpl.clients.JsonRpcClient(network_url)
     account_info = xrpl.models.requests.account_info.AccountInfo(
         account=address,
         ledger_index="validated"
@@ -1315,8 +1530,8 @@ def get_xrp_balance(mainnet_url, address):
         logger.error(f"Exception when fetching XRP balance: {e}")
         return None
 
-def send_xrp(mainnet_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=""):
-    client = xrpl.clients.JsonRpcClient(mainnet_url)
+def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=""):
+    client = xrpl.clients.JsonRpcClient(network_url)
 
     logger.debug(f"Sending {amount} XRP to {destination} with memo {memo}")
 
@@ -1393,48 +1608,54 @@ def is_pft_transaction(tx) -> bool:
     deliver_max = tx.get('DeliverMax', {})
     return isinstance(deliver_max, dict) and deliver_max.get('currency') == 'PFT'
 
-def get_pft_holder_df(mainnet_url, pft_issuer):
+def get_pft_holder_df(network_url, pft_issuer):
     """ This function outputs a detail of all accounts holding PFT tokens
     with a float of their balances as pft_holdings. note this is from
     the view of the issuer account so balances appear negative so the pft_holdings 
     are reverse signed.
     """
-    client = xrpl.clients.JsonRpcClient(mainnet_url)
+    client = xrpl.clients.JsonRpcClient(network_url)
     logger.debug("Getting dataframe of all accounts holding PFT tokens...")
     response = client.request(xrpl.models.requests.AccountLines(
         account=pft_issuer,
         ledger_index="validated",
         peer=None,
         limit=None))
+    if not response.is_successful():
+        raise Exception(f"Error fetching PFT holders: {response.result.get('error')}")
     full_post_fiat_holder_df = pd.DataFrame(response.result)
     for xfield in ['account','balance','currency','limit_peer']:
         full_post_fiat_holder_df[xfield] = full_post_fiat_holder_df['lines'].apply(lambda x: x[xfield])
     full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
     return full_post_fiat_holder_df
     
-def has_trust_line(mainnet_url, pft_issuer, wallet):
+def has_trust_line(network_url, pft_issuer, wallet):
     """ This function checks if the user has a trust line to the PFT token"""
-    pft_holders = get_pft_holder_df(mainnet_url, pft_issuer)
-    existing_pft_accounts = list(pft_holders['account'])
-    user_is_in_pft_accounts = wallet.address in existing_pft_accounts
-    return user_is_in_pft_accounts
+    try:
+        pft_holders = get_pft_holder_df(network_url, pft_issuer)
+        existing_pft_accounts = list(pft_holders['account'])
+        user_is_in_pft_accounts = wallet.address in existing_pft_accounts
+        return user_is_in_pft_accounts
+    except Exception as e:
+        logger.error(f"Error checking if user has a trust line: {e}")
+        return False
 
-def handle_trust_line(mainnet_url, pft_issuer, wallet):
+def handle_trust_line(network_url, pft_issuer, wallet):
     """ This function checks if the user has a trust line to the PFT token
     and if not establishes one"""
     logger.debug("Checking if trust line exists...")
-    if not has_trust_line(mainnet_url, pft_issuer, wallet):
-        _ = generate_trust_line_to_pft_token(mainnet_url, wallet)
+    if not has_trust_line(network_url, pft_issuer, wallet):
+        _ = generate_trust_line_to_pft_token(network_url, wallet)
         logger.debug("Trust line created")
     else:
         logger.debug("Trust line already exists")
 
-def generate_trust_line_to_pft_token(mainnet_url, wallet: xrpl.wallet.Wallet):
+def generate_trust_line_to_pft_token(network_url, wallet: xrpl.wallet.Wallet):
     """ Note this transaction consumes XRP to create a trust
     line for the PFT Token so the holder DF should be checked 
     before this is run
     """ 
-    client = xrpl.clients.JsonRpcClient(mainnet_url)
+    client = xrpl.clients.JsonRpcClient(network_url)
     trust_set_tx = xrpl.models.transactions.TrustSet(
         account=wallet.address,
         limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
@@ -1495,6 +1716,43 @@ def decompress_string(compressed_string):
         return decompressed_string
     except (binascii.Error, brotli.error, UnicodeDecodeError) as e:
         raise ValueError(f"Decompression failed: {e}")
+    
+def get_google_doc_text(share_link):
+    """ Gets the Google Doc Text """ 
+    # Extract the document ID from the share link
+    doc_id = share_link.split('/')[5]
+
+    # Construct the Google Docs API URL
+    url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+
+    # Send a GET request to the API URL
+    response = requests.get(url)
+
+    # Check if the request was successful
+    if response.status_code == 200:
+        # Return the plain text content of the document
+        return response.text
+    else:
+        # Return an error message if the request was unsuccessful
+        return f"Failed to retrieve the document. Status code: {response.status_code}"
+    
+def retrieve_xrp_address_from_google_doc(google_doc_text):
+    """ Retreives the XRP address from the google doc """
+    # Split the text into lines
+    lines = google_doc_text.split('\n')      
+
+    # Regular expression for XRP address
+    xrp_address_pattern = r'r[1-9A-HJ-NP-Za-km-z]{25,34}'
+
+    wallet_at_front_of_doc = None
+    # look through the first 5 lines for an XRP address
+    for line in lines[:5]:
+        match = re.search(xrp_address_pattern, line)
+        if match:
+            wallet_at_front_of_doc = match.group()
+            break
+
+    return wallet_at_front_of_doc
 
 class GoogleDocNotFoundException(Exception):
     """ This exception is raised when the Google Doc is not found """

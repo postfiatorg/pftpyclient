@@ -3,6 +3,7 @@ import getpass
 from pftpyclient.basic_utilities.settings import *
 from cryptography.fernet import InvalidToken
 from loguru import logger
+import shutil
 
 CREDENTIAL_FILENAME = "manyasone_cred_list.txt"
 
@@ -31,10 +32,139 @@ class CredentialManager:
         decrypted_cred_map = {
             self.wallet_address_name: pwl.password_decrypt(token=encrypted_cred_map[self.wallet_address_name], password=pw_decryptor).decode('utf-8'),
             self.wallet_secret_name: pwl.password_decrypt(token=encrypted_cred_map[self.wallet_secret_name], password=pw_decryptor).decode('utf-8'),
-            self.google_doc_name: pwl.password_decrypt(token=encrypted_cred_map[self.google_doc_name], password=pw_decryptor).decode('utf-8')
         }
+
+        # Only add google_doc_name if it exists in the encrypted_cred_map
+        if self.google_doc_name in encrypted_cred_map:
+            decrypted_cred_map[self.google_doc_name] = pwl.password_decrypt(
+                token=encrypted_cred_map[self.google_doc_name], 
+                password=pw_decryptor
+            ).decode('utf-8')
         
         return decrypted_cred_map 
+    
+    def enter_and_encrypt_credential(self, credentials_dict):
+        """Encryps and stores multiple credentials"""
+        enter_and_encrypt_credential(credentials_dict=credentials_dict, pw_encryptor=self.pw_initiator)
+
+    def change_password(self, current_password, new_password):
+        """Change the encryption password for the current user's credentials"""
+        # Verify current password
+        try:
+            current_creds = self.decrypt_creds(current_password)
+        except InvalidToken:
+            return ValueError("Current password is incorrect")
+        
+        # Create backup
+        backup_path = self.credential_file_path.with_suffix('.txt_backup')
+        shutil.copy2(self.credential_file_path, backup_path)
+
+        try:
+            # Get all existing credentials
+            existing_cred_map = _get_cred_map()
+
+            # Prepare new credentials for current user
+            new_creds = []
+            for key in self.key_variables:
+                if key in current_creds:
+                    credential_byte_str = pwl.password_encrypt(
+                        message=bytes(current_creds[key], 'utf-8'), 
+                        password=new_password
+                    )
+                    new_creds.append(f'\nvariable___{key}\n{credential_byte_str}')
+
+            # Write updated credential file
+            with open(self.credential_file_path, 'w') as f:
+                # Write credentials for other users (unchanged)
+                for key, value in existing_cred_map.items():
+                    if key not in self.key_variables:
+                        f.write(f'\nvariable___{key}\n{value}')
+                # Write new credentials for current user
+                f.write(''.join(new_creds))
+
+            # Update instance password
+            self.pw_initiator = new_password
+
+            # Remove backup file after successful change
+            if backup_path.exists():
+                os.remove(backup_path)
+
+            return True
+        
+        except Exception as e:
+            # Restore from backup if anything fails
+            if backup_path.exists():
+                shutil.copy2(backup_path, self.credential_file_path)
+                os.remove(backup_path)
+            logger.error(f"Error changing password: {e}")
+            raise Exception(f"Error changing password: {e}")
+        
+    def clear_credentials(self):
+        """Securely clear all credentials from memory"""
+        try:
+            # Clear decrypted credentials
+            if hasattr(self, 'pw_map'):
+                for key in self.pw_map:
+                    self.pw_map[key] = '0' * len(self.pw_map[key])  # overwrite with zeros
+                self.pw_map.clear()
+                del self.pw_map
+
+            # Clear encryption password
+            if hasattr(self, 'pw_initiator'):
+                self.pw_initiator = '0' * len(self.pw_initiator)  # overwrite with zeros
+                del self.pw_initiator
+
+            # Clear other sensitive data
+            self.postfiat_username = None
+            self.wallet_address_name = None
+            self.wallet_secret_name = None
+            self.google_doc_name = None
+            self.key_variables = None
+
+            logger.debug("Credentials cleared from memory")
+
+        except Exception as e:
+            logger.error(f"Error clearing credentials: {e}")
+            raise Exception(f"Error clearing credentials: {e}")
+        
+    def delete_credentials(self):
+        """Delete all credentials for the current user"""
+        try:
+            # Get all existing credentials
+            existing_cred_map = _get_cred_map()
+
+            # Create backup
+            backup_path = self.credential_file_path.with_suffix('.txt_backup')
+            shutil.copy2(self.credential_file_path, backup_path)
+
+            try:
+                # Write updated credential file without current user's credentials
+                with open(self.credential_file_path, 'w') as f:
+                    for key, value in existing_cred_map.items():
+                        if key not in self.key_variables:
+                            f.write(f'\nvariable___{key}\n{value}')
+
+                # Clear credentials from memory
+                self.clear_credentials()
+
+                # Remove backup file after successful deletion
+                if backup_path.exists():
+                    os.remove(backup_path)
+
+                logger.info(f"Successfully deleted account for user: {self.postfiat_username}")
+                return True
+            
+            except Exception as e:
+                # Restore from backup if anything fails
+                if backup_path.exists():
+                    shutil.copy2(backup_path, self.credential_file_path)
+                    os.remove(backup_path)
+                logger.error(f"Error deleting account: {e}")
+                raise Exception(f"Error deleting account: {e}")
+            
+        except Exception as e:
+            logger.error(f"Error deleting account: {e}")
+            raise Exception(f"Error deleting account: {e}")
     
 def _read_creds(credential_file_path):
     with open(credential_file_path, 'r') as f:
@@ -102,7 +232,7 @@ def cache_credentials(input_map):
         credentials = {
             f'{input_map["Username_Input"]}__v1xrpaddress': input_map['XRP Address_Input'],
             f'{input_map["Username_Input"]}__v1xrpsecret': input_map['XRP Secret_Input'],
-            f'{input_map["Username_Input"]}__googledoc': input_map['Google Doc Share Link_Input']                
+            # f'{input_map["Username_Input"]}__googledoc': input_map['Google Doc Share Link_Input']                
         }
 
         enter_and_encrypt_credential(
@@ -147,4 +277,3 @@ def get_cached_usernames():
     except Exception as e:
         logger.error(f"Error reading cached usernames: {e}")
         return []
-

@@ -3,23 +3,43 @@ import wx
 import wx.adv
 import wx.grid as gridlib
 import wx.html
-import wx.lib.scrolledpanel as scrolled
 import xrpl
 from xrpl.wallet import Wallet
 import asyncio
-from threading import Thread
+from threading import Thread, Event
 import wx.lib.newevent
 import nest_asyncio
-from pftpyclient.task_manager.basic_tasks import GoogleDocNotFoundException, InvalidGoogleDocException, PostFiatTaskManager, WalletInitiationFunctions, NoMatchingTaskException, WrongTaskStateException, is_over_1kb, MAX_CHUNK_SIZE, compress_string
-from pftpyclient.user_login.credential_input import cache_credentials, get_credential_file_path, get_cached_usernames
+from pftpyclient.task_manager.wallet_state import (
+    WalletState, 
+    requires_wallet_state,
+    FUNDED_STATES,
+    TRUSTLINED_STATES,
+    INITIATED_STATES,
+    GOOGLE_DOC_SENT_STATES,
+    PFT_STATES
+)
+from pftpyclient.task_manager.basic_tasks import (
+    GoogleDocNotFoundException, 
+    InvalidGoogleDocException, 
+    PostFiatTaskManager, 
+    WalletInitiationFunctions, 
+    NoMatchingTaskException, 
+    WrongTaskStateException, 
+    is_over_1kb, 
+    MAX_CHUNK_SIZE, 
+    compress_string
+)
+from pftpyclient.user_login.credential_input import get_cached_usernames
 import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
+from pftpyclient.performance.monitor import PerformanceMonitor
+from pftpyclient.configuration.configuration import ConfigurationManager
 from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
 import pandas as pd
-
+from enum import Enum, auto
 # Configure the logger at module level
 wx_sink = configure_logger(
     log_to_file=True,
@@ -34,12 +54,15 @@ MAINNET_WEBSOCKETS = [
     "wss://s1.ripple.com/",
     "wss://s2.ripple.com/"
 ]
-
 TESTNET_WEBSOCKETS = [
     "wss://s.altnet.rippletest.net:51233"
 ]
+MAINNET_URL = "https://s2.ripple.com:51234"
+TESTNET_URL = "https://s.altnet.rippletest.net:51234"
+USE_TESTNET = False
 
 REMEMBRANCER_ADDRESS = "rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn"
+ISSUER_ADDRESS = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
 
 UPDATE_TIMER_INTERVAL_SEC = 60  # Every 60 Seconds
 
@@ -60,6 +83,12 @@ nest_asyncio.apply()
 
 UpdateGridEvent, EVT_UPDATE_GRID = wx.lib.newevent.NewEvent()
 
+class WalletUIState(Enum):
+    IDLE = auto()
+    BUSY = auto()
+    SYNCING = auto()
+    TRANSACTION_PENDING = auto()
+
 class PostFiatWalletApp(wx.App):
     def OnInit(self):
         frame = WalletApp()
@@ -74,24 +103,43 @@ class XRPLMonitorThread(Thread):
     def __init__(self, gui):
         Thread.__init__(self, daemon=True)
         self.gui = gui
-        self.nodes = MAINNET_WEBSOCKETS
+        self.nodes = MAINNET_WEBSOCKETS if not USE_TESTNET else TESTNET_WEBSOCKETS
         self.current_node_index = 0
         self.url = self.nodes[self.current_node_index]
         self.loop = asyncio.new_event_loop()
         self.context = None
+        self.expecting_state_change = False
+        self._stop_event = Event()
 
     def run(self):
+        """Thread entry point"""
         asyncio.set_event_loop(self.loop)
-        self.context = self.loop.run_until_complete(self.monitor())
+        try:
+            self.context = self.loop.run_until_complete(self.monitor())
+        except Exception as e:
+            if not self.stopped():
+                logger.error(f"Unexpected error in XRPLMonitorThread: {e}")
+        finally:
+            self.loop.close()
+
+    def stop(self):
+        """Signal the thread to stop"""
+        self._stop_event.set()
+
+    def stopped(self):
+        """Check if the thread has been signaled to stop"""
+        return self._stop_event.is_set()
 
     async def monitor(self):
-        while True:
-            try:
+        """Main monitoring coroutine"""
+        try:
+            while not self.stopped():
                 await self.watch_xrpl_account(self.gui.wallet.classic_address, self.gui.wallet)
-            except Exception as e:
-                logger.error(f"Error in monitor: {e}. Switching to next node.")
-                self.switch_node()
-                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.debug("Monitor task cancelled")
+        except Exception as e:
+            if not self.stopped():
+                logger.error(f"Unexpected error in monitor: {e}")
     
     def switch_node(self):
         self.current_node_index = (self.current_node_index + 1) % len(self.nodes)
@@ -101,38 +149,81 @@ class XRPLMonitorThread(Thread):
     async def watch_xrpl_account(self, address, wallet=None):
         self.account = address
         self.wallet = wallet
-        try:
-            async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
-                try: 
-                    await asyncio.wait_for(self.on_connected(), timeout=10)
-                except asyncio.TimeoutError:
-                    logger.warning(f"Node {self.url} timed out. Switching to next node.")
-                    self.switch_node()
-                    return
+        check_interval = 10
 
-                async for message in self.client:
-                    mtype = message.get("type")
-                    if mtype == "ledgerClosed":
-                        wx.CallAfter(self.gui.update_ledger, message)
-                    elif mtype == "transaction":
+        while not self.stopped():
+            try:
+                async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
+                    while True:
                         try: 
-                            response = await asyncio.wait_for(
-                                self.client.request(xrpl.models.requests.AccountInfo(
-                                    account=self.account,
-                                    ledger_index=message["ledger_index"]
-                                )),
-                                timeout=10
-                            )
-                            wx.CallAfter(self.gui.update_account, response.result["account_data"])
-                            wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))                    
+                            response = await asyncio.wait_for(self.on_connected(), timeout=check_interval)
+
+                            async for message in self.client:
+                                mtype = message.get("type")
+                                # Message type "ledgerClosed" is received when a new ledger is closed (block added to the ledger)
+                                if mtype == "ledgerClosed":
+                                    wx.CallAfter(self.gui.update_ledger, message)
+                                    # Only check account info if we are expecting a state change.
+                                    # This is necessary because the transaction stream can be delayed significantly.
+                                    # TODO: This is a hack to get around the delay.
+                                    # TODO: The issue might be caused by a logic flaw in the on_connected() method.
+                                    if self.expecting_state_change:
+                                        logger.debug(f"Checking account info because we are expecting a state change.")
+                                        try:
+                                            response = await asyncio.wait_for(
+                                                self.client.request(xrpl.models.requests.AccountInfo(
+                                                    account=self.account,
+                                                    ledger_index="validated"
+                                                )),
+                                                timeout=check_interval
+                                            )
+                                            wx.CallAfter(self.gui.update_account, response.result["account_data"])
+                                            wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))                                       
+                                        except asyncio.TimeoutError:
+                                            logger.warning(f"Request to {self.url} timed out. Switching to next node.")
+                                            self.switch_node()
+                                            return
+                                        except Exception as e:
+                                            logger.error(f"Error processing request: {e}")
+                                # Message type "transaction" is received when a transaction is detected
+                                elif mtype == "transaction":
+                                    try:
+                                        response = await asyncio.wait_for(
+                                            self.client.request(xrpl.models.requests.AccountInfo(
+                                                account=self.account,
+                                                ledger_index="validated"
+                                            )),
+                                            timeout=check_interval
+                                        )
+                                        wx.CallAfter(self.gui.update_account, response.result["account_data"])
+                                        wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))
+                                    except asyncio.TimeoutError:
+                                        logger.warning(f"Request to {self.url} timed out. Switching to next node.")
+                                        self.switch_node()
+                                        return
+                                    except Exception as e:
+                                        logger.error(f"Error processing request: {e}")
+
                         except asyncio.TimeoutError:
-                            logger.warning(f"Request to {self.url} timed out. Switching to next node.")
+                            logger.warning(f"Node {self.url} timed out. Switching to next node.")
+                            self.switch_node()
+                            return
                         except Exception as e:
-                            logger.error(f"Error processing request: {e}")
-        except Exception as e:
-            logger.error(f"Error in watch_xrpl_account: {e}")
+                            if "actNotFound" in str(e):
+                                logger.debug(f"Account {self.account} not found yet, waiting...")
+                                await asyncio.sleep(check_interval)
+                                continue
+                            else:
+                                logger.error(f"Unexpected error in monitoring loop: {e}")
+                                await asyncio.sleep(check_interval)
+
+            except Exception as e:
+                if self.stopped():
+                    break
+                logger.error(f"Error in watch_xrpl_account: {e}")
 
     async def on_connected(self):
+        logger.debug(f"on_connected: {self.account}")
         response = await self.client.request(xrpl.models.requests.Subscribe(
             streams=["ledger"],
             accounts=[self.account]
@@ -143,26 +234,46 @@ class XRPLMonitorThread(Thread):
             ledger_index="validated"
         ))
         if response.is_successful():
+            logger.debug(f"on_connected success result: {response.result}")
             wx.CallAfter(self.gui.update_account, response.result["account_data"])
             wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))
+            return response
+        else:
+            if response.result.get("error") == "actNotFound":
+                raise Exception("actNotFound")
+            logger.error(f"Error in on_connected: {response.result}")
+            raise Exception(str(response.result))
 
 class CustomDialog(wx.Dialog):
-    def __init__(self, title, fields):
-        super(CustomDialog, self).__init__(None, title=title, size=(400, 200))
+    def __init__(self, title, fields, message=None):
+        super(CustomDialog, self).__init__(None, title=title, size=(500, 200))
         self.fields = fields
+        self.message = message
         self.InitUI()
-        self.SetSize((400, 200))
+
+        # For layout update before getting best size
+        self.GetSizer().Fit(self)
+        self.Layout()
+
+        best_size = self.GetBestSize()
+        min_height = best_size.height
+        self.SetSize((500, min_height))
 
     def InitUI(self):
         pnl = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
+
+        if self.message:
+            message_label = wx.StaticText(pnl, label=self.message, style=wx.ST_NO_AUTORESIZE)
+            message_label.Wrap(480)  # wrap text at slightly less than width of dialog
+            vbox.Add(message_label, flag=wx.EXPAND | wx.ALL, border=10)
 
         self.text_controls = {}
         for field in self.fields:
             hbox = wx.BoxSizer(wx.HORIZONTAL)
             label = wx.StaticText(pnl, label=field)
             hbox.Add(label, flag=wx.RIGHT, border=8)
-            text_ctrl = wx.TextCtrl(pnl)
+            text_ctrl = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 100))
             hbox.Add(text_ctrl, proportion=1)
             self.text_controls[field] = text_ctrl
             vbox.Add(hbox, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, border=10)
@@ -178,6 +289,10 @@ class CustomDialog(wx.Dialog):
 
         pnl.SetSizer(vbox)
 
+        dialog_sizer = wx.BoxSizer(wx.VERTICAL)
+        dialog_sizer.Add(pnl, 1, wx.EXPAND)
+        self.SetSizer(dialog_sizer)
+
         self.submit_button.Bind(wx.EVT_BUTTON, self.OnSubmit)
         self.close_button.Bind(wx.EVT_BUTTON, self.OnClose)
 
@@ -191,6 +306,15 @@ class CustomDialog(wx.Dialog):
         return {field: text_ctrl.GetValue() for field, text_ctrl in self.text_controls.items()}
 
 class WalletApp(wx.Frame):
+
+    STATE_AVAILABLE_TABS = {
+        WalletState.UNFUNDED: ["Summary", "Log"],
+        WalletState.FUNDED: ["Summary", "Payments", "Log"],
+        WalletState.TRUSTLINED: ["Summary", "Payments", "Memos", "Log"],
+        WalletState.INITIATED: ["Summary", "Payments", "Memos", "Log"],
+        WalletState.GOOGLE_DOC_SENT: ["Summary", "Payments", "Memos", "Log"],
+        WalletState.ACTIVE: ["Summary", "Proposals", "Verification", "Rewards", "Payments", "Memos", "Log"]
+    }
 
     GRID_CONFIGS = {
         'proposals': {
@@ -256,6 +380,17 @@ class WalletApp(wx.Frame):
         icon = wx.Icon(icon_path, wx.BITMAP_TYPE_ICO)
         self.SetIcon(icon)
 
+        self.perf_monitor = None
+
+        self.config = ConfigurationManager()
+        
+        if self.config.get_global_config('performance_monitor'):
+            self.launch_perf_monitor()
+
+        self.create_menu_bar()
+
+        self.tab_pages = {}  # Store references to tab pages
+
         self.wallet = None
         self.build_ui()
 
@@ -272,6 +407,8 @@ class WalletApp(wx.Frame):
         self.grid_base_row_height = 125
         self.row_height_margin = 25
 
+        self.network_url = MAINNET_URL if not USE_TESTNET else TESTNET_URL
+
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""
         columns = self.GRID_CONFIGS[grid_name]['columns']
@@ -280,6 +417,47 @@ class WalletApp(wx.Frame):
             grid.SetColLabelValue(idx, col_label)
             grid.SetColSize(idx, width)
         return grid
+    
+    def create_menu_bar(self):
+        """Create the menu bar with File and Extras menus"""
+        self.menubar = wx.MenuBar()
+
+        # File menu
+        file_menu = wx.Menu()
+        preferences_item = file_menu.Append(wx.ID_ANY, "Preferences", "Configure client settings")
+        logout_item = file_menu.Append(wx.ID_ANY, "Logout", "Return to login screen")
+        quit_item = file_menu.Append(wx.ID_EXIT, "Quit", "Quit the application")
+        self.Bind(wx.EVT_MENU, self.on_preferences, preferences_item)
+        self.Bind(wx.EVT_MENU, self.on_logout, logout_item)
+        self.Bind(wx.EVT_MENU, self.on_close, quit_item)
+        self.menubar.Append(file_menu, "File")
+
+        # Create Account menu
+        self.account_menu = wx.Menu()
+        self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
+        self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
+        self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
+        self.menubar.Append(self.account_menu, "Account")
+
+        # Bind menu events
+        self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
+        self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
+        self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
+
+        # Extras menu
+        extras_menu = wx.Menu()
+        self.perf_monitor_item = extras_menu.Append(wx.ID_ANY, "Performance Monitor", "Monitor client's performance")
+        self.Bind(wx.EVT_MENU, self.launch_perf_monitor, self.perf_monitor_item)
+        self.menubar.Append(extras_menu, "Extras")
+
+        self.SetMenuBar(self.menubar)
+
+        # Initially disable Account menu
+        self.menubar.EnableTop(self.menubar.FindMenu("Account"), False)
+
+    def enable_menus(self):
+        """Enable certain menus after successful login"""
+        self.menubar.EnableTop(self.menubar.FindMenu("Account"), True)
 
     def build_ui(self):
         self.panel = wx.Panel(self)
@@ -309,14 +487,56 @@ class WalletApp(wx.Frame):
         self.summary_sizer = wx.BoxSizer(wx.VERTICAL)
         self.summary_tab.SetSizer(self.summary_sizer)
 
-        # Create Summary tab elements but don't add them to sizer yet
+        # Create Summary tab elements
+        username_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
-        self.lbl_xrp_balance = wx.StaticText(self.summary_tab, label="XRP Balance: ")
-        self.lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: ")
-        self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
+        self.lbl_wallet_state = wx.StaticText(self.summary_tab, label="Wallet State: ")
+        username_row_sizer.Add(self.lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        username_row_sizer.AddStretchSpacer()
+        username_row_sizer.Add(self.lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_sizer.Add(username_row_sizer, 0, wx.EXPAND)
 
-        # Add grid for Key Account Details
+        # Create XRP balance row
+        xrp_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_xrp_balance = wx.StaticText(self.summary_tab, label="XRP Balance: ")
+        self.lbl_next_action = wx.StaticText(self.summary_tab, label="Next Action: ")
+        xrp_balance_row_sizer.Add(self.lbl_xrp_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        xrp_balance_row_sizer.AddStretchSpacer()
+        xrp_balance_row_sizer.Add(self.lbl_next_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_sizer.Add(xrp_balance_row_sizer, 0, wx.EXPAND)
+
+        # Create PFT balance row
+        pft_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: ")
+        self.btn_wallet_action = wx.Button(self.summary_tab, label="Take Action")
+        pft_balance_row_sizer.Add(self.lbl_pft_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        pft_balance_row_sizer.AddStretchSpacer()
+        pft_balance_row_sizer.Add(self.btn_wallet_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_sizer.Add(pft_balance_row_sizer, 0, wx.EXPAND)
+
+        # Create address section
+        self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
+        self.summary_sizer.Add(self.lbl_address, 0, flag=wx.ALL, border=5)
+
+        # Bind wallet action button
+        self.btn_wallet_action.Bind(wx.EVT_BUTTON, self.on_take_action)
+
+        # Set font weights
+        font = self.lbl_next_action.GetFont()
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        self.lbl_next_action.SetFont(font)
+        self.btn_wallet_action.SetFont(font)
+
+        # Create Key Account Details section
+        self.lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
+        self.summary_sizer.Add(self.lbl_key_details, 0, flag=wx.ALL, border=5)
         self.summary_grid = self.setup_grid(gridlib.Grid(self.summary_tab), 'summary')
+        self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
+
+        self.summary_tab.SetSizer(self.summary_sizer)
+
+        # Store reference to summary tab page
+        self.tab_pages["Summary"] = self.summary_tab
 
         #################################
         # PROPOSALS
@@ -353,6 +573,9 @@ class WalletApp(wx.Frame):
         # Add grid to Proposals tab
         self.proposals_grid = self.setup_grid(gridlib.Grid(self.proposals_tab), 'proposals')
         self.proposals_sizer.Add(self.proposals_grid, 1, wx.EXPAND | wx.ALL, 20)
+
+        # Store reference to proposals tab page
+        self.tab_pages["Proposals"] = self.proposals_tab
 
         #################################
         # VERIFICATION
@@ -396,6 +619,9 @@ class WalletApp(wx.Frame):
         self.verification_grid = self.setup_grid(gridlib.Grid(self.verification_tab), 'verification')
         self.verification_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 20)
 
+        # Store reference to verification tab page
+        self.tab_pages["Verification"] = self.verification_tab
+
         #################################
         # REWARDS
         #################################
@@ -407,7 +633,10 @@ class WalletApp(wx.Frame):
 
         # Add grid to Rewards tab
         self.rewards_grid = self.setup_grid(gridlib.Grid(self.rewards_tab), 'rewards')
-        self.rewards_sizer.Add(self.rewards_grid, 1, wx.EXPAND | wx.ALL, 20)
+        self.rewards_sizer.Add(self.rewards_grid, 1, wx.EXPAND | wx.ALL, 20)    
+
+        # Store reference to rewards tab page
+        self.tab_pages["Rewards"] = self.rewards_tab
 
         #################################
         # PAYMENTS
@@ -464,12 +693,15 @@ class WalletApp(wx.Frame):
         self.payments_sizer.Add(self.btn_submit_pft_payment, flag=wx.ALL, border=5)
         self.btn_submit_pft_payment.Bind(wx.EVT_BUTTON, self.on_submit_pft_payment)
 
-        # Add "Show Secret" button
-        self.btn_show_secret = wx.Button(self.payments_tab, label="Show Secret")
-        self.payments_sizer.Add(self.btn_show_secret, flag=wx.ALL, border=5)
-        self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
+        # # Add "Show Secret" button
+        # self.btn_show_secret = wx.Button(self.payments_tab, label="Show Secret")
+        # self.payments_sizer.Add(self.btn_show_secret, flag=wx.ALL, border=5)
+        # self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
 
         self.panel.SetSizer(self.sizer)
+
+        # Store reference to payments tab page
+        self.tab_pages["Payments"] = self.payments_tab
 
         #################################
         # MEMOS
@@ -495,6 +727,9 @@ class WalletApp(wx.Frame):
         self.memos_grid = self.setup_grid(gridlib.Grid(self.memos_tab), 'memos')
         self.memos_sizer.Add(self.memos_grid, 1, wx.EXPAND | wx.ALL, 20)
 
+        # Store reference to memos tab page
+        self.tab_pages["Memos"] = self.memos_tab
+
         #################################
         # LOGS
         #################################
@@ -507,6 +742,16 @@ class WalletApp(wx.Frame):
         # Create a text control for logs
         self.log_text = wx.TextCtrl(self.log_tab, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
         self.log_sizer.Add(self.log_text, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Store reference to log tab page
+        self.tab_pages["Log"] = self.log_tab
+
+        #################################
+
+        self.status_bar = self.CreateStatusBar()
+        self.status_bar.SetFieldsCount(2)
+        self.status_bar.SetStatusWidths([-3, -1])  # 75% for message, 25% for state
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def create_login_panel(self):
         panel = wx.Panel(self.panel)
@@ -532,24 +777,24 @@ class WalletApp(wx.Frame):
         box_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Username
-        self.lbl_user = wx.StaticText(box, label="Username:")
-        box_sizer.Add(self.lbl_user, flag=wx.ALL, border=5)
+        self.login_lbl_username = wx.StaticText(box, label="Username:")
+        box_sizer.Add(self.login_lbl_username, flag=wx.ALL, border=5)
 
         # Create combobox for username dropdown
-        self.txt_user = wx.ComboBox(box, style=wx.CB_DROPDOWN)
-        box_sizer.Add(self.txt_user, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        self.login_txt_username = wx.ComboBox(box, style=wx.CB_DROPDOWN)
+        box_sizer.Add(self.login_txt_username, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Password
-        self.lbl_pass = wx.StaticText(box, label="Password:")
-        box_sizer.Add(self.lbl_pass, flag=wx.ALL, border=5)
-        self.txt_pass = wx.TextCtrl(box, style=wx.TE_PASSWORD)
-        box_sizer.Add(self.txt_pass, flag=wx.EXPAND | wx.ALL, border=5)
+        self.login_lbl_password = wx.StaticText(box, label="Password:")
+        box_sizer.Add(self.login_lbl_password, flag=wx.ALL, border=5)
+        self.login_txt_password = wx.TextCtrl(box, style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
+        box_sizer.Add(self.login_txt_password, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Error label
-        self.error_label = wx.StaticText(box, label="")
-        self.error_label.SetForegroundColour(wx.RED)
-        box_sizer.Add(self.error_label, flag=wx.EXPAND |wx.ALL, border=5)
-        # self.error_label.Hide()
+        self.login_error_label = wx.StaticText(box, label="")
+        self.login_error_label.SetForegroundColour(wx.RED)
+        box_sizer.Add(self.login_error_label, flag=wx.EXPAND |wx.ALL, border=5)
+        # self.login_error_label.Hide()
 
         # Login button
         self.btn_login = wx.Button(box, label="Login")
@@ -577,10 +822,14 @@ class WalletApp(wx.Frame):
         panel.SetSizer(main_sizer)
 
         # Bind events
-        self.txt_user.Bind(wx.EVT_COMBOBOX_DROPDOWN, self.on_dropdown_opened)
-        self.txt_user.Bind(wx.EVT_COMBOBOX, self.on_username_selected)
-        self.txt_user.Bind(wx.EVT_TEXT, self.on_clear_error)
-        self.txt_pass.Bind(wx.EVT_TEXT, self.on_clear_error)
+        self.login_txt_username.Bind(wx.EVT_COMBOBOX_DROPDOWN, self.on_dropdown_opened)
+        self.login_txt_username.Bind(wx.EVT_COMBOBOX, self.on_username_selected)
+        self.login_txt_username.Bind(wx.EVT_TEXT, self.on_clear_error)
+        self.login_txt_password.Bind(wx.EVT_TEXT, self.on_clear_error)
+
+        # Add Enter key bindings
+        self.login_txt_username.Bind(wx.EVT_TEXT_ENTER, self.on_login)
+        self.login_txt_password.Bind(wx.EVT_TEXT_ENTER, self.on_login)
 
         self.populate_username_dropdown()
 
@@ -589,15 +838,19 @@ class WalletApp(wx.Frame):
     def populate_username_dropdown(self):
         """Populates the username dropdown with cached usernames"""
         try:
-            current_value = self.txt_user.GetValue()
             cached_usernames = get_cached_usernames()
-            self.txt_user.Clear()
-            self.txt_user.AppendItems(cached_usernames)
+            self.login_txt_username.Clear()
+            self.login_txt_username.AppendItems(cached_usernames)
 
-            if current_value and current_value in cached_usernames:
-                self.txt_user.SetValue(current_value)
+            # Get the last logged-in user
+            last_user = self.config.get_global_config('last_logged_in_user')
+
+            if last_user and last_user in cached_usernames:
+                self.login_txt_username.SetValue(last_user)
+                self.login_txt_password.SetFocus()
             elif cached_usernames:
-                self.txt_user.SetValue(cached_usernames[0])
+                self.login_txt_username.SetValue(cached_usernames[0])
+                self.login_txt_password.SetFocus()
         except Exception as e:
             logger.error(f"Error populating username dropdown: {e}")
             self.show_error("Error loading cached usernames")
@@ -609,7 +862,7 @@ class WalletApp(wx.Frame):
 
     def on_username_selected(self, event):
         """Handle username selection from dropdown"""
-        self.txt_pass.SetFocus()
+        self.login_txt_password.SetFocus()
         self.on_clear_error(event)
     
     def create_user_details_panel(self):
@@ -627,17 +880,17 @@ class WalletApp(wx.Frame):
         user_details_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # XRP Address
-        self.lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
-        user_details_sizer.Add(self.lbl_xrp_address, flag=wx.ALL, border=5)
-        self.txt_xrp_address = wx.TextCtrl(panel)
-        user_details_sizer.Add(self.txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
+        user_details_sizer.Add(self.create_lbl_xrp_address, flag=wx.ALL, border=5)
+        self.create_txt_xrp_address = wx.TextCtrl(panel)
+        user_details_sizer.Add(self.create_txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
 
         # XRP Secret
         secret_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
-        user_details_sizer.Add(self.lbl_xrp_secret, flag=wx.ALL, border=5)
-        self.txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)  # TODO: make a checkbox to show/hide the secret
-        secret_sizer.Add(self.txt_xrp_secret, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
+        user_details_sizer.Add(self.create_lbl_xrp_secret, flag=wx.ALL, border=5)
+        self.create_txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)  # TODO: make a checkbox to show/hide the secret
+        secret_sizer.Add(self.create_txt_xrp_secret, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
         self.chk_show_secret = wx.CheckBox(panel, label="Show Secret")
         secret_sizer.Add(self.chk_show_secret, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         user_details_sizer.Add(secret_sizer, flag=wx.EXPAND)
@@ -645,42 +898,25 @@ class WalletApp(wx.Frame):
         self.chk_show_secret.Bind(wx.EVT_CHECKBOX, self.on_toggle_secret_visibility_user_details)
 
         # Username
-        self.lbl_username = wx.StaticText(panel, label="Username:")
-        user_details_sizer.Add(self.lbl_username, flag=wx.ALL, border=5)
-        self.txt_username = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
-        user_details_sizer.Add(self.txt_username, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_username = wx.StaticText(panel, label="Username:")
+        user_details_sizer.Add(self.create_lbl_username, flag=wx.ALL, border=5)
+        self.create_txt_username = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+        user_details_sizer.Add(self.create_txt_username, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Bind event to force lowercase
-        self.txt_username.Bind(wx.EVT_TEXT, self.on_force_lowercase)
+        self.create_txt_username.Bind(wx.EVT_TEXT, self.on_force_lowercase)
 
         # Password
-        self.lbl_password = wx.StaticText(panel, label="Password:")
-        user_details_sizer.Add(self.lbl_password, flag=wx.ALL, border=5)
-        self.txt_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        user_details_sizer.Add(self.txt_password, flag=wx.EXPAND | wx.ALL, border=5)
+        self.create_lbl_password = wx.StaticText(panel, label="Password (minimum 8 characters):")
+        user_details_sizer.Add(self.create_lbl_password, flag=wx.ALL, border=5)
+        self.create_txt_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        user_details_sizer.Add(self.create_txt_password, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Confirm Password
-        self.lbl_confirm_password = wx.StaticText(panel, label="Confirm Password:")
-        user_details_sizer.Add(self.lbl_confirm_password, flag=wx.ALL, border=5)
-        self.txt_confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        user_details_sizer.Add(self.txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
-
-        # Google Doc Share Link
-        self.lbl_google_doc = wx.StaticText(panel, label="Google Doc Share Link:")
-        user_details_sizer.Add(self.lbl_google_doc, flag=wx.ALL, border=5)
-        self.txt_google_doc = wx.TextCtrl(panel)
-        user_details_sizer.Add(self.txt_google_doc, flag=wx.EXPAND | wx.ALL, border=5)
-
-        # Commitment
-        self.lbl_commitment = wx.StaticText(panel, label="Please write 1 sentence committing to a long term objective of your choosing:")
-        user_details_sizer.Add(self.lbl_commitment, flag=wx.ALL, border=5)
-        self.txt_commitment = wx.TextCtrl(panel)
-        user_details_sizer.Add(self.txt_commitment, flag=wx.EXPAND | wx.ALL, border=5)
-
-        # Info
-        # TODO: Move where this is displayed to the login screen
-        self.lbl_info = wx.StaticText(panel, label="Paste Your XRP Address in the first line of your Google Doc and make sure that anyone who has the link can view Before Genesis")
-        user_details_sizer.Add(self.lbl_info, flag=wx.ALL, border=5)
+        self.create_lbl_confirm_password = wx.StaticText(panel, label="Confirm Password:")
+        user_details_sizer.Add(self.create_lbl_confirm_password, flag=wx.ALL, border=5)
+        self.create_txt_confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        user_details_sizer.Add(self.create_txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Tooltips
         self.tooltip_xrp_address = wx.ToolTip("This is your XRP address. It is used to receive XRP or PFT.")
@@ -688,26 +924,27 @@ class WalletApp(wx.Frame):
         self.tooltip_username = wx.ToolTip("Set a username that you will use to log in with. You can use lowercase letters, numbers, and underscores.")
         self.tooltip_password = wx.ToolTip("Set a password that you will use to log in with. This password is used to encrypt your XRP address and secret.")
         self.tooltip_confirm_password = wx.ToolTip("Confirm your password.")
-        self.tooltip_google_doc = wx.ToolTip("This is the link to your Google Doc. 1) It must be a shareable link. 2) The first line of the document must be your XRP address.")
-        self.txt_xrp_address.SetToolTip(self.tooltip_xrp_address)
-        self.txt_xrp_secret.SetToolTip(self.tooltip_xrp_secret)
-        self.txt_username.SetToolTip(self.tooltip_username)
-        self.txt_password.SetToolTip(self.tooltip_password)
-        self.txt_confirm_password.SetToolTip(self.tooltip_confirm_password)
-        self.txt_google_doc.SetToolTip(self.tooltip_google_doc)
+        self.create_txt_xrp_address.SetToolTip(self.tooltip_xrp_address)
+        self.create_txt_xrp_secret.SetToolTip(self.tooltip_xrp_secret)
+        self.create_txt_username.SetToolTip(self.tooltip_username)
+        self.create_txt_password.SetToolTip(self.tooltip_password)
+        self.create_txt_confirm_password.SetToolTip(self.tooltip_confirm_password)
 
         # Buttons
+        wallet_buttons_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_generate_wallet = wx.Button(panel, label="Generate New XRP Wallet")
-        user_details_sizer.Add(self.btn_generate_wallet, flag=wx.ALL, border=5)
+        wallet_buttons_sizer.Add(self.btn_generate_wallet, 1, flag=wx.EXPAND | wx.RIGHT, border=5)
         self.btn_generate_wallet.Bind(wx.EVT_BUTTON, self.on_generate_wallet)
 
-        self.btn_existing_user = wx.Button(panel, label="Cache Credentials")
-        user_details_sizer.Add(self.btn_existing_user, flag=wx.ALL, border=5)
-        self.btn_existing_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
+        self.btn_restore_wallet = wx.Button(panel, label="Restore from Seed")
+        wallet_buttons_sizer.Add(self.btn_restore_wallet, 1, flag=wx.EXPAND | wx.LEFT, border=5)
+        self.btn_restore_wallet.Bind(wx.EVT_BUTTON, self.on_restore_wallet)
 
-        self.btn_genesis = wx.Button(panel, label="Genesis")
-        user_details_sizer.Add(self.btn_genesis, flag=wx.ALL, border=5)
-        self.btn_genesis.Bind(wx.EVT_BUTTON, self.on_genesis)
+        user_details_sizer.Add(wallet_buttons_sizer, flag=wx.EXPAND | wx.ALL, border=5)
+
+        self.btn_cache_user = wx.Button(panel, label="Cache Credentials")
+        user_details_sizer.Add(self.btn_cache_user, flag=wx.EXPAND, border=15)
+        self.btn_cache_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
 
         sizer.Add(user_details_sizer, 1, wx.EXPAND | wx.ALL, 10)
 
@@ -716,123 +953,92 @@ class WalletApp(wx.Frame):
         return panel
     
     def on_force_lowercase(self, event):
-        value = self.txt_username.GetValue()
+        value = self.create_txt_username.GetValue()
         lowercase_value = value.lower()
         if value != lowercase_value:
-            self.txt_username.SetValue(lowercase_value)
-            self.txt_username.SetInsertionPointEnd()
+            self.create_txt_username.SetValue(lowercase_value)
+            self.create_txt_username.SetInsertionPointEnd()
     
     def on_toggle_secret_visibility_user_details(self, event):
         if self.chk_show_secret.IsChecked():
-            self.txt_xrp_secret.SetWindowStyle(wx.TE_PROCESS_ENTER)  # Default style
+            self.create_txt_xrp_secret.SetWindowStyle(wx.TE_PROCESS_ENTER)  # Default style
         else:
-            self.txt_xrp_secret.SetWindowStyle(wx.TE_PASSWORD)
+            self.create_txt_xrp_secret.SetWindowStyle(wx.TE_PASSWORD)
 
         # Store the current value and cursor position
-        current_value = self.txt_xrp_secret.GetValue()
+        current_value = self.create_txt_xrp_secret.GetValue()
 
         # Recreate the text control with the new style
-        new_txt_xrp_secret = wx.TextCtrl(self.txt_xrp_secret.GetParent(), 
+        new_txt_xrp_secret = wx.TextCtrl(self.create_txt_xrp_secret.GetParent(), 
                                         value=current_value,
-                                        style=self.txt_xrp_secret.GetWindowStyle())
+                                        style=self.create_txt_xrp_secret.GetWindowStyle())
         
         # Replace the old control with the new one in the sizer
-        self.txt_xrp_secret.GetContainingSizer().Replace(self.txt_xrp_secret, new_txt_xrp_secret)
-        self.txt_xrp_secret.Destroy()
-        self.txt_xrp_secret = new_txt_xrp_secret
+        self.create_txt_xrp_secret.GetContainingSizer().Replace(self.create_txt_xrp_secret, new_txt_xrp_secret)
+        self.create_txt_xrp_secret.Destroy()
+        self.create_txt_xrp_secret = new_txt_xrp_secret
 
         # Refresh the layout
-        self.txt_xrp_secret.GetParent().Layout()
+        self.create_txt_xrp_secret.GetParent().Layout()
 
     def on_generate_wallet(self, event):
         # Generate a new XRP wallet
         self.wallet = Wallet.create()
-        self.txt_xrp_address.SetValue(self.wallet.classic_address)
-        self.txt_xrp_secret.SetValue(self.wallet.seed)
+        self.create_txt_xrp_address.SetValue(self.wallet.classic_address)
+        self.create_txt_xrp_secret.SetValue(self.wallet.seed)
 
-    def on_genesis(self, event):
-        # Gather input data
-        input_map = {
-            'Username_Input': self.txt_username.GetValue(),
-            'Password_Input': self.txt_password.GetValue(),
-            'Google Doc Share Link_Input': self.txt_google_doc.GetValue(),
-            'XRP Address_Input': self.txt_xrp_address.GetValue(),
-            'XRP Secret_Input': self.txt_xrp_secret.GetValue(),
-        }
-        commitment = self.txt_commitment.GetValue()  # Get the user commitment
-
-        if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
-            wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Info', wx.OK | wx.ICON_INFORMATION)
-        # if any of the fields are empty, show an error message 
-        elif any(not value for value in input_map.values()) or commitment == "":
-            wx.MessageBox('All fields are required for genesis!', 'Info', wx.OK | wx.ICON_INFORMATION)
-        else:
-            # initialize "pre-wallet" that helps with initiation
-            wallet_functions = WalletInitiationFunctions(input_map, commitment)
-
+    def on_restore_wallet(self, event):
+        """Restore wallet from existing seed"""
+        dialog = CustomDialog("Restore Wallet", ["XRP Secret"])
+        if dialog.ShowModal() == wx.ID_OK:
+            seed = dialog.GetValues()["XRP Secret"]
             try:
-                wallet_functions.check_if_google_doc_is_valid()
+                # Attempt to create wallet from seed
+                wallet = Wallet.from_seed(seed)
+
+                # Update the UI with the restored wallet details
+                self.create_txt_xrp_address.SetValue(wallet.classic_address)
+                self.create_txt_xrp_secret.SetValue(wallet.seed)
+
+                wx.MessageBox("Wallet restored successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
+
             except Exception as e:
-                wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
-            else:
-                try:
-                    response = wallet_functions.cache_credentials(input_map)
-                except Exception as e:
-                    wx.MessageBox(f"Error caching credentials: {e}", 'Error', wx.OK | wx.ICON_ERROR)
-                else:
-                    wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
+                logger.error(f"Error restoring wallet: {e}")
+                wx.MessageBox("Invalid seed format. Please check your seed and try again.", "Error", wx.OK | wx.ICON_ERROR)
 
-                    # generate trust line to PFT token
-                    wallet_functions.handle_trust_line()
-
-                    # Call send_initiation_rite with the gathered data
-                    response = wallet_functions.send_initiation_rite()
-
-                    formatted_response = self.format_response(response)
-
-                    logger.info(f"Genesis Result: {formatted_response}")
-
-                    dialog = SelectableMessageDialog(self, "Genesis Result", formatted_response)
-                    dialog.ShowModal()
-                    dialog.Destroy()
-
-                    wx.MessageBox("Genesis successful! Return to the login screen to and proceed to login.", 'Info', wx.OK | wx.ICON_INFORMATION)
+        dialog.Destroy()
 
     def on_cache_user(self, event):
         #TODO: Phase out this method in favor of automatic caching on genesis
         logger.debug("User clicked Cache Credentials button")
         """Caches the user's credentials"""
         input_map = {
-            'Username_Input': self.txt_username.GetValue(),
-            'Password_Input': self.txt_password.GetValue(),
-            'Google Doc Share Link_Input': self.txt_google_doc.GetValue(),
-            'XRP Address_Input': self.txt_xrp_address.GetValue(),
-            'XRP Secret_Input': self.txt_xrp_secret.GetValue(),
-            'Confirm Password_Input': self.txt_confirm_password.GetValue(),
+            'Username_Input': self.create_txt_username.GetValue(),
+            'Password_Input': self.create_txt_password.GetValue(),
+            'XRP Address_Input': self.create_txt_xrp_address.GetValue(),
+            'XRP Secret_Input': self.create_txt_xrp_secret.GetValue(),
+            'Confirm Password_Input': self.create_txt_confirm_password.GetValue(),
         }
 
-        if self.txt_password.GetValue() != self.txt_confirm_password.GetValue():
+        is_valid, error_message = self.validate_password(input_map['Password_Input'])
+        if not is_valid:
+            logger.error(error_message)
+            wx.MessageBox(error_message, 'Error', wx.OK | wx.ICON_ERROR)
+        elif self.create_txt_password.GetValue() != self.create_txt_confirm_password.GetValue():
             logger.error("Passwords Do Not Match! Please Retry.")
             wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
         elif any(not value for value in input_map.values()):
-            logger.error("All fields (except commitment) are required for caching!")
-            wx.MessageBox('All fields (except commitment) are required for caching!', 'Error', wx.OK | wx.ICON_ERROR)
+            logger.error("All fields are required for caching!")
+            wx.MessageBox('All fields are required for caching!', 'Error', wx.OK | wx.ICON_ERROR)
         else:
-            wallet_functions = WalletInitiationFunctions(input_map)
+            wallet_functions = WalletInitiationFunctions(input_map, self.network_url)
             try:
-                logger.debug("Checking if Google Doc is valid")
-                wallet_functions.check_if_google_doc_is_valid()
-                logger.debug("Google Doc is valid. Caching credentials.")
                 response = wallet_functions.cache_credentials(input_map)
                 wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
-            # Invalid Google Doc URL's are fatal, since they cannot be easily changed once cached
-            except (InvalidGoogleDocException, GoogleDocNotFoundException) as e:
-                logger.error(f"{e}")
-                wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
-            # Other exceptions are non-fatal, since the user can make adjustments without modifying cached credentials
             except Exception as e:
                 logger.error(f"{e}")
-                # Present the error message to the user, but allow them to continue caching credentials
+                # TODO: This check was inserted for instances when Google Docs were still being checked and were invalid
+                # TODO: Since google docs were removed, this check is probably no longer needed
                 if wx.YES == wx.MessageBox(f"{e}. \n\nContinue caching anyway?", 'Error', wx.YES_NO | wx.ICON_ERROR):
                     try:
                         logger.debug("Attempting to cache credentials despite error")
@@ -844,15 +1050,21 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
 
     def on_login(self, event):
-        # change login button to "Logging in..."
+        self.set_wallet_ui_state(WalletUIState.BUSY, "Logging in...")
         self.btn_login.SetLabel("Logging in...")
         self.btn_login.Update()
 
-        username = self.txt_user.GetValue()
-        password = self.txt_pass.GetValue()
+        username = self.login_txt_username.GetValue()
+        password = self.login_txt_password.GetValue()
 
         try:
-            self.task_manager = PostFiatTaskManager(username=username, password=password)
+            self.task_manager = PostFiatTaskManager(
+                username=username, 
+                password=password,
+                network_url=self.network_url,
+                config=self.config
+            )
+
         except (ValueError, InvalidToken, KeyError) as e:
             logger.error(f"Login failed: {e}")
             self.show_error("Invalid username or password")
@@ -866,40 +1078,94 @@ class WalletApp(wx.Frame):
             self.btn_login.Update()
             return
         
+        self.enable_menus()
+        
         self.wallet = self.task_manager.user_wallet
         classic_address = self.wallet.classic_address
 
+        self.update_ui_based_on_wallet_state()
+
         logger.info(f"Logged in as {username}")
+
+        # Save the last logged-in user
+        self.config.set_global_config('last_logged_in_user', username)
 
         # Hide login panel and show tabs
         self.login_panel.Hide()
         self.tabs.Show()
 
-        self.populate_summary_tab(username, classic_address)
+        self.update_account_display(username, classic_address)
 
         # Update layout and ensure correct sizing
         self.panel.Layout()
         self.Layout()
         self.Fit()
 
-        # Fetch and display key account details
-        key_account_details = self.task_manager.process_account_info()
-
-        self.populate_summary_grid(key_account_details)
-
-        self.summary_tab.Layout()  # Update the layout
-
         self.worker = XRPLMonitorThread(self)
         self.worker.start()
 
-        # Immediately populate the grid with current data
-        self.update_data(None)
+        # Populate grids with data.
+        # No need to call sync_and_refresh here, since sync_transactions was called by the task manager's instantiation
+        self.refresh_grids()
 
         # Start timers
-        self.start_json_update_timer()
-        self.start_force_update_timer()
         self.start_pft_update_timer()
         self.start_transaction_update_timer()
+
+        self.set_wallet_ui_state(WalletUIState.IDLE)
+
+    @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
+    def update_ui_based_on_wallet_state(self, is_state_transition=False):
+        """Update UI elements based on wallet state. Only hides PFT tabs if wallet is not active."""
+        current_state = self.task_manager.wallet_state
+        available_tabs = self.STATE_AVAILABLE_TABS[current_state]
+
+        self.tabs.Freeze()
+
+        # Update all tabs' visibility and enabled state
+        for tab_name, tab_page in self.tab_pages.items():
+            tab_index = self.tabs.FindPage(tab_page)
+            if tab_index != wx.NOT_FOUND:
+                if tab_name in available_tabs:
+                    self.tabs.GetPage(tab_index).Enable()
+                else:
+                    self.tabs.GetPage(tab_index).Disable()
+
+        self.tabs.Layout()
+        self.panel.Layout()
+        self.Layout()
+        self.tabs.Thaw()
+
+        # Update summary tab wallet state labels
+        if hasattr(self, 'lbl_wallet_state'):
+            self.lbl_wallet_state.SetLabel(f"Wallet State: {current_state.value}")
+
+        if current_state == WalletState.ACTIVE:
+            if hasattr(self, 'lbl_next_action'):
+                self.lbl_next_action.Hide()
+            if hasattr(self, 'btn_wallet_action'):
+                self.btn_wallet_action.Hide()
+        else:
+            if hasattr(self, 'lbl_next_action'):
+                self.lbl_next_action.Show()
+                self.lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
+            if hasattr(self, 'btn_wallet_action'):
+                self.btn_wallet_action.Show()
+
+        self.summary_sizer.Layout()
+        self.summary_tab.Layout()
+        self.panel.Layout()
+
+        # Only show message box if not a state transition
+        if not is_state_transition:
+            if current_state != WalletState.ACTIVE:
+                required_action = self.task_manager.get_required_action()
+                message = (
+                    f"Some features are currently locked because your wallet is not fully set up.\n\n"
+                    f"Next required action: {required_action}\n\n"
+                    f"All features will be unlocked once wallet reaches '{WalletState.ACTIVE.value}' state."
+                )
+                wx.MessageBox(message, "Wallet Features Limited", wx.OK | wx.ICON_INFORMATION)
 
     def on_create_new_user(self, event):
         self.login_panel.Hide()
@@ -914,56 +1180,155 @@ class WalletApp(wx.Frame):
         self.Refresh()
 
     def show_error(self, message):
-        self.error_label.SetLabel(message)
-        # self.error_label.Show()
+        self.login_error_label.SetLabel(message)
 
         # Simple shake animation
-        original_pos = self.error_label.GetPosition()
+        original_pos = self.login_error_label.GetPosition()
         for i in range(5):
-            self.error_label.Move(original_pos.x + 2, original_pos.y)
+            self.login_error_label.Move(original_pos.x + 2, original_pos.y)
             wx.MilliSleep(40)
-            self.error_label.Move(original_pos.x - 2, original_pos.y)
+            self.login_error_label.Move(original_pos.x - 2, original_pos.y)
             wx.MilliSleep(40)
-        self.error_label.Move(original_pos)
+        self.login_error_label.Move(original_pos)
 
         self.login_panel.Layout()
 
     def on_clear_error(self, event):
-        self.error_label.SetLabel("")
-        # self.error_label.Hide()
+        self.login_error_label.SetLabel("")
         event.Skip()
 
-    def populate_summary_tab(self, username, classic_address):
-        # Clear existing content
-        self.summary_sizer.Clear(True)
+    @PerformanceMonitor.measure('update_account_display')
+    def update_account_display(self, username, classic_address):
+        """Update all account-related display elements"""
+        logger.debug(f"Updating account display for {username}")
 
-        # Add elements to sizer
-        self.summary_sizer.Add(self.lbl_username, flag=wx.ALL, border=5)
-        self.summary_sizer.Add(self.lbl_xrp_balance, flag=wx.ALL, border=5)
-        self.summary_sizer.Add(self.lbl_pft_balance, flag=wx.ALL, border=5)
-        self.summary_sizer.Add(self.lbl_address, flag=wx.ALL, border=5)
-
-        # Create a heading for Key Account Details
-        lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
-        self.summary_sizer.Add(lbl_key_details, flag=wx.ALL, border=5)
-
-        self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
-
-        # Update labels
+        # Update basic account info
         self.lbl_username.SetLabel(f"Username: {username}")
         self.lbl_address.SetLabel(f"XRP Address: {classic_address}")
 
-        # Update account info
-        self.update_account_info()
+        xrp_balance = self.task_manager.get_xrp_balance()
+        xrp_balance = xrpl.utils.drops_to_xrp(str(xrp_balance))
+        self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
-    def update_account_info(self):
-        if self.task_manager:
-            xrp_balance = str(xrpl.utils.drops_to_xrp(self.task_manager.get_xrp_balance()))
-            self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
+        # PFT balance pending update
+        self.lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
 
-            # PFT balance update (placeholder, as it's not streamed)
-            self.lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
+        self.lbl_wallet_state.SetLabel(f"Wallet State: {self.task_manager.wallet_state.value}")
+        self.lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
 
+    def on_take_action(self, event):
+        """Handle wallet action button click based on current state"""
+        current_state = self.task_manager.wallet_state
+
+        match current_state:
+            case WalletState.UNFUNDED:
+                message = (
+                    "To activate your wallet, you need \nto send at least 20 XRP to your address. \n\n"
+                    f"Your XRP address:\n\n{self.wallet.classic_address}\n\n"
+                )
+                dialog = SelectableMessageDialog(self, "Fund Your Wallet", message)
+                dialog.ShowModal()
+                dialog.Destroy()
+
+            case WalletState.FUNDED:
+                message = (
+                    "Your wallet needs a trust line to handle PFT tokens.\n\n"
+                    "This transaction will:\n"
+                    "- Set up the required trust line\n"
+                    "- Cost a small amount of XRP (~0.00001 XRP)\n"
+                    "- Enable PFT token transactions\n\n"
+                    "Proceed?"
+                )
+                if wx.YES == wx.MessageBox(message, "Set Trust Line", wx.YES_NO | wx.ICON_QUESTION):
+                    try:
+                        self.worker.expecting_state_change = True
+                        self.task_manager.handle_trust_line()
+                        wx.CallAfter(self.update_account_info)  # TODO: Not sure if this is needed
+                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                    except Exception as e:
+                        logger.error(f"Error setting trust line: {e}")
+                        wx.MessageBox(f"Error setting trust line: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+            case WalletState.TRUSTLINED:
+                message = (
+                    "To start accepting tasks, you need to perform the Initiation Rite.\n\n"
+                    "This transaction will cost 1 XRP.\n\n"
+                    "Please write 1 sentence committing to a long term objective of your choice:"
+                )
+                dialog = CustomDialog("Initiation Rite", ["Commitment"], message=message)
+                if dialog.ShowModal() == wx.ID_OK:
+                    commitment = dialog.GetValues()["Commitment"]
+                    try:
+                        self.worker.expecting_state_change = True
+                        response = self.task_manager.send_initiation_rite(commitment)
+                        formatted_response = self.format_response(response)
+                        dialog = SelectableMessageDialog(self, "Initiation Rite Result", formatted_response)
+                        dialog.ShowModal()
+                        dialog.Destroy()
+                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                    except Exception as e:
+                        logger.error(f"Error sending initiation rite: {e}")
+                        wx.MessageBox(f"Error sending initiation rite: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                dialog.Destroy()
+
+            case WalletState.INITIATED:
+                template_text = (
+                    f"{self.wallet.classic_address}\n"
+                    "___x TASK VERIFICATION SECTION START x___\n \n"
+                    "___x TASK VERIFICATION SECTION END x___\n"
+                )
+                
+                message = (
+                    "To continue with wallet initialization,\nyou need to provide a Google Doc link.\n\n"
+                    "This document should:\n"
+                    "- Be viewable by anyone who has the link\n"
+                    "- Have your XRP address on the first line\n"
+                    "- Include a task verification section\n\n"
+                    "Copy and paste the text below into your Google Doc:\n\n"
+                    f"\n{template_text}\n\n"
+                    "When you're ready, click OK to proceed."
+                )
+
+                template_dialog = SelectableMessageDialog(self, "Google Doc Setup", message)
+                template_dialog.ShowModal()
+                template_dialog.Destroy()
+
+                message = "Now enter the link for your Google Doc:"
+
+                dialog = CustomDialog("Google Doc Setup", ["Google Doc Share Link"], message=message)
+                if dialog.ShowModal() == wx.ID_OK:
+                    google_doc_link = dialog.GetValues()["Google Doc Share Link"]
+                    try:
+                        self.worker.expecting_state_change = True
+                        self.task_manager.handle_google_doc_setup(google_doc_link)
+                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                    except Exception as e:
+                        logger.error(f"Error setting up Google Doc: {e}")
+                        wx.MessageBox(f"Error setting up Google Doc: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                dialog.Destroy()
+            
+            case WalletState.GOOGLE_DOC_SENT:
+                message = (
+                    "To continue with wallet initialization, you need to send a User Genesis transaction.\n\n"
+                    "This transaction will:\n"
+                    "- Cost 7 PFT\n"
+                    "- Register you as a user in the Post Fiat network\n"
+                    "- Enable you to start accepting tasks\n\n"
+                    "Proceed?"
+                )
+                if wx.YES == wx.MessageBox(message, "Send Genesis Transaction", wx.YES_NO | wx.ICON_QUESTION):
+                    try:
+                        self.worker.expecting_state_change = True
+                        self.task_manager.handle_genesis()
+                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                    except Exception as e:
+                        logger.error(f"Error sending genesis transaction: {e}")
+                        wx.MessageBox(f"Error sending genesis transaction: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+            case _:
+                logger.error(f"Unknown wallet state: {current_state}")
+
+    @PerformanceMonitor.measure('run_bg_job')
     def run_bg_job(self, job):
         if self.worker.context:
             asyncio.run_coroutine_threadsafe(job, self.worker.loop)
@@ -971,14 +1336,93 @@ class WalletApp(wx.Frame):
     def update_ledger(self, message):
         pass  # Simplified for this version
 
+    @PerformanceMonitor.measure('update_account')
     def update_account(self, acct):
+        logger.debug(f"Updating account: {acct}")
         xrp_balance = str(xrpl.utils.drops_to_xrp(acct["Balance"]))
         self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
+        # Check if account state should change
+        if self.task_manager:
+            current_state = self.task_manager.wallet_state
+
+            # If balance is > 0 XRP and current state is UNFUNDED, update state
+            if (current_state == WalletState.UNFUNDED and float(xrp_balance) > 0):
+                logger.info("Account now funded. Updating wallet state.")
+                self.task_manager.wallet_state = WalletState.FUNDED
+                if hasattr(self, 'worker'):
+                    self.worker.expecting_state_change = False
+                message = (
+                    "Your wallet is now funded!\n\n"
+                    "You can now proceed with setting up a trust line for PFT tokens.\n"
+                    "Click the 'Take Action' button to continue."
+                )
+                wx.CallAfter(lambda: wx.MessageBox(message, "XRP Received!", wx.OK | wx.ICON_INFORMATION))
+                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+
+            # If trust line is detected and current state is FUNDED
+            elif (current_state == WalletState.FUNDED and self.task_manager.has_trust_line()):
+                logger.info("Trust line detected. Updating wallet state.")
+                self.task_manager.wallet_state = WalletState.TRUSTLINED
+                if hasattr(self, 'worker'):
+                    self.worker.expecting_state_change = False
+                message = (
+                    "Trust line successfully established!\n\n"
+                    "You can now proceed with the initiation rite.\n"
+                    "Click the 'Take Action' button to continue."                    
+                )
+                wx.CallAfter(lambda: wx.MessageBox(message, "Trust Line Set!", wx.OK | wx.ICON_INFORMATION))
+                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+
+            # If initiation rite is detected and current state is TRUSTLINED
+            elif (current_state == WalletState.TRUSTLINED and self.task_manager.initiation_rite_sent()):
+                logger.info("Initiation rite detected. Updating wallet state.")
+                self.task_manager.wallet_state = WalletState.INITIATED
+                if hasattr(self, 'worker'):
+                    self.worker.expecting_state_change = False
+                message = (
+                    "Initiation rite successfully sent!\n\n"
+                    "You can now proceed with setting up your Google Doc.\n"
+                    "Click the 'Take Action' button to continue."
+                )
+                wx.CallAfter(lambda: wx.MessageBox(message, "Initiation Complete!", wx.OK | wx.ICON_INFORMATION))
+                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+
+            # If Google Doc is detected and current state is INITIATED
+            elif (current_state == WalletState.INITIATED and self.task_manager.google_doc_sent()):
+                logger.info("Google Doc detected. Updating wallet state.")
+                self.task_manager.wallet_state = WalletState.GOOGLE_DOC_SENT
+                if hasattr(self, 'worker'):
+                    self.worker.expecting_state_change = False
+                message = (
+                    "Google Doc successfully set up!\n\n"
+                    "You can now proceed with the final step: sending your genesis transaction.\n"
+                    "Click the 'Take Action' button to continue."
+                )
+                wx.CallAfter(lambda: wx.MessageBox(message, "Google Doc Ready!", wx.OK | wx.ICON_INFORMATION))
+                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+
+            # If genesis is detected and current state is GOOGLE_DOC_SENT
+            elif (current_state == WalletState.GOOGLE_DOC_SENT and self.task_manager.genesis_sent()):
+                logger.info("Genesis transaction detected. Updating wallet state.")
+                self.task_manager.wallet_state = WalletState.ACTIVE
+                if hasattr(self, 'worker'):
+                    self.worker.expecting_state_change = False
+                message = (
+                    "Genesis transaction successful!\n\n"
+                    "Your wallet is now fully initialized and ready to use.\n"
+                    "You can now start accepting tasks."
+                )
+                wx.CallAfter(lambda: wx.MessageBox(message, "Wallet Activated!", wx.OK | wx.ICON_INFORMATION))
+                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+
+    @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('update_tokens')
     def update_tokens(self, account_address):
+        #TODO: refactor this to use the task manager
         logger.debug(f"Fetching token balances for account: {account_address}")
         try:
-            client = xrpl.clients.JsonRpcClient("https://s2.ripple.com:51234")
+            client = xrpl.clients.JsonRpcClient(self.network_url)
             account_lines = xrpl.models.requests.AccountLines(
                 account=account_address,
                 ledger_index="validated"
@@ -994,10 +1438,9 @@ class WalletApp(wx.Frame):
             logger.debug(f"Account lines: {lines}")
 
             pft_balance = 0.0
-            issuer_address = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
             for line in lines:
                 logger.debug(f"Processing line: {line}")
-                if line['currency'] == 'PFT' and line['account'] == issuer_address:
+                if line['currency'] == 'PFT' and line['account'] == ISSUER_ADDRESS:
                     pft_balance = float(line['balance'])
                     logger.debug(f"Found PFT balance: {pft_balance}")
 
@@ -1009,17 +1452,12 @@ class WalletApp(wx.Frame):
     def on_close(self, event):
         if self.worker:
             self.worker.loop.stop()
+
+        if self.perf_monitor:
+            self.perf_monitor.stop()
+            self.perf_monitor = None
+
         self.Destroy()
-
-    def start_json_update_timer(self):
-        self.json_update_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.update_data, self.json_update_timer)
-        self.json_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000) 
-
-    def start_force_update_timer(self):
-        self.force_update_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.on_force_update, self.force_update_timer)
-        self.force_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def start_pft_update_timer(self):
         self.pft_update_timer = wx.Timer(self)
@@ -1031,57 +1469,136 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
         self.tx_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
 
-    def on_transaction_update_timer(self, _):
-        logger.debug("Transaction update timer triggered")
-        self.task_manager.sync_transactions()
-
-    def update_data(self, event):
+    def _sync_and_refresh(self):
+        """Internal method to sync transactions and refresh grids"""
         try:
-            # Get proposals tab data
-            proposals_df = self.task_manager.get_proposals_df()
-            wx.PostEvent(self, UpdateGridEvent(data=proposals_df, target="proposals"))
-
-            # Get Rewards tab data
-            rewards_df = self.task_manager.get_rewards_df()
-            wx.PostEvent(self, UpdateGridEvent(data=rewards_df, target="rewards"))
-
-            # Get Verification tab data
-            verification_df = self.task_manager.get_verification_df()
-            wx.PostEvent(self, UpdateGridEvent(data=verification_df, target="verification"))
-
-            # Get Memos tab data
-            memos_df = self.task_manager.get_memos_df()
-            wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos"))
-
+            self.set_wallet_ui_state(WalletUIState.SYNCING, "Syncing transactions...")
+            if self.task_manager.sync_transactions():
+                logger.debug("New transactions found, updating grids")
+                self.refresh_grids()
+            else:
+                logger.debug("No new transactions found, skipping grid updates.")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
         except Exception as e:
-            logger.exception(f"Error updating data: {e}")
+            logger.error(f"Error during sync and refresh cycle: {e}")
+            self.set_wallet_ui_state(WalletUIState.IDLE, f"Sync error: {e}")
+            raise
 
+    def on_transaction_update_timer(self, _):
+        """Timer-triggered update"""
+        logger.debug("Transaction update timer triggered")
+        try:
+            self._sync_and_refresh()
+        except Exception as e:
+            logger.error(f"Timer update failed: {e}")
+    
+    def on_force_update(self, _):
+        """Handle manual force update requests"""
+        logger.info("Manual force update triggered")
+        self.btn_force_update.SetLabel("Updating...")
+        self.btn_force_update.Update()
+
+        try:
+            self._sync_and_refresh()
+        except Exception as e:
+            logger.error(f"Force update failed: {e}")
+            wx.MessageBox(
+                "Failed to update wallet data. Please check the console log for more details.",
+                "Force Update Error",
+                wx.OK | wx.ICON_ERROR
+            )
+        finally:
+            self.btn_force_update.SetLabel("Force Update")
+            self.btn_force_update.Update()
+
+    @PerformanceMonitor.measure('refresh_grids')
+    def refresh_grids(self, event=None):
+        """Update all grids based on wallet state with proper error handling"""
+        logger.debug("Starting grid refresh")
+        current_state = self.task_manager.wallet_state
+
+        # Summary grid (available in FUNDED_STATES)
+        if current_state in FUNDED_STATES:
+            try: 
+                key_account_details = self.task_manager.process_account_info()
+                wx.PostEvent(self, UpdateGridEvent(data=key_account_details, target="summary", caller=f"{self.__class__.__name__}.refresh_grids"))
+            except Exception as e:
+                logger.error(f"Failed updating summary grid: {e}")
+
+        # Memos grid (available in TRUSTLINED_STATES)
+        if current_state in TRUSTLINED_STATES:
+            try:
+                memos_df = self.task_manager.get_memos_df()
+                wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos", caller=f"{self.__class__.__name__}.refresh_grids"))
+            except Exception as e:
+                logger.error(f"Failed updating memos grid: {e}")
+
+        # Proposals, Rewards, and Verification grids (available in PFT_STATES)
+        if current_state in PFT_STATES:
+            for grid_type, getter_method in [
+                ("proposals", self.task_manager.get_proposals_df),
+                ("rewards", self.task_manager.get_rewards_df),
+                ("verification", self.task_manager.get_verification_df)
+            ]:
+                try:
+                    data = getter_method()
+                    wx.PostEvent(self, UpdateGridEvent(data=data, target=grid_type, caller=f"{self.__class__.__name__}.refresh_grids"))
+                except Exception as e:
+                    logger.error(f"Failed updating {grid_type} grid: {e}")
+
+    @PerformanceMonitor.measure('update_grid')
     def update_grid(self, event):
-        logger.debug(f"Updating grid with target: {getattr(event, 'target')}")
-        if hasattr(event, 'target'):
-            match event.target:
-                case "rewards":
-                    self.populate_grid_generic(self.rewards_grid, event.data, 'rewards')
-                case "verification":
-                    self.populate_grid_generic(self.verification_grid, event.data, 'verification')
-                case "proposals":
-                    self.populate_grid_generic(self.proposals_grid, event.data, 'proposals')
-                case "memos":
-                    self.populate_grid_generic(self.memos_grid, event.data, 'memos')
-                case "summary":
-                    self.populate_summary_grid(event.data)
-                case _:
-                    logger.error(f"Unknown grid target: {event.target}")
+        """Update a specific grid based on the event target and wallet state"""
+        if not hasattr(event, 'target'):
+            logger.error(f"No target found in event: {event}")
+            return
+        
+        current_state = self.task_manager.wallet_state
+
+        # Define wallet state requirements for each grid
+        grid_state_requirements = {
+            'rewards': PFT_STATES,
+            'verification': PFT_STATES,
+            'proposals': PFT_STATES,
+            'memos': TRUSTLINED_STATES,
+            'summary': []
+        }
+
+        target = event.target
+        required_states = grid_state_requirements.get(target, [])
+
+        # Skip grid update if wallet state is not met
+        if required_states and current_state not in required_states:
+            logger.debug(f"Skipping {target} grid update because wallet state is {current_state}")
+            return
+
+        # Handle each grid based on target
+        match event.target:
+            case "rewards":
+                self.populate_grid_generic(self.rewards_grid, event.data, 'rewards')
+            case "verification":
+                self.populate_grid_generic(self.verification_grid, event.data, 'verification')
+            case "proposals":
+                self.populate_grid_generic(self.proposals_grid, event.data, 'proposals')
+            case "memos":
+                self.populate_grid_generic(self.memos_grid, event.data, 'memos')
+            case "summary":
+                self.populate_summary_grid(event.data)
+            case _:
+                logger.error(f"Unknown grid target: {event.target}")
+
         self.auto_size_window()
 
+    @PerformanceMonitor.measure('on_pft_update_timer')
     def on_pft_update_timer(self, event):
+        self.set_wallet_ui_state(WalletUIState.SYNCING, "Updating token balance...")
         if self.wallet:
             self.update_tokens(self.wallet.classic_address)
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
+    @PerformanceMonitor.measure('populate_grid_generic')
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
         """Generic grid population method that respects zoom settings"""
-        logger.debug(f"Populating {grid_name} grid with {data.shape[0]} rows")
-        logger.debug(f"DataFrame Columns: {data.columns}")
 
         if data.empty:
             logger.debug(f"No data to populate {grid_name} grid")
@@ -1139,6 +1656,7 @@ class WalletApp(wx.Frame):
 
         self.auto_size_window()
 
+    @PerformanceMonitor.measure('populate_summary_grid')
     def populate_summary_grid(self, key_account_details):
         """Convert dictionary to dataframe and use generic grid population method"""
         summary_df = pd.DataFrame(list(key_account_details.items()), columns=['Key', 'Value'])
@@ -1245,6 +1763,7 @@ class WalletApp(wx.Frame):
         event.Skip()
 
     def on_request_task(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Requesting Task...")
         self.btn_request_task.SetLabel("Requesting Task...")
         self.btn_request_task.Update()
 
@@ -1258,13 +1777,15 @@ class WalletApp(wx.Frame):
                     wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
             except Exception as e:
                 logger.error(f"Error converting response to status message: {e}")
-            wx.CallLater(30000, self.update_data, None)
+            wx.CallLater(30000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_request_task.SetLabel("Request Task")
         self.btn_request_task.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_accept_task(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Accepting Task...")
         self.btn_accept_task.SetLabel("Accepting Task...")
         self.btn_accept_task.Update()
 
@@ -1294,13 +1815,15 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(message, 'Task Acceptance Result', wx.OK | wx.ICON_INFORMATION)
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.update_data, None)
+                wx.CallLater(5000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
         self.btn_accept_task.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_refuse_task(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Refusing Task...")
         self.btn_refuse_task.SetLabel("Refusing Task...")
         self.btn_refuse_task.Update()
 
@@ -1326,13 +1849,15 @@ class WalletApp(wx.Frame):
                         logger.error("No response from send_refusal_for_task")
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.update_data, None)
+                wx.CallLater(5000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_refuse_task.SetLabel("Refuse Task")
         self.btn_refuse_task.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_for_verification(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting for Verification...")
         self.btn_submit_for_verification.SetLabel("Submitting for Verification...")
         self.btn_submit_for_verification.Update()
 
@@ -1364,14 +1889,16 @@ class WalletApp(wx.Frame):
                         logger.error("No response from submit_initial_completion")
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.update_data, None)
+                wx.CallLater(5000, self.refresh_grids, None)
             
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
         self.btn_submit_for_verification.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_verification_details(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Verification Details...")
         self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
         self.btn_submit_verification_details.Update()
 
@@ -1402,47 +1929,10 @@ class WalletApp(wx.Frame):
         self.txt_verification_details.SetValue("")
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
-
-    def on_force_update(self, event):
-        self.btn_force_update.SetLabel("Updating...")
-        self.btn_force_update.Update()
-
-        logger.info("Kicking off Force Update")
-
-        try:
-            key_account_details = self.task_manager.process_account_info()
-            self.populate_summary_grid(key_account_details)
-        except Exception as e:
-            logger.error(f"FAILED UPDATING SUMMARY DATA: {e}")
-
-        try:
-            proposals_df = self.task_manager.get_proposals_df()
-            self.populate_grid_generic(self.proposals_grid, proposals_df, 'proposals')
-        except Exception as e:
-            logger.error(f"FAILED UPDATING PROPOSALS DATA: {e}")
-
-        try:
-            verification_data = self.task_manager.get_verification_df()
-            self.populate_grid_generic(self.verification_grid, verification_data, 'verification')
-        except Exception as e:
-            logger.error(f"FAILED UPDATING VERIFICATION DATA: {e}")
-
-        try:
-            rewards_data = self.task_manager.get_rewards_df()
-            self.populate_grid_generic(self.rewards_grid, rewards_data, 'rewards')
-        except Exception as e:
-            logger.error(f"FAILED UPDATING REWARDS DATA: {e}")
-
-        # try:
-        memos_data = self.task_manager.get_memos_df()
-        self.populate_grid_generic(self.memos_grid, memos_data, 'memos')
-        # except Exception as e:
-        #     logger.error(f"FAILED UPDATING MEMOS DATA: {e}")
-
-        self.btn_force_update.SetLabel("Force Update")
-        self.btn_force_update.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_log_pomodoro(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Logging Pomodoro...")
         self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
         self.btn_log_pomodoro.Update()
 
@@ -1459,9 +1949,11 @@ class WalletApp(wx.Frame):
         self.txt_verification_details.SetValue("")
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
         self.btn_log_pomodoro.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_memo(self, event):
         """Submits a memo to the remembrancer."""
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Memo...")
         self.btn_submit_memo.SetLabel("Submitting...")
         self.btn_submit_memo.Update()
 
@@ -1518,8 +2010,10 @@ class WalletApp(wx.Frame):
             
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.txt_memo_input.SetValue("")
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_xrp_payment(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting XRP Payment...")
         self.btn_submit_xrp_payment.SetLabel("Submitting...")
         self.btn_submit_xrp_payment.Update()
 
@@ -1542,8 +2036,10 @@ class WalletApp(wx.Frame):
 
         self.btn_submit_xrp_payment.SetLabel("Submit Payment")
         self.btn_submit_xrp_payment.Update()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_pft_payment(self, event):
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting PFT Payment...")
         self.btn_submit_pft_payment.SetLabel("Submitting...")
         self.btn_submit_pft_payment.Update()
 
@@ -1574,17 +2070,126 @@ class WalletApp(wx.Frame):
 
         self.btn_submit_pft_payment.SetLabel("Submit Payment")
         self.btn_submit_pft_payment.Update()
-
+        self.set_wallet_ui_state(WalletUIState.IDLE)
     def on_show_secret(self, event):
-        self.btn_show_secret.SetLabel("Showing Secret...")
-        self.btn_show_secret.Update()
+        dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your secret.")
 
-        classic_address = self.wallet.classic_address
-        secret = self.wallet.seed
-        wx.MessageBox(f"Classic Address: {classic_address}\nSecret: {secret}", 'Wallet Secret', wx.OK | wx.ICON_INFORMATION)
+        if dialog.ShowModal() == wx.ID_OK:
+            password = dialog.GetValue()
+            dialog.Destroy()
 
-        self.btn_show_secret.SetLabel("Show Secret")
-        self.btn_show_secret.Update()
+            try: 
+                if self.task_manager.verify_password(password):
+                    seed = self.wallet.seed
+                    message = (
+                        "WARNING: NEVER share this with anyone!\n\n"
+                        f"Secret: {seed}"
+                    )
+                    seed_dialog = SelectableMessageDialog(self, "Wallet Secret", message)
+                    seed_dialog.ShowModal()
+                    seed_dialog.Destroy()
+                else:
+                    wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
+            except Exception as e:
+                logger.error(f"Error showing secret: {e}")
+                wx.MessageBox(f"Error showing secret: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        
+        else:
+            dialog.Destroy()
+
+    def validate_password(self, password):
+        """Validate password requirements"""
+        if len(password) < 8:
+            return False, "Password must be at least 8 characters long"
+        return True, ""
+
+    def on_change_password(self, event):
+        """Handle password change request"""
+        dialog = ChangePasswordDialog(self)
+        while True:  # Keep dialog open until success or cancel
+            if dialog.ShowModal() == wx.ID_OK:
+                try:
+                    current_password = dialog.current_password.GetValue()
+                    new_password = dialog.new_password.GetValue()
+                    confirm_password = dialog.confirm_password.GetValue()
+
+                    # Verify current password
+                    if not self.task_manager.verify_password(current_password):
+                        raise ValueError("Incorrect password")
+
+                    # Validate new password
+                    is_valid, error_message = self.validate_password(new_password)
+                    if not is_valid:
+                        raise ValueError(error_message)
+                        
+                    # Check if passwords match
+                    if new_password != confirm_password:
+                        raise ValueError("New passwords do not match")
+                        
+                    # Attempt password change
+                    success = self.task_manager.credential_manager.change_password(
+                        current_password, new_password
+                    )
+                    
+                    if success:
+                        wx.MessageBox(
+                            "Password changed successfully!", 
+                            "Success",
+                            wx.OK | wx.ICON_INFORMATION
+                        )
+                        break
+                        
+                except ValueError as e:
+                    wx.MessageBox(
+                        str(e),
+                        "Error",
+                        wx.OK | wx.ICON_ERROR
+                    )
+                except Exception as e:
+                    wx.MessageBox(
+                        f"An error occurred: {e}",
+                        "Error",
+                        wx.OK | wx.ICON_ERROR
+                    )
+            else: 
+                break 
+        dialog.Destroy()
+
+    def on_delete_credentials(self, event):
+        """Handle delete credentials request"""
+        logger.info("Credentials deletion requested")
+        
+        dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to delete your account.")
+
+        if dialog.ShowModal() == wx.ID_OK:
+            password = dialog.GetValue()
+            dialog.Destroy()
+
+            if self.task_manager.verify_password(password):
+                delete_dialog = DeleteCredentialsDialog(self)
+                if delete_dialog.ShowModal() == wx.ID_OK:
+                    try:
+                        # Attempt to delete account
+                        self.task_manager.credential_manager.delete_credentials()
+
+                        logger.info("Account deleted successfully")
+                        wx.MessageBox("Your credentials have been deleted.\nYou will now be logged out.", 
+                                      "Account Deleted", 
+                                      wx.OK | wx.ICON_INFORMATION)
+                        
+                        delete_dialog.Destroy()
+                        self.logout()
+
+                    except Exception as e:
+                        logger.error(f"Error deleting credentials: {e}")
+                        wx.MessageBox(f"Error deleting credentials: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                else:
+                    delete_dialog.Destroy()
+            else:
+                wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
+
+        else:
+            dialog.Destroy()
 
     def format_response(self, response):
         if isinstance(response, list):
@@ -1654,7 +2259,126 @@ class WalletApp(wx.Frame):
             int(color.Blue() * factor),
             color.Alpha()
         )
+    
+    def launch_perf_monitor(self, event=None):
+        """Toggle the performance monitor on and off"""
+        if self.perf_monitor is None:
+            self.perf_monitor = PerformanceMonitor(
+                output_dir=Path.cwd() / "pftpyclient" / "logs"
+            )
+            PerformanceMonitor._instance = self.perf_monitor
+
+            def monitor_thread():
+                self.perf_monitor.start()
+                while not self.perf_monitor.shutdown_event.is_set():
+                    time.sleep(1)
+                self.perf_monitor.stop()
+                self.perf_monitor = None
+                PerformanceMonitor._instance = None
         
+            Thread(target=monitor_thread, daemon=True).start()
+
+    def on_preferences(self, event):
+        """Handle preferences dialog"""
+        dialog = PreferencesDialog(self)
+        if dialog.ShowModal() == wx.ID_OK:
+            # Check if performance monitor setting changed
+            if self.config.get_global_config('performance_monitor'):
+                self.launch_perf_monitor(None)
+            else:
+                if self.perf_monitor:
+                    self.perf_monitor.shutdown_event.set()
+        dialog.Destroy()
+
+    def set_wallet_ui_state(self, state: WalletUIState, message: str = ""):
+        """Update the status bar with current wallet state"""
+        self.current_ui_state = state
+        status_text = message or f"Wallet state: {state.name.lower()}"
+        self.status_bar.SetStatusText(status_text, 0)
+        self.status_bar.SetStatusText(state.name, 1)
+
+    def is_wallet_busy(self):
+        """Check if wallet is in a busy state"""
+        return hasattr(self, 'current_ui_state') and self.current_ui_state != WalletUIState.IDLE
+    
+    def on_logout(self, event):
+        """Handle logout request"""
+        if self.is_wallet_busy():
+            wx.MessageBox("Please wait for the current operation to complete before logging out.", "Wallet Busy", wx.OK | wx.ICON_WARNING)
+            return
+
+        if wx.YES == wx.MessageBox("Are you sure you want to logout?", "Confirm Logout", wx.YES_NO | wx.ICON_QUESTION):
+            self.logout()
+
+    def logout(self):
+        """Perform logout operations and reset UI"""
+        try:
+
+            # Stop background processes
+            if hasattr(self, 'worker') and self.worker:
+                # Signal the worker to stop
+                self.worker.stop()
+
+                # Cancel any pending tasks
+                pending_tasks = asyncio.all_tasks(self.worker.loop)
+                for task in pending_tasks:
+                    task.cancel()
+
+                # Run the loop one last time to process cancellations
+                if pending_tasks:
+                    try:
+                        self.worker.loop.call_soon_threadsafe(
+                            lambda: self.worker.loop.stop()
+                        )
+                    except Exception as e:
+                        pass  # Ignore any errors during loop stop
+            
+                # Wait for thread to complete (with timeout)
+                self.worker.join(timeout=2)
+                if self.worker.is_alive():
+                    logger.error("Worker thread did not stop gracefully")
+                self.worker = None
+
+            # Stop timers
+            if hasattr(self, 'pft_update_timer'):
+                logger.debug("Stopping PFT update timer")
+                self.pft_update_timer.Stop()
+
+            if hasattr(self, 'tx_update_timer'):
+                logger.debug("Stopping TX update timer")
+                self.tx_update_timer.Stop()
+
+            # Clear sensitive data
+            if hasattr(self, 'task_manager'):
+                logger.debug("Clearing credentials")
+                self.task_manager.credential_manager.clear_credentials()
+                self.task_manager = None
+
+            if hasattr(self, 'wallet'):
+                logger.debug("Clearing wallet")
+                self.wallet = None
+
+            self.tabs.Hide()
+
+            # Reset menu state
+            self.menubar.EnableTop(self.menubar.FindMenu("Account"), False)
+
+            logger.debug("Logging out...")
+
+            # Show login panel
+            self.btn_login.SetLabel("Login")
+            self.btn_login.Update()
+            self.login_panel.Show()
+            self.login_txt_password.SetValue("")            
+            self.login_txt_password.Update()
+
+            # Reset status bar
+            self.set_wallet_ui_state(WalletUIState.IDLE, "Logged out")
+
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+            wx.MessageBox(f"Error during logout: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
         url = link.GetHref()
@@ -1698,6 +2422,177 @@ class SelectableMessageDialog(wx.Dialog):
         </html>
         """
         self.html_window.SetPage(html_content)
+
+class ChangePasswordDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Change Password")
+
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Current password
+        current_label = wx.StaticText(panel, label="Current Password:")
+        self.current_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        sizer.Add(current_label, 0, wx.ALL, 5)
+        sizer.Add(self.current_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+
+        # New password
+        new_label = wx.StaticText(panel, label="New Password:")
+        self.new_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        sizer.Add(new_label, 0, wx.ALL, 5)
+        sizer.Add(self.new_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        
+        # Confirm password
+        confirm_label = wx.StaticText(panel, label="Confirm New Password:")
+        self.confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        sizer.Add(confirm_label, 0, wx.ALL, 5)
+        sizer.Add(self.confirm_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
+        
+        # Buttons
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        ok_button = wx.Button(panel, wx.ID_OK, "Change Password")
+        cancel_button = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        button_sizer.Add(ok_button, 0, wx.ALL, 5)
+        button_sizer.Add(cancel_button, 0, wx.ALL, 5)
+        sizer.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+
+        panel.SetSizer(sizer)
+        self.Center()
+
+class DeleteCredentialsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Delete Credentials")
+        self.InitUI()
+
+    def InitUI(self):
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Warning icon and text
+        warning_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        warning_bitmap = wx.ArtProvider.GetBitmap(wx.ART_WARNING, size=(32, 32))
+        warning_icon = wx.StaticBitmap(self, bitmap=warning_bitmap)
+        warning_sizer.Add(warning_icon, 0, wx.ALL, 5)
+
+        warning_text = (
+            "WARNING: This action cannot be undone!\n\n"
+            "• All local credentials will be deleted for this account.\n"
+            "• Your XRP wallet will remain on the XRPL but you will lose access\n"
+            "• Any PFT tokens in your wallet will become inaccessible\n\n"
+            "MAKE SURE YOU HAVE BACKED UP YOUR XRP SECRET KEY\n"
+            "BEFORE PROCEEDING!\n\n"
+        )
+
+        warning_label = wx.StaticText(self, label=warning_text)
+        warning_label.Wrap(400)
+        warning_sizer.Add(warning_label, 1, wx.ALL, 5)
+        main_sizer.Add(warning_sizer, 0, wx.EXPAND | wx.ALL, 10)
+
+        # Confirmation text input
+        confirm_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        confirm_label = wx.StaticText(self, label="Type DELETE to confirm:")
+        self.confirm_input = wx.TextCtrl(self)
+        
+        confirm_sizer.Add(confirm_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        confirm_sizer.Add(self.confirm_input, 1, wx.EXPAND, 10)
+        main_sizer.Add(confirm_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Buttons
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        warning_bitmap = wx.ArtProvider.GetBitmap(wx.ART_WARNING, size=(16, 16))
+        warning_icon = wx.StaticBitmap(self, bitmap=warning_bitmap)
+        self.delete_button = wx.Button(self, label="Delete Account")
+        cancel_button = wx.Button(self, label="Cancel")
+
+        button_sizer.Add(warning_icon, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        button_sizer.Add(self.delete_button, 1, wx.ALL, 5)
+        button_sizer.Add(cancel_button, 1, wx.ALL, 5)
+        main_sizer.Add(button_sizer, 0, wx.ALL | wx.EXPAND, 5)
+
+        self.SetSizer(main_sizer)
+
+        # Bind events
+        self.delete_button.Bind(wx.EVT_BUTTON, self.on_delete)
+        cancel_button.Bind(wx.EVT_BUTTON, self.on_cancel)
+        self.confirm_input.Bind(wx.EVT_TEXT, self.on_text_change)
+
+        # Initially disable delete button
+        self.delete_button.Enable(False)
+
+        # Set initial size
+        self.SetSize(self.GetBestSize())
+
+    def on_text_change(self, event):
+        """Enable delete button only when confirmation text matches exactly"""
+        self.delete_button.Enable(
+            self.confirm_input.GetValue() == "DELETE"
+        )
+
+    def on_delete(self, event):
+        self.EndModal(wx.ID_OK)
+
+    def on_cancel(self, event):
+        self.EndModal(wx.ID_CANCEL)
+
+
+class PreferencesDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Preferences")
+        self.config = parent.config
+        self.InitUI()
+
+    def InitUI(self):
+        panel = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+
+        # Create a static box for grouping preferences
+        sb = wx.StaticBox(panel, label="Application Settings")
+        sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
+
+        # Performance Monitor checkbox
+        self.perf_monitor = wx.CheckBox(panel, label="Enable Performance Monitor")
+        self.perf_monitor.SetValue(self.config.get_global_config('performance_monitor'))
+        sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Cache Format radio buttons
+        cache_box = wx.StaticBox(panel, label="Transaction Cache Format")
+        cache_sbs = wx.StaticBoxSizer(cache_box, wx.VERTICAL)
+
+        self.cache_csv = wx.RadioButton(panel, label="CSV", style=wx.RB_GROUP)
+        self.cache_pickle = wx.RadioButton(panel, label="Pickle")
+
+        current_format = self.config.get_global_config("transaction_cache_format")
+        if current_format == "csv":
+            self.cache_csv.SetValue(True)
+        else:
+            self.cache_pickle.SetValue(True)
+
+        cache_sbs.Add(self.cache_csv, 0, wx.ALL, 5)
+        cache_sbs.Add(self.cache_pickle, 0, wx.ALL, 5)
+        sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Add the static box to the main vertical box
+        vbox.Add(sbs, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Add OK and Cancel buttons
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        ok_button = wx.Button(panel, wx.ID_OK, "OK")
+        cancel_button = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        button_sizer.Add(ok_button, 0, wx.ALL, 5)
+        button_sizer.Add(cancel_button, 0, wx.ALL, 5)
+        vbox.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+
+        # Bind the OK button event
+        ok_button.Bind(wx.EVT_BUTTON, self.on_ok)
+
+        panel.SetSizer(vbox)
+        vbox.Fit(panel)
+        self.Center()
+
+    def on_ok(self, event):
+        """Save config when OK is clicked"""
+        self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
+        self.config.set_global_config('transaction_cache_format', 'csv' if self.cache_csv.GetValue() else 'pickle')
+        self.EndModal(wx.ID_OK)
 
 def main():
     logger.info("Starting Post Fiat Wallet")

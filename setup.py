@@ -1,31 +1,37 @@
 from setuptools import setup, find_packages
 import os
+import sys
 
 def read(fname):
     return open(os.path.join(os.path.dirname(__file__), fname)).read()
+
+install_requires = [
+    'numpy',
+    'pandas',
+    'sqlalchemy',
+    'cryptography',
+    'xrpl-py',
+    'wxPython',
+    'requests',
+    'toml',
+    'nest_asyncio',
+    'browser_history',
+    'sec-cik-mapper',
+    'loguru',
+    'brotli',
+    'psutil',
+    'pyqtgraph',    # used for performance monitoring, #TODO: make this optional
+    'PyQt5'         # used for performance monitoring, #TODO: make this optional
+]
+
+if sys.platform == 'win32':
+    install_requires.append('pywin32')
 
 setup(
     name='pftpyclient',
     version='0.1.0',
     packages=find_packages(),
-    install_requires=[
-        'numpy',
-        'pandas',
-        'sqlalchemy',
-        'cryptography',
-        'xrpl-py',
-        'wxPython',
-        'requests',
-        'toml',
-        'nest_asyncio',
-        'browser_history',
-        'sec-cik-mapper',
-        'loguru',
-        'brotli',
-    ],
-    extras_require={
-        'windows': ['pywin32'],
-    },
+    install_requires=install_requires,
     author='PFAdmin',
     author_email='admin@postfiat.com',
     description='Basic Post Fiat Python Functionality',

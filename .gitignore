@@ -133,3 +133,4 @@ dmypy.json
 # Pyre type checker
 .pyre/
 *.lnk
+.vscode/settings.json
