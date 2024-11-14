@@ -1770,14 +1770,16 @@ class WalletApp(wx.Frame):
         dialog = CustomDialog("Request Task", ["Task Request"])
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
-            response = self.task_manager.request_post_fiat(request_message=request_message)
             try:
-                if response:
-                    message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                    wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
+                response = self.task_manager.request_post_fiat(request_message=request_message)
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Request Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+                wx.CallLater(5000, self.refresh_grids, None)
             except Exception as e:
-                logger.error(f"Error converting response to status message: {e}")
-            wx.CallLater(30000, self.refresh_grids, None)
+                logger.error(f"Error requesting task: {e}")
+                wx.MessageBox(f"Error requesting task: {e}", 'Task Request Error', wx.OK | wx.ICON_ERROR)
         dialog.Destroy()
 
         self.btn_request_task.SetLabel("Request Task")
@@ -1799,6 +1801,11 @@ class WalletApp(wx.Frame):
                     task_id=task_id,
                     acceptance_string=acceptance_string
                 )
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Acceptance Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+                wx.CallLater(5000, self.refresh_grids, None)
             except NoMatchingTaskException as e:
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
@@ -1808,14 +1815,6 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
-            else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Task Acceptance Result', wx.OK | wx.ICON_INFORMATION)
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -1837,21 +1836,23 @@ class WalletApp(wx.Frame):
                     task_id=task_id,
                     refusal_reason=refusal_reason
                 )
-            except Exception as e:
-                logger.error(f"Error sending refusal for task: {e}")
-                wx.MessageBox(f"Error sending refusal for task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
-            else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Task Refusal Result', wx.OK | wx.ICON_INFORMATION)
-                    else:
-                        logger.error("No response from send_refusal_for_task")
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Refusal Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
                 wx.CallLater(5000, self.refresh_grids, None)
-        dialog.Destroy()
+            except NoMatchingTaskException as e:
+                logger.error(f"Error refusing task: {e}")
+                wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
+            except WrongTaskStateException as e:
+                logger.error(f"Error refusing task: {e}")
+                wx.MessageBox(f"Task ID {task_id} is not in the correct state to be refused. Current status: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
+            except Exception as e:
+                logger.error(f"Error refusing task: {e}")
+                wx.MessageBox(f"Error refusing task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
 
+
+        dialog.Destroy()
         self.btn_refuse_task.SetLabel("Refuse Task")
         self.btn_refuse_task.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -1871,6 +1872,11 @@ class WalletApp(wx.Frame):
                     completion_string=completion_string,
                     task_id=task_id
                 )
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Submission Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+                wx.CallLater(5000, self.refresh_grids, None)
             except NoMatchingTaskException as e:
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
@@ -1880,17 +1886,6 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
-            else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Task Submission Result', wx.OK | wx.ICON_INFORMATION)
-                    else:
-                        logger.error("No response from submit_initial_completion")
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.refresh_grids, None)
-            
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
@@ -1913,18 +1908,20 @@ class WalletApp(wx.Frame):
                     response_string=response_string,
                     task_id=task_id
                 )
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Verification Submission Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+                wx.CallLater(5000, self.refresh_grids, None)
+            except NoMatchingTaskException as e:
+                logger.error(f"Error sending verification response: {e}")
+                wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
+            except WrongTaskStateException as e:
+                logger.error(f"Error sending verification response: {e}")
+                wx.MessageBox(f"Task ID {task_id} is not in the correct state for verification. Current status: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
             except Exception as e:
                 logger.error(f"Error sending verification response: {e}")
                 wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
-            else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
-                    else:
-                            logger.error("No response from send_verification_response")
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
 
         self.txt_verification_details.SetValue("")
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
@@ -1942,9 +1939,15 @@ class WalletApp(wx.Frame):
         if not task_id or not pomodoro_text:
             wx.MessageBox("Please enter a task ID and pomodoro text", "Error", wx.OK | wx.ICON_ERROR)
         else:
-            response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
-            message = self.task_manager.ux__convert_response_object_to_status_message(response)
-            wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
+            try:
+                response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Pomodoro Log Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+            except Exception as e:
+                logger.error(f"Error logging pomodoro: {e}")
+                wx.MessageBox(f"Error logging pomodoro: {e}", 'Pomodoro Log Error', wx.OK | wx.ICON_ERROR)
 
         self.txt_verification_details.SetValue("")
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")

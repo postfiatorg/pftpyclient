@@ -1197,6 +1197,7 @@ class PostFiatTaskManager:
 
     @PerformanceMonitor.measure('send_acceptance_for_task_id')
     def send_acceptance_for_task_id(self, task_id, acceptance_string):
+        """This function accepts a task. It requires the most recent task status to be PROPOSAL"""
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
 
@@ -1216,38 +1217,20 @@ class PostFiatTaskManager:
 
     @PerformanceMonitor.measure('send_refusal_for_task')
     def send_refusal_for_task(self, task_id, refusal_reason):
-        # TODO - rewrite this to use the get_task and get_task_state methods
-        """ 
-        This function refuses a task. The function will not work if the task has already 
-        been accepted, refused, or completed. 
-
-        EXAMPLE PARAMETERS
-        task_id='2024-05-14_19:10__ME26'
-        refusal_reason = 'I cannot accept this task because ...'
-        """
-        task_df = self.tasks
-        task_statuses = task_df[task_df['task_id'] 
-        == task_id]['task_type'].unique()
-
-        if any(status in task_statuses for status in ['REFUSAL', 'ACCEPTANCE', 
-            'VERIFICATION_RESPONSE', 'USER_GENESIS', 'REWARD']):
-            print('Task is not valid for refusal. Its statuses include:')
-            print(task_statuses)
-            return
-
-        if 'PROPOSAL' not in task_statuses:
-            print('Task must have a proposal to be refused. Current statuses include:')
-            print(task_statuses)
-            return
-
-        print('Proceeding to refuse task')
-        node_account = list(task_df[task_df['task_id'] 
-            == task_id].tail(1)['node_account'])[0]
+        """This function refuses a task. It requires the most recent task status to be PROPOSAL"""
+        # Check if the task ID exists
+        task_df = self.get_task(task_id)
+        most_recent_status = self.get_task_state(task_df)
+        
+        if most_recent_status != 'PROPOSAL':
+            raise WrongTaskStateException('PROPOSAL', most_recent_status)
+        
+        proposal_source = task_df.iloc[0]['node_account']
         if 'REFUSAL REASON ___' not in refusal_reason:
             refusal_reason = 'REFUSAL REASON ___ ' + refusal_reason
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
                                                                task_id=task_id, full_output=refusal_reason)
-        response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
+        response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_refusal_for_task response: {response}")
         return response
 
@@ -1434,18 +1417,18 @@ class PostFiatTaskManager:
         
         return key_display_info
 
-    def ux__convert_response_object_to_status_message(self, response):
-        """ Takes a response object from an XRP transaction and converts it into legible transaction text""" 
-        status_constructor = 'unsuccessfully'
-        logger.debug(f"Response: {response}")
-        if 'success' in response.status:
-            status_constructor = 'successfully'
-        non_hex_memo = self.convert_memo_dict(response.result['tx_json']['Memos'][0]['Memo'])
-        user_string = non_hex_memo['full_output']
-        amount_of_pft_sent = response.result['tx_json']['DeliverMax']['value']
-        node_name = response.result['tx_json']['Destination']
-        output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
-        return output_string
+    # def ux__convert_response_object_to_status_message(self, response):
+    #     """ Takes a response object from an XRP transaction and converts it into legible transaction text""" 
+    #     status_constructor = 'unsuccessfully'
+    #     logger.debug(f"Response: {response}")
+    #     if 'success' in response.status:
+    #         status_constructor = 'successfully'
+    #     non_hex_memo = self.convert_memo_dict(response.result['tx_json']['Memos'][0]['Memo'])
+    #     user_string = non_hex_memo['full_output']
+    #     amount_of_pft_sent = response.result['tx_json']['DeliverMax']['value']
+    #     node_name = response.result['tx_json']['Destination']
+    #     output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
+    #     return output_string
 
     @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
