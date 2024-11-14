@@ -5,7 +5,8 @@ from loguru import logger
 GLOBAL_CONFIG = {
     'performance_monitor': False,
     'transaction_cache_format': 'csv', # or pickle
-    'last_logged_in_user': ''
+    'last_logged_in_user': '',
+    'require_password_for_payment': True
 }
 
 USER_CONFIG = {

@@ -46,8 +46,6 @@ MAX_CHUNK_SIZE = 760
 SAVE_MEMOS = False
 SAVE_TASKS = False
 
-AUTO_INITIALIZE = False
-
 class WalletInitiationFunctions:
     def __init__(self, input_map, network_url, user_commitment=""):
         """
@@ -160,11 +158,6 @@ class PostFiatTaskManager:
 
         # Initialize wallet state based on account status
         self.wallet_state = self.determine_wallet_state()
-        
-        if AUTO_INITIALIZE:
-            self.handle_trust_line()
-            self.handle_google_doc()
-            self.handle_genesis()
 
     def get_xrp_balance(self):
         return get_xrp_balance(self.network_url, self.user_wallet.classic_address)
@@ -1155,6 +1148,59 @@ class PostFiatTaskManager:
         return result_df
     
     @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('get_payments_df')
+    def get_payments_df(self):
+        """ Returns a dataframe containing payment transaction details"""
+        if self.memos.empty:
+            return pd.DataFrame()
+        
+        df = self.memos.copy()
+
+        # Extract delivered amoutn and determine token type
+        def get_payment_details(row):
+            meta = row['meta']  # meta is already deserialized in memory
+            delivered = meta.get('delivered_amount', None)
+
+            if isinstance(delivered, dict):  # PFT payment
+                # Convert to float and format to prevent scientific notation
+                amount = float(delivered['value'])
+                amount_str = f"{amount:f}".rstrip('0').rstrip('.')  # Remove trailing zeros and decimal point if whole number
+                return {
+                    'amount': amount_str,
+                    'token': delivered['currency']
+                }
+            elif delivered:  # XRP payment
+                amount = float(delivered) / 1000000
+                amount_str = f"{amount:f}".rstrip('0').rstrip('.') 
+                return {
+                    'amount': amount_str,
+                    'token': 'XRP'
+                }
+            return {'amount': None, 'token': None}
+
+        # Extract payment details
+        payment_details = df.apply(get_payment_details, axis=1)
+        df['amount'] = payment_details.apply(lambda x: x['amount'])
+        df['token'] = payment_details.apply(lambda x: x['token'])
+
+        # Create to/from label based on message_type
+        df['direction'] = df['message_type'].map({'INCOMING': 'From', 'OUTGOING': 'To'})
+
+        # Get the external address (sender or recipient)
+        # TODO: Node_account is a bad name for this column
+        df['address'] = df['node_account']
+
+        df['tx_hash'] = df['hash']
+
+        # Select and rename columns
+        result_df = df[['datetime', 'amount', 'token', 'direction', 'address', 'tx_hash']]
+
+        # Sort by datetime descending
+        result_df = result_df.sort_values(by='datetime', ascending=False).reset_index(drop=True)
+
+        return result_df
+    
+    @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_memos_df')
     def get_memos_df(self):
 
@@ -1417,19 +1463,6 @@ class PostFiatTaskManager:
         
         return key_display_info
 
-    # def ux__convert_response_object_to_status_message(self, response):
-    #     """ Takes a response object from an XRP transaction and converts it into legible transaction text""" 
-    #     status_constructor = 'unsuccessfully'
-    #     logger.debug(f"Response: {response}")
-    #     if 'success' in response.status:
-    #         status_constructor = 'successfully'
-    #     non_hex_memo = self.convert_memo_dict(response.result['tx_json']['Memos'][0]['Memo'])
-    #     user_string = non_hex_memo['full_output']
-    #     amount_of_pft_sent = response.result['tx_json']['DeliverMax']['value']
-    #     node_name = response.result['tx_json']['Destination']
-    #     output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
-    #     return output_string
-
     @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
         pomodoro_id = task_id.replace('__','==')
@@ -1542,11 +1575,11 @@ def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
     try:    
         response = xrpl.transaction.submit_and_wait(payment, client, wallet)    
     except xrpl.transaction.XRPLReliableSubmissionException as e:
-        response = f"Transaction submission failed: {e}"
-        logger.error(response)
+        logger.error(f"Transaction submission failed: {e}")
+        raise
     except Exception as e:
-        response = f"Unexpected error: {e}"
-        logger.error(response)
+        logger.error(f"Unexpected error: {e}")
+        raise
 
     return response
 
