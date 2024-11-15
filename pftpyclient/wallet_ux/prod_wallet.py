@@ -47,22 +47,9 @@ wx_sink = configure_logger(
     log_filename="prod_wallet.log",
     level="DEBUG"
 )
+from pftpyclient.wallet_ux.constants import *
 
-MAINNET_WEBSOCKETS = [
-    "wss://xrplcluster.com",
-    "wss://xrpl.ws/",
-    "wss://s1.ripple.com/",
-    "wss://s2.ripple.com/"
-]
-TESTNET_WEBSOCKETS = [
-    "wss://s.altnet.rippletest.net:51233"
-]
-MAINNET_URL = "https://s2.ripple.com:51234"
-TESTNET_URL = "https://s.altnet.rippletest.net:51234"
 USE_TESTNET = False
-
-REMEMBRANCER_ADDRESS = "rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn"
-ISSUER_ADDRESS = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
 
 UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
 REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 10  # 10 seconds
@@ -669,6 +656,27 @@ class WalletApp(wx.Frame):
         self.memos_sizer = wx.BoxSizer(wx.VERTICAL)
         self.memos_tab.SetSizer(self.memos_sizer)
 
+        self.memos_sizer.AddSpacer(10)
+
+        # Add recipient selection
+        recipient_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        recipient_lbl = wx.StaticText(self.memos_tab, label="Recipient:")
+        recipient_sizer.Add(recipient_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.memo_recipient = wx.ComboBox(
+            self.memos_tab,
+            style=wx.CB_DROPDOWN,
+            size=(200, -1)
+        )
+        self.memo_recipient.Bind(wx.EVT_COMBOBOX, self.on_destination_selected)
+        self.memo_recipient.Bind(wx.EVT_TEXT, self.on_destination_text)
+        recipient_sizer.Add(self.memo_recipient, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        # Add checkboxes
+        self.memo_encrypt = wx.CheckBox(self.memos_tab, label="Encrypt")
+        recipient_sizer.Add(self.memo_encrypt, flag=wx.ALIGN_CENTER_VERTICAL, border=5)
+
+        self.memos_sizer.Add(recipient_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
         # Add memo input box
         self.lbl_memo = wx.StaticText(self.memos_tab, label="Enter your memo:")
         self.memos_sizer.Add(self.lbl_memo, 0, wx.EXPAND | wx.ALL, border=5)
@@ -881,15 +889,33 @@ class WalletApp(wx.Frame):
         """Handle manual text entry - allow any text"""
         event.Skip()
 
-    def populate_destination_combobox(self):
-        """Populate destination combobox with contacts"""
-        self.txt_payment_destination.Clear()
+    def update_all_destination_comboboxes(self):
+        """Update all destination comboboxes"""
+        self._populate_destination_combobox(self.txt_payment_destination)
+        self._populate_destination_combobox(self.memo_recipient, REMEMBRANCER_ADDRESS)
+
+    def _populate_destination_combobox(self, combobox, default_destination=None):
+        """
+        Populate destination combobox with contacts
+        Args:
+            combobox: wx.ComboBox to populate
+            default_destination: Optional default address to select
+        """
+        combobox.Clear()
         contacts = self.task_manager.get_contacts()
 
         # Add contacts in format "name (address)"
         for address, name in contacts.items():
             display_text = f"{name} ({address})"
-            self.txt_payment_destination.Append(display_text, address)
+            combobox.Append(display_text, address)
+
+        # Set default selection
+        if default_destination:
+            if default_destination in contacts:
+                display_text = f"{contacts[default_destination]} ({default_destination})"
+                combobox.SetValue(display_text)
+            else:
+                combobox.SetValue(default_destination)
 
     def on_send_payment(self, event):
         """Handle unified payment submission"""
@@ -1238,7 +1264,7 @@ class WalletApp(wx.Frame):
 
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
-        self.populate_destination_combobox()
+        self.update_all_destination_comboboxes()
 
     @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
@@ -2099,13 +2125,17 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Memo...")
         self.btn_submit_memo.SetLabel("Submitting...")
         self.btn_submit_memo.Update()
-
         logger.info("Submitting Memo")
 
         memo_text = self.txt_memo_input.GetValue()
+        recipient = self.memo_recipient.GetSelection()
+        if recipient != wx.NOT_FOUND:
+            recipient = self.memo_recipient.GetClientData(recipient)
+        else:
+            recipient = self.memo_recipient.GetValue()
 
-        if not memo_text:
-            wx.MessageBox("Please enter a memo", "Error", wx.OK | wx.ICON_ERROR)
+        if not memo_text or not recipient:
+            wx.MessageBox("Please enter a memo and recipient", "Error", wx.OK | wx.ICON_ERROR)
         else:
             logger.info(f"Memo Text: {memo_text}")
 
@@ -2135,7 +2165,7 @@ class WalletApp(wx.Frame):
             logger.info("User confirmed, submitting memo")
 
             try:
-                responses = self.task_manager.send_memo(REMEMBRANCER_ADDRESS, memo_text)
+                responses = self.task_manager.send_memo(recipient, memo_text)
                 formatted_responses = [self.format_response(response) for response in responses]
                 logger.info(f"Memo Submission Result: {formatted_responses}")
 
@@ -2538,7 +2568,7 @@ class WalletApp(wx.Frame):
         dialog = ContactsDialog(self)
         if dialog.ShowModal() == wx.ID_OK:
             self.refresh_grids()
-            self.populate_destination_combobox()
+            self.update_all_destination_comboboxes()
         dialog.Destroy()
 
     def show_payment_confirmation(self, amount, destination, token_type):
@@ -2551,8 +2581,7 @@ class WalletApp(wx.Frame):
             contact_name = dialog.get_contact_info()
             if contact_name:
                 self.task_manager.save_contact(destination, contact_name)
-                self.populate_destination_combobox()
-
+                self.update_all_destination_comboboxes()
         dialog.Destroy()
         return result == wx.ID_OK
 

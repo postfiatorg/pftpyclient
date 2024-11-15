@@ -40,11 +40,12 @@ from pftpyclient.task_manager.wallet_state import (
 from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager
 nest_asyncio.apply()
+from pftpyclient.wallet_ux.constants import *
 
 MAX_CHUNK_SIZE = 760
 
-SAVE_MEMOS = False
-SAVE_TASKS = False
+SAVE_MEMOS = True
+SAVE_TASKS = True
 
 class WalletInitiationFunctions:
     def __init__(self, input_map, network_url, user_commitment=""):
@@ -58,13 +59,13 @@ class WalletInitiationFunctions:
         }
         """
         self.network_url = network_url
-        self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
+        self.default_node = DEFAULT_NODE
         self.username = input_map['Username_Input']
         self.google_doc_share_link = input_map.get('Google Doc Share Link_Input', None)
         self.xrp_address = input_map['XRP Address_Input']
         self.wallet = xrpl.wallet.Wallet.from_seed(input_map['XRP Secret_Input'])
         self.user_commitment = user_commitment
-        self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
+        self.pft_issuer = ISSUER_ADDRESS
 
     def get_xrp_balance(self):
         return get_xrp_balance(self.network_url, self.wallet.classic_address)
@@ -131,10 +132,9 @@ class PostFiatTaskManager:
         self.credential_manager=CredentialManager(username,password)
         self.pw_map = self.credential_manager.decrypt_creds(self.credential_manager.pw_initiator)
         self.network_url= network_url
-        self.treasury_wallet_address = 'r46SUhCzyGE4KwBnKQ6LmDmJcECCqdKy4q'
-        self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
+        self.pft_issuer = ISSUER_ADDRESS
         self.trust_line_default = '100000000'
-        self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
+        self.default_node = DEFAULT_NODE
         self.user_wallet = self.spawn_user_wallet()
         self.google_doc_link = self.pw_map.get(self.credential_manager.google_doc_name, None)
 
@@ -432,10 +432,9 @@ class PostFiatTaskManager:
         """ Updates the tasks dataframe with new tasks from the new memos.
         Task dataframe contains columns: user,task_id,full_output,hash,node_account,datetime,task_type"""
 
-        # Filter for memos that are task IDs and PFT transactions
+        # Filter for memos that are task IDs
         new_task_df = new_memo_df[
-            new_memo_df['memo_data'].apply(is_task_id) & 
-            new_memo_df['tx_json'].apply(is_pft_transaction)
+            new_memo_df['memo_data'].apply(is_task_id)
         ].copy()
 
         if not new_task_df.empty:
@@ -638,7 +637,7 @@ class PostFiatTaskManager:
 
         return response
     
-    def _send_memo_single(self, destination, memo):
+    def _send_memo_single(self, destination, memo, pft_amount=0):
         """ Sends a memo to a destination. """
         client = xrpl.clients.JsonRpcClient(self.network_url)
 
@@ -650,19 +649,27 @@ class PostFiatTaskManager:
         else:
             logger.error("Memo is not a string or a Memo object, raising ValueError")
             raise ValueError("Memo must be either a string or a Memo object")
-        
-        amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
-            currency="PFT",
-            issuer=self.pft_issuer,
-            value=str(1)
-        )
 
-        payment = xrpl.models.transactions.Payment(
-            account=self.user_wallet.address,
-            amount=amount_to_send,
-            destination=destination,
-            memos=memos,
-        )
+        # Get PFT requirement for destination
+        pft_value = SPECIAL_ADDRESSES.get(destination, {}).get("memo_pft_requirement", 0)
+
+        payment_args = {
+            "account": self.user_wallet.address,
+            "destination": destination,
+            "memos": memos
+        }
+        
+        if pft_value > 0:
+            payment_args["amount"] = xrpl.models.amounts.IssuedCurrencyAmount(
+                currency="PFT",
+                issuer=self.pft_issuer,
+                value=str(pft_value)
+            )
+        else:
+            # Send minimum XRP amount for memo-only transactions
+            payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(0.00001))  # Minimum XRP amount
+
+        payment = xrpl.models.transactions.Payment(**payment_args)
 
         try:
             logger.debug("Submitting and waiting for transaction")

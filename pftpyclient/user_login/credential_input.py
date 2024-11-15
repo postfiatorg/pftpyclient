@@ -8,8 +8,7 @@ import json
 from xrpl.core import addresscodec
 from xrpl.core.keypairs.ed25519 import ED25519
 from pftpyclient.postfiatsecurity.hash_tools import derive_shared_secret
-
-CREDENTIAL_FILENAME = "manyasone_cred_list.txt"
+from pftpyclient.wallet_ux.constants import *
 
 class CredentialManager:
     def __init__(self,username,password):
