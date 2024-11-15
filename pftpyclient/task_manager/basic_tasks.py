@@ -1189,11 +1189,19 @@ class PostFiatTaskManager:
         # Get the external address (sender or recipient)
         # TODO: Node_account is a bad name for this column
         df['address'] = df['node_account']
+        
+        # Add contact names where available
+        contacts = self.credential_manager.get_contacts()
+        df['contact_name'] = df['address'].map(contacts)
+        df['display_address'] = df.apply(
+            lambda x: x['contact_name'] + ' (' + x['address'] + ')' if pd.notna(x['contact_name']) else x['address'],
+            axis=1
+        )
 
         df['tx_hash'] = df['hash']
 
         # Select and rename columns
-        result_df = df[['datetime', 'amount', 'token', 'direction', 'address', 'tx_hash']]
+        result_df = df[['datetime', 'amount', 'token', 'direction', 'display_address', 'tx_hash']]
 
         # Sort by datetime descending
         result_df = result_df.sort_values(by='datetime', ascending=False).reset_index(drop=True)
@@ -1494,7 +1502,16 @@ class PostFiatTaskManager:
         except Exception as e:
             logger.error(f"Password verification failed: {e}")
             return False
+        
+    def get_contacts(self):
+        return self.credential_manager.get_contacts()
     
+    def save_contact(self, address, name):
+        return self.credential_manager.save_contact(address, name)
+    
+    def delete_contact(self, address):
+        return self.credential_manager.delete_contact(address)
+
 def is_over_1kb(string):
     # 1KB = 1024 bytes
     return len(string.encode('utf-8')) > 1024

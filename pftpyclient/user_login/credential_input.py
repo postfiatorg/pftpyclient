@@ -4,6 +4,7 @@ from pftpyclient.basic_utilities.settings import *
 from cryptography.fernet import InvalidToken
 from loguru import logger
 import shutil
+import json
 
 CREDENTIAL_FILENAME = "manyasone_cred_list.txt"
 
@@ -13,8 +14,8 @@ class CredentialManager:
         self.wallet_address_name = f'{self.postfiat_username}__v1xrpaddress'
         self.wallet_secret_name = f'{self.postfiat_username}__v1xrpsecret'
         self.google_doc_name = f'{self.postfiat_username}__googledoc'
-        # self.key_variables = [self.wallet_address_name, self.wallet_secret_name, 'postfiatusername']
-        self.key_variables = [self.wallet_address_name, self.wallet_secret_name, self.google_doc_name]
+        self.contacts_name = f'{self.postfiat_username}__contacts'
+        self.key_variables = [self.wallet_address_name, self.wallet_secret_name, self.google_doc_name, self.contacts_name]
         self.pw_initiator = password
         self.credential_file_path = get_credential_file_path()
 
@@ -38,6 +39,13 @@ class CredentialManager:
         if self.google_doc_name in encrypted_cred_map:
             decrypted_cred_map[self.google_doc_name] = pwl.password_decrypt(
                 token=encrypted_cred_map[self.google_doc_name], 
+                password=pw_decryptor
+            ).decode('utf-8')
+
+        # Only add contacts if they exist in the encrypted_cred_map
+        if self.contacts_name in encrypted_cred_map:
+            decrypted_cred_map[self.contacts_name] = pwl.password_decrypt(
+                token=encrypted_cred_map[self.contacts_name], 
                 password=pw_decryptor
             ).decode('utf-8')
         
@@ -165,6 +173,36 @@ class CredentialManager:
         except Exception as e:
             logger.error(f"Error deleting account: {e}")
             raise Exception(f"Error deleting account: {e}")
+        
+    def get_contacts(self):
+        """Returns dictionary of contacts or empty dict if none exist"""
+        try:
+            if self.contacts_name in self.pw_map:
+                contacts_json = self.pw_map[self.contacts_name]
+                return json.loads(contacts_json)
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting contacts: {e}")
+            return {}
+        
+    def save_contact(self, address: str, name: str):
+        """Save or update a contact"""
+        contacts = self.get_contacts()
+        contacts[address] = name
+        self._save_contacts(contacts)
+
+    def delete_contact(self, address: str):
+        """Delete a contact by address"""
+        contacts = self.get_contacts()
+        if address in contacts:
+            del contacts[address]
+            self._save_contacts(contacts)
+
+    def _save_contacts(self, contacts: dict):
+        """Save contacts to the credential file"""
+        contacts_json = json.dumps(contacts)
+        enter_and_encrypt_credential(credentials_dict={self.contacts_name: contacts_json}, pw_encryptor=self.pw_initiator)
+        self.pw_map = self.decrypt_creds(pw_decryptor=self.pw_initiator)
     
 def _read_creds(credential_file_path):
     with open(credential_file_path, 'r') as f:
@@ -205,7 +243,8 @@ def enter_and_encrypt_credential(credentials_dict, pw_encryptor):
     new_credentials = []
     
     for credential_ref, pw_data in credentials_dict.items():
-        if credential_ref in existing_cred_map.keys():
+        # Allow updates for contacts
+        if credential_ref in existing_cred_map.keys() and not credential_ref.endswith('__contacts'):
             logger.error(f'Credential {credential_ref} is already loaded')
             return
         
@@ -214,9 +253,24 @@ def enter_and_encrypt_credential(credentials_dict, pw_encryptor):
         new_credentials.append(f'\nvariable___{credential_ref}\n{credential_byte_str}')
     
     if new_credentials:
-        with open(get_credential_file_path(), 'a') as f:
-            f.write(''.join(new_credentials))
-        
+        # For contacts, we need to overwrite the existing entry
+        if any(ref.endswith('__contacts') for ref in credentials_dict.keys()):
+            with open(get_credential_file_path(), 'r') as f:
+                lines = f.readlines()
+
+            # Remove existing contacts entry
+            contact_key = next(ref for ref in credentials_dict.keys() if ref.endswith('__contacts'))
+            lines = [line for line in lines if not (contact_key in line)]
+
+            # Write back all lines except contacts
+            with open(get_credential_file_path(), 'w') as f:
+                f.writelines(lines)
+                f.write(''.join(new_credentials))
+        else:
+            # For non-contacts credentials, append as usual
+            with open(get_credential_file_path(), 'a') as f:
+                f.write(''.join(new_credentials))
+            
         logger.debug(f"Added {len(new_credentials)} new credentials to {get_credential_file_path()}")
     else:
         logger.debug("No new credentials to add")

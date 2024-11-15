@@ -359,7 +359,7 @@ class WalletApp(wx.Frame):
                 ('amount', 'Amount', 70),
                 ('token', 'Token', 50),
                 ('direction', 'To/From', 55),
-                ('address', 'Address', 250),
+                ('display_address', 'Address', 250),
                 ('tx_hash', 'Tx Hash', 450)
             ]
         }
@@ -445,12 +445,14 @@ class WalletApp(wx.Frame):
 
         # Create Account menu
         self.account_menu = wx.Menu()
+        self.contacts_item = self.account_menu.Append(wx.ID_ANY, "Manage Contacts")
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
         self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
         self.menubar.Append(self.account_menu, "Account")
 
         # Bind menu events
+        self.Bind(wx.EVT_MENU, self.on_manage_contacts, self.contacts_item)
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
         self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
@@ -834,6 +836,9 @@ class WalletApp(wx.Frame):
             style=wx.CB_DROPDOWN,
             size=(200, -1)  # Wider to accommodate XRP addresses
         )
+        self.txt_payment_destination.Bind(wx.EVT_COMBOBOX, self.on_destination_selected)
+        self.txt_payment_destination.Bind(wx.EVT_TEXT, self.on_destination_text)
+
         required_input_sizer.Add(self.txt_payment_destination, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
         left_sizer.Add(required_input_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -862,6 +867,29 @@ class WalletApp(wx.Frame):
 
         # Bind events
         self.btn_send.Bind(wx.EVT_BUTTON, self.on_send_payment)
+
+    def on_destination_selected(self, event):
+        """Handle selection from dropdown - extract the address"""
+        selection = event.GetSelection()
+        if selection != wx.NOT_FOUND:
+            # Get the stored address from client data
+            address = self.txt_payment_destination.GetClientData(selection)
+            wx.CallAfter(self.txt_payment_destination.ChangeValue, address)
+        event.Skip()
+
+    def on_destination_text(self, event):
+        """Handle manual text entry - allow any text"""
+        event.Skip()
+
+    def populate_destination_combobox(self):
+        """Populate destination combobox with contacts"""
+        self.txt_payment_destination.Clear()
+        contacts = self.task_manager.get_contacts()
+
+        # Add contacts in format "name (address)"
+        for address, name in contacts.items():
+            display_text = f"{name} ({address})"
+            self.txt_payment_destination.Append(display_text, address)
 
     def on_send_payment(self, event):
         """Handle unified payment submission"""
@@ -900,31 +928,33 @@ class WalletApp(wx.Frame):
         
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Confirming payment...")
         
-        # Show confirmation dialog
-        message = f"Confirm {token_type} Payment\n\nAmount: {amount} {token_type}\nDestination: {destination}"
-        message += f"\nMemo: {memo}" if memo else ""
-        if wx.YES == wx.MessageBox(message, "Confirm Payment", wx.YES_NO | wx.ICON_QUESTION):
-            self.set_wallet_ui_state(message="Submitting payment...")
-            self.btn_send.Disable()
+        # Show confirmation dialog with contact saving option
+        if not self.show_payment_confirmation(amount, destination, token_type):
+            self.btn_send.SetLabel("Send")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
+            return
+        
+        self.set_wallet_ui_state(message="Submitting payment...")
+        self.btn_send.Disable()
 
-            try:
-                if token_type == "XRP":
-                    response = self.task_manager.send_xrp(amount, destination, memo)
-                else: # PFT
-                    response = self.task_manager.send_pft(amount, destination, memo)
+        try:
+            if token_type == "XRP":
+                response = self.task_manager.send_xrp(amount, destination, memo)
+            else: # PFT
+                response = self.task_manager.send_pft(amount, destination, memo)
 
-                formatted_response = self.format_response(response)
-                dialog = SelectableMessageDialog(self, f"{token_type} Payment Submitted", formatted_response)
-                dialog.ShowModal()
-                dialog.Destroy()
+            formatted_response = self.format_response(response)
+            dialog = SelectableMessageDialog(self, f"{token_type} Payment Submitted", formatted_response)
+            dialog.ShowModal()
+            dialog.Destroy()
 
-            except xrpl.transaction.XRPLReliableSubmissionException as e:
-                logger.error(f"Error submitting payment: {e}")
-                wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
-            except Exception as e:
-                logger.error(f"Error submitting payment: {e}")
-                wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
-            
+        except xrpl.transaction.XRPLReliableSubmissionException as e:
+            logger.error(f"Error submitting payment: {e}")
+            wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        except Exception as e:
+            logger.error(f"Error submitting payment: {e}")
+            wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        
         self.btn_send.Enable()
         self.btn_send.SetLabel("Send")
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -1207,6 +1237,8 @@ class WalletApp(wx.Frame):
         self.start_transaction_update_timer()
 
         self.set_wallet_ui_state(WalletUIState.IDLE)
+
+        self.populate_destination_combobox()
 
     @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
@@ -1879,7 +1911,6 @@ class WalletApp(wx.Frame):
                 dialog = SelectableMessageDialog(self, "Task Request Result", formatted_response)
                 dialog.ShowModal()
                 dialog.Destroy()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
             except Exception as e:
                 logger.error(f"Error requesting task: {e}")
                 wx.MessageBox(f"Error requesting task: {e}", 'Task Request Error', wx.OK | wx.ICON_ERROR)
@@ -1908,7 +1939,6 @@ class WalletApp(wx.Frame):
                 dialog = SelectableMessageDialog(self, "Task Acceptance Result", formatted_response)
                 dialog.ShowModal()
                 dialog.Destroy()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC* 1000, self.refresh_grids, None)
             except NoMatchingTaskException as e:
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
@@ -1918,6 +1948,8 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
+            else:
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -1943,7 +1975,6 @@ class WalletApp(wx.Frame):
                 dialog = SelectableMessageDialog(self, "Task Refusal Result", formatted_response)
                 dialog.ShowModal()
                 dialog.Destroy()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
             except NoMatchingTaskException as e:
                 logger.error(f"Error refusing task: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
@@ -1953,6 +1984,8 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error refusing task: {e}")
                 wx.MessageBox(f"Error refusing task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
+            else:
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
 
         dialog.Destroy()
@@ -1989,6 +2022,8 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
+            else:
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
@@ -2015,7 +2050,6 @@ class WalletApp(wx.Frame):
                 dialog = SelectableMessageDialog(self, "Verification Submission Result", formatted_response)
                 dialog.ShowModal()
                 dialog.Destroy()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
             except NoMatchingTaskException as e:
                 logger.error(f"Error sending verification response: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
@@ -2025,8 +2059,10 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error sending verification response: {e}")
                 wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
+            else:
+                self.verification_txt_details.SetValue("")
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
-        self.verification_txt_details.SetValue("")
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -2051,8 +2087,9 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error logging pomodoro: {e}")
                 wx.MessageBox(f"Error logging pomodoro: {e}", 'Pomodoro Log Error', wx.OK | wx.ICON_ERROR)
+            else:
+                self.verification_txt_details.SetValue("")
 
-        self.verification_txt_details.SetValue("")
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
         self.btn_log_pomodoro.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -2109,14 +2146,15 @@ class WalletApp(wx.Frame):
                         dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
                     dialog.ShowModal()
                     dialog.Destroy()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
             except Exception as e:
                 logger.error(f"Error submitting memo: {e}")
                 wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
-            
+            else:
+                self.txt_memo_input.SetValue("")
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+
         self.btn_submit_memo.SetLabel("Submit Memo")
-        self.txt_memo_input.SetValue("")
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_xrp_payment(self, event):
@@ -2495,6 +2533,29 @@ class WalletApp(wx.Frame):
             logger.error(f"Error during logout: {e}")
             wx.MessageBox(f"Error during logout: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
+    def on_manage_contacts(self, event):
+        """Handle manage contacts request"""
+        dialog = ContactsDialog(self)
+        if dialog.ShowModal() == wx.ID_OK:
+            self.refresh_grids()
+            self.populate_destination_combobox()
+        dialog.Destroy()
+
+    def show_payment_confirmation(self, amount, destination, token_type):
+        """Show payment confirmation dialog"""
+        dialog = ConfirmPaymentDialog(self, amount, destination, token_type)
+        result = dialog.ShowModal()
+
+        if result == wx.ID_OK:
+            # Save contact if requested
+            contact_name = dialog.get_contact_info()
+            if contact_name:
+                self.task_manager.save_contact(destination, contact_name)
+                self.populate_destination_combobox()
+
+        dialog.Destroy()
+        return result == wx.ID_OK
+
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
         url = link.GetHref()
@@ -2715,6 +2776,161 @@ class PreferencesDialog(wx.Dialog):
         self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
         self.config.set_global_config('transaction_cache_format', 'csv' if self.cache_csv.GetValue() else 'pickle')
         self.EndModal(wx.ID_OK)
+
+class ContactsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Manage Contacts", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.task_manager: PostFiatTaskManager = parent.task_manager
+        self.changes_made = False
+
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Contacts list 
+        self.contacts_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.BORDER_SUNKEN)
+        self.contacts_list.InsertColumn(0, "Name", width=150)
+        self.contacts_list.InsertColumn(1, "Address", width=300)
+        sizer.Add(self.contacts_list, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Add contact section
+        add_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.name_ctrl = wx.TextCtrl(panel)
+        self.address_ctrl = wx.TextCtrl(panel)
+
+        add_sizer.Add(wx.StaticText(panel, label="Name:"), 0, wx.CENTER | wx.ALL, 5)
+        add_sizer.Add(self.name_ctrl, 1, wx.EXPAND | wx.ALL, 5)
+        add_sizer.Add(wx.StaticText(panel, label="Address:"), 0, wx.CENTER | wx.ALL, 5)
+        add_sizer.Add(self.address_ctrl, 1, wx.EXPAND | wx.ALL, 5)
+        
+        sizer.Add(add_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        add_btn = wx.Button(panel, label="Add Contact")
+        del_btn = wx.Button(panel, label="Delete Contact")
+        close_btn = wx.Button(panel, label="Close")
+        btn_sizer.Add(add_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(del_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(close_btn, 0, wx.ALL, 5)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 5)
+        
+        panel.SetSizer(sizer)
+
+        start_size = (600, 400)
+        self.SetSize(start_size)
+        self.SetMinSize(start_size)
+        
+        # Bind events
+        add_btn.Bind(wx.EVT_BUTTON, self.on_add)
+        del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
+        close_btn.Bind(wx.EVT_BUTTON, self.on_close)
+        
+        self.load_contacts()
+
+    def load_contacts(self):
+        """Reload contacts list from storage"""
+        self.contacts_list.DeleteAllItems()
+        contacts = self.task_manager.get_contacts()
+        for address, name in contacts.items():
+            index = self.contacts_list.GetItemCount()
+            self.contacts_list.InsertItem(index, name)
+            self.contacts_list.SetItem(index, 1, address)
+        self.contacts_list.Layout()
+        self.Layout()
+
+    def on_add(self, event):
+        name = self.name_ctrl.GetValue().strip()
+        address = self.address_ctrl.GetValue().strip()
+        if name and address:
+            logger.debug(f"Saving contact: {name} - {address}")
+            self.task_manager.save_contact(address, name)
+            self.load_contacts()
+            self.name_ctrl.SetValue("")
+            self.address_ctrl.SetValue("")
+            self.changes_made = True
+
+    def on_delete(self, event):
+        index = self.contacts_list.GetFirstSelected()
+        if index >= 0:
+            name = self.contacts_list.GetItem(index, 0).GetText()
+            address = self.contacts_list.GetItem(index, 1).GetText()
+            logger.debug(f"Deleting contact: {name} - {address}")
+            self.task_manager.delete_contact(address)
+            self.load_contacts()
+            self.changes_made = True
+
+    def on_close(self, event):
+        """Handle dialog close"""
+        if self.changes_made:
+            self.EndModal(wx.ID_OK)
+        else:
+            self.EndModal(wx.ID_CANCEL)
+
+class ConfirmPaymentDialog(wx.Dialog):
+    def __init__(self, parent, amount, destination, token_type):
+        super().__init__(parent, title="Confirm Payment", style=wx.DEFAULT_DIALOG_STYLE)
+        self.task_manager = parent.task_manager
+        self.destination = destination
+    
+        # Check if destination is a known contact
+        contacts = self.task_manager.get_contacts()
+        contact_name = contacts.get(destination)
+
+        self.InitUI(amount, destination, token_type, contact_name)
+        self.Fit()
+        self.Center()
+
+    def InitUI(self, amount, destination, token_type, contact_name):
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Create messge with contact name if it exists
+        if contact_name:
+            message = f"Send {amount} {token_type} to {contact_name} ({destination})?"
+        else:
+            message = f"Send {amount} {token_type} to {destination}?"
+
+        msg_text = wx.StaticText(self, label=message)
+        msg_text.Wrap(400)
+        sizer.Add(msg_text, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Only show contact controls if this isn't already a contact
+        if not contact_name:
+            # Add save contact checkbox and name input
+            self.save_contact = wx.CheckBox(self, label="Save as contact")
+            self.contact_name = wx.TextCtrl(self)
+            self.contact_name.Hide()
+
+            sizer.Add(self.save_contact, 0, wx.ALL, 5)
+            sizer.Add(self.contact_name, 0, wx.EXPAND | wx.ALL, 5)
+
+            self.save_contact.Bind(wx.EVT_CHECKBOX, self.on_checkbox)
+
+        # Button sizer
+        btn_sizer = wx.StdDialogButtonSizer()
+
+        self.ok_btn = wx.Button(self, wx.ID_OK, "Send")
+        self.ok_btn.SetDefault()
+        btn_sizer.AddButton(self.ok_btn)
+
+        cancel_btn = wx.Button(self, wx.ID_CANCEL, "Cancel")
+        btn_sizer.AddButton(cancel_btn)
+
+        btn_sizer.Realize()
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+
+        self.SetSizer(sizer)
+
+    def on_checkbox(self, event):
+        """Handle checkbox toggle"""
+        self.contact_name.Show(self.save_contact.GetValue())
+        self.Fit() # Resize dialog to fit new size
+
+    def get_contact_info(self):
+        """Return contact info if saving was requested"""
+        if not hasattr(self, 'save_contact') or not self.save_contact.GetValue():
+            return None
+        name = self.contact_name.GetValue().strip()
+        return name if name else None
 
 def main():
     logger.info("Starting Post Fiat Wallet")
