@@ -21,7 +21,8 @@ install_requires = [
     'brotli',
     'psutil',
     'pyqtgraph',    # used for performance monitoring, #TODO: make this optional
-    'PyQt5'         # used for performance monitoring, #TODO: make this optional
+    'PyQt5',         # used for performance monitoring, #TODO: make this optional
+    'PyNaCl'
 ]
 
 if sys.platform == 'win32':
