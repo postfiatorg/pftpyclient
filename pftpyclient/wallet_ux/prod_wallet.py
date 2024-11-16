@@ -677,9 +677,16 @@ class WalletApp(wx.Frame):
 
         self.memos_sizer.Add(recipient_sizer, 0, wx.EXPAND | wx.ALL, 5)
 
-        # Add memo input box
+        # Add memo input box section with encryption requests button
+        memo_header_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.lbl_memo = wx.StaticText(self.memos_tab, label="Enter your memo:")
-        self.memos_sizer.Add(self.lbl_memo, 0, wx.EXPAND | wx.ALL, border=5)
+        memo_header_sizer.Add(self.lbl_memo, 1, wx.ALIGN_CENTER_VERTICAL)
+
+        self.btn_encryption_requests = wx.Button(self.memos_tab, label="Encryption Requests")
+        self.btn_encryption_requests.Bind(wx.EVT_BUTTON, self.on_encryption_requests)
+        memo_header_sizer.Add(self.btn_encryption_requests, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 5)
+
+        self.memos_sizer.Add(memo_header_sizer, 0, wx.EXPAND | wx.ALL, border=5)
         self.txt_memo_input = wx.TextCtrl(self.memos_tab, style=wx.TE_MULTILINE, size=(-1, 200))
         self.memos_sizer.Add(self.txt_memo_input, 1, wx.EXPAND | wx.ALL, border=5)
 
@@ -2577,6 +2584,12 @@ class WalletApp(wx.Frame):
                 self.update_all_destination_comboboxes()
         dialog.Destroy()
         return result == wx.ID_OK
+    
+    def on_encryption_requests(self, event):
+        """Show the encryption requests dialog"""
+        dialog = EncryptionRequestsDialog(self)
+        dialog.ShowModal()
+        dialog.Destroy()
 
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
@@ -2732,6 +2745,86 @@ class DeleteCredentialsDialog(wx.Dialog):
     def on_cancel(self, event):
         self.EndModal(wx.ID_CANCEL)
 
+class EncryptionRequestsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Pending Encryption Requests", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.parent: WalletApp = parent
+        self.task_manager: PostFiatTaskManager = parent.task_manager
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        help_text = (
+            "The following users would like to set up encrypted messaging with you. "
+            "Accepting a request will allow you to exchange private messages with them."
+        )
+        text = wx.StaticText(self, label=help_text)
+        text.Wrap(400)
+        sizer.Add(text, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Create list control
+        self.list_ctrl = wx.ListCtrl(self, style=wx.LC_REPORT | wx.BORDER_SUNKEN | wx.LC_SINGLE_SEL)
+        self.list_ctrl.InsertColumn(0, "From", width=300)
+        self.list_ctrl.InsertColumn(1, "Received", width=150)
+        sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Add buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.accept_btn = wx.Button(self, label="Accept")
+        self.accept_btn.Bind(wx.EVT_BUTTON, self.on_accept)
+        btn_sizer.Add(self.accept_btn, 0, wx.RIGHT, 5)
+        
+        self.skip_btn = wx.Button(self, label="Skip")
+        self.skip_btn.Bind(wx.EVT_BUTTON, self.on_skip)
+        btn_sizer.Add(self.skip_btn)
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        self.SetSizer(sizer)
+        self.load_requests()
+
+        # Enable/disable accept button based on selection
+        self.accept_btn.Enable(False)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_selection_changed)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_selection_changed)
+
+        start_size = (600, 400)
+        self.SetSize(start_size)
+        self.SetMinSize(start_size)
+
+    def on_selection_changed(self, event):
+        """Enable accept button if an item is selected"""
+        self.accept_btn.Enable(self.list_ctrl.GetFirstSelected() != -1)
+
+    def load_requests(self):
+        """Load pending encryption requests into the list control"""
+        self.list_ctrl.DeleteAllItems()
+        requests = self.task_manager.get_pending_handshakes()
+
+        for idx, request in requests.iterrows():
+            index = self.list_ctrl.GetItemCount()
+            self.list_ctrl.InsertItem(index, request['address'])
+            self.list_ctrl.SetItem(index, 1, request['received_at'].strftime('%Y-%m-%d %H:%M:%S'))
+            self.list_ctrl.SetItemData(index, idx)
+
+    def on_accept(self, event):
+        idx = self.list_ctrl.GetFirstSelected()
+        if idx == -1:
+            return
+        
+        address = self.task_manager.get_pending_handshakes().iloc[self.list_ctrl.GetItemData(idx)]['address']
+        
+        try:
+            response = self.task_manager.send_handshake(address)
+            formatted_response = self.parent.format_response(response)
+            handshake_dialog = SelectableMessageDialog(self, "Handshake Sent", formatted_response)
+            handshake_dialog.ShowModal()
+            handshake_dialog.Destroy()
+            self.load_requests()
+        except Exception as e:
+            wx.MessageBox(f"Failed to send handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_skip(self, event):
+        self.Close()
 
 class PreferencesDialog(wx.Dialog):
     def __init__(self, parent):

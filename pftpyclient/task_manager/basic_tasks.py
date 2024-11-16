@@ -745,6 +745,78 @@ class PostFiatTaskManager:
 
         return response
     
+    @PerformanceMonitor.measure('get_pending_handshakes')
+    def get_pending_handshakes(self):
+        """Returns a DataFrame of received handshakes"""
+        if self.system_memos.empty:
+            return pd.DataFrame()
+        
+        # Get incoming handshakes
+        handshakes = self.system_memos[
+            (self.system_memos['task_id'] == SystemMemoType.HANDSHAKE.value) &
+            (self.system_memos['direction'] == 'INCOMING')
+        ]
+
+        if handshakes.empty:
+            return pd.DataFrame()
+        
+        # For each sender, check if we've sent them a handshake back
+        results = []
+        for _, handshake in handshakes.iterrows():
+            sender = handshake['counterparty_address']
+            handshake_sent, _ = self.get_handshake_for_address(sender)
+
+            if not handshake_sent:
+                # Get sender's display name from contacts, if available
+                results.append({
+                    'address': sender,
+                    'received_at': handshake['datetime'],
+                })
+
+        return pd.DataFrame(results)
+
+    @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('get_handshake_for_address')
+    def get_handshake_for_address(self, address: str) -> tuple[bool, str]:
+        """Returns (handshake_sent, their_public_key) tuple where:
+        - handshake_sent: Whether we've already sent our public key
+        - received_key: Their ECDH public key if they've sent it, None otherwise
+        """
+        if self.memos.empty:
+            logger.debug("No memos or handshakes found")
+            return False, None
+        
+        # Filter for handshakes
+        handshakes = self.system_memos[
+            self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
+        ]
+
+        if handshakes.empty:
+            logger.debug("No handshakes found")
+            return False, None
+
+        # Get handshakes sent FROM the user TO this address
+        sent_handshakes = handshakes[
+            (handshakes['counterparty_address'] == address) & 
+            (handshakes['direction'] == 'OUTGOING')
+        ]
+        handshake_sent = not sent_handshakes.empty
+
+        # Get handshakes received FROM this address TO the user
+        received_handshakes = handshakes[
+            (handshakes['counterparty_address'] == address) &
+            (handshakes['direction'] == 'INCOMING')
+        ]
+   
+        received_key = None
+        if not received_handshakes.empty:
+            logger.debug(f"Found {len(received_handshakes)} received handshakes from {address}")
+            latest_received_handshake = received_handshakes.sort_values('datetime').iloc[-1]
+            received_key = latest_received_handshake['full_output']
+            logger.debug(f"Most recent received handshake: {received_key[:8]}...")
+
+        return handshake_sent, received_key
+    
     @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('send_handshake')
     def send_handshake(self, destination):
@@ -762,8 +834,25 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('encrypt_memo')
     def encrypt_memo(self, memo: str, shared_secret: str) -> str:
         """ Encrypts a memo using a shared secret """
-        fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(shared_secret.encode()).digest()))
-        return fernet.encrypt(memo.encode()).decode()        
+        # Convert shared_secret to bytes if it isn't already
+        if isinstance(shared_secret, str):
+            shared_secret = shared_secret.encode()
+
+        # Generate the Fernet key from shared secret
+        key = base64.urlsafe_b64encode(hashlib.sha256(shared_secret).digest())
+        fernet = Fernet(key)
+
+        # Ensure memo is str before encoding to bytes
+        if isinstance(memo, str):
+            memo = memo.encode()
+        elif isinstance(memo, bytes):
+            pass
+        else:
+            raise ValueError(f"Memo must be string or bytes, not {type(memo)}")
+        
+        # Encrypt and return as string
+        encrypted_bytes = fernet.encrypt(memo)
+        return encrypted_bytes.decode()
 
     @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('send_memo')
@@ -1393,48 +1482,6 @@ class PostFiatTaskManager:
         result_df = result_df.sort_values(by='datetime', ascending=False).reset_index(drop=True)
 
         return result_df
-    
-    @requires_wallet_state(TRUSTLINED_STATES)
-    @PerformanceMonitor.measure('get_handshake_for_address')
-    def get_handshake_for_address(self, address: str) -> tuple[bool, str]:
-        """Returns (handshake_sent, their_public_key) tuple where:
-        - handshake_sent: Whether we've already sent our public key
-        - received_key: Their ECDH public key if they've sent it, None otherwise
-        """
-        if self.memos.empty:
-            logger.debug("No memos or handshakes found")
-            return False, None
-        
-        # Filter for handshakes
-        handshakes = self.system_memos[
-            self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
-        ]
-
-        if handshakes.empty:
-            logger.debug("No handshakes found")
-            return False, None
-
-        # Get handshakes sent FROM the user TO this address
-        sent_handshakes = handshakes[
-            (handshakes['counterparty_address'] == address) & 
-            (handshakes['direction'] == 'OUTGOING')
-        ]
-        handshake_sent = not sent_handshakes.empty
-
-        # Get handshakes received FROM this address TO the user
-        received_handshakes = handshakes[
-            (handshakes['counterparty_address'] == address) &
-            (handshakes['direction'] == 'INCOMING')
-        ]
-   
-        received_key = None
-        if not received_handshakes.empty:
-            logger.debug(f"Found {len(received_handshakes)} received handshakes from {address}")
-            latest_received_handshake = received_handshakes.sort_values('datetime').iloc[-1]
-            received_key = latest_received_handshake['full_output'].split('HANDSHAKE ___')[1]
-            logger.debug(f"Most recent received handshake: {received_key[:8]}...")
-
-        return handshake_sent, received_key
     
     @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_memos_df')
