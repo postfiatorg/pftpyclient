@@ -44,6 +44,10 @@ class CredentialManager:
         if not hasattr(self, 'ecdh_public_key'):
             self._derive_ecdh_public_key()
         return self.ecdh_public_key
+    
+    def get_shared_secret(self, received_key: str) -> str:
+        """Derives shared secret from ECDH public key"""
+        return derive_shared_secret(received_key, self.get_raw_entropy())
 
     def decrypt_creds(self, pw_decryptor):
         '''Decrypts all credentials in the file'''

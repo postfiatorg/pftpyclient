@@ -41,11 +41,13 @@ from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager
 nest_asyncio.apply()
 from pftpyclient.wallet_ux.constants import *
-
+from cryptography.fernet import Fernet
 MAX_CHUNK_SIZE = 760
 
-SAVE_MEMOS = True
+SAVE_MEMO_TRANSACTIONS = True
 SAVE_TASKS = True
+SAVE_MEMOS = True
+SAVE_SYSTEM_MEMOS = True
 
 class WalletInitiationFunctions:
     def __init__(self, input_map, network_url, user_commitment=""):
@@ -142,13 +144,19 @@ class PostFiatTaskManager:
 
         file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
 
-        # initialize dataframes
+        # initialize dataframe filepaths for caching
         self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.{file_extension}")
+        self.memo_tx_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memo_transactions.{file_extension}")
         self.memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.{file_extension}")  # only used for debugging
         self.tasks_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.{file_extension}")  # only used for debugging
+        self.system_memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_system_memos.{file_extension}")  # only used for debugging
+        
+        # initialize dataframes for caching
         self.transactions = pd.DataFrame()
-        self.memos = pd.DataFrame()
+        self.memo_transactions = pd.DataFrame()
         self.tasks = pd.DataFrame()
+        self.memos = pd.DataFrame()
+        self.system_memos = pd.DataFrame()
 
         # Initialize client for blockchain queries
         self.client = xrpl.clients.JsonRpcClient(self.network_url)
@@ -272,13 +280,21 @@ class PostFiatTaskManager:
     def save_transactions(self):
         self.save_dataframe(self.transactions, self.tx_history_filepath, "transactions")
 
-    @PerformanceMonitor.measure('save_memos')
-    def save_memos(self):
-        self.save_dataframe(self.memos, self.memos_filepath, "memos")
+    @PerformanceMonitor.measure('save_memo_transactions')
+    def save_memo_transactions(self):
+        self.save_dataframe(self.memo_transactions, self.memo_tx_filepath, "memo_transactions")
 
     @PerformanceMonitor.measure('save_tasks')
     def save_tasks(self):
         self.save_dataframe(self.tasks, self.tasks_filepath, "tasks")
+
+    @PerformanceMonitor.measure('save_memos')
+    def save_memos(self):
+        self.save_dataframe(self.memos, self.memos_filepath, "memos")
+
+    @PerformanceMonitor.measure('save_system_memos')
+    def save_system_memos(self):
+        self.save_dataframe(self.system_memos, self.system_memos_filepath, "system_memos")
 
     @PerformanceMonitor.measure('load_transactions')
     def load_transactions(self):
@@ -359,7 +375,7 @@ class PostFiatTaskManager:
             if not loaded_tx_df.empty:
                 logger.debug(f"Loaded {len(loaded_tx_df)} transactions from {self.tx_history_filepath}")
                 self.transactions = loaded_tx_df
-                self.sync_memos(loaded_tx_df)
+                self.sync_memo_transactions(loaded_tx_df)
 
         # Choose ledger index to start sync from
         if self.transactions.empty:
@@ -377,86 +393,198 @@ class PostFiatTaskManager:
             new_tx_df = pd.DataFrame(new_tx_list)
             self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
             self.save_transactions()
-            self.sync_memos(new_tx_df)
+            self.sync_memo_transactions(new_tx_df)
             return True
         else:
             logger.debug("No new transactions found. Finished updating local tx history")
             return False
 
-    @PerformanceMonitor.measure('sync_memos')
-    def sync_memos(self, new_tx_df):
-        """ Updates the memos dataframe with new memos from the new transactions. Memos are serialized into dicts"""
+    @PerformanceMonitor.measure('sync_memo_transactions')
+    def sync_memo_transactions(self, new_tx_df):
+        """Enriches transactions that contain memos with additional columns for easier processing"""
         # flag rows with memos
         new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x)
 
         # filter for rows with memos and convert to dataframe
-        new_memo_df = new_tx_df[new_tx_df['has_memos']== True].copy()
+        memo_tx_df = new_tx_df[new_tx_df['has_memos']== True].copy()
 
         # Extract first memo into a new column, serialize to dict
         # Any additional memos are ignored
-        new_memo_df['memo_data']=new_memo_df['tx_json'].apply(lambda x: self.convert_memo_dict(x['Memos'][0]['Memo']))
+        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.convert_memo_dict(x['Memos'][0]['Memo']))
         
         # Extract account and destination from tx_json into new columns
-        new_memo_df['account']= new_memo_df['tx_json'].apply(lambda x: x['Account'])
-        new_memo_df['destination']=new_memo_df['tx_json'].apply(lambda x: x['Destination'])
+        memo_tx_df['account']= memo_tx_df['tx_json'].apply(lambda x: x['Account'])
+        memo_tx_df['destination']=memo_tx_df['tx_json'].apply(lambda x: x['Destination'])
         
-        # Determine message type
-        new_memo_df['message_type']=np.where(new_memo_df['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
+        # Determine direction
+        memo_tx_df['direction']=np.where(memo_tx_df['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
         
-        # Derive node account
-        new_memo_df['node_account']= new_memo_df[['destination','account']].sum(1).apply(lambda x: 
-                                                         str(x).replace(self.user_wallet.classic_address,''))
+        # Derive counterparty address
+        memo_tx_df['counterparty_address']= memo_tx_df[['destination','account']].sum(1).apply(
+            lambda x: str(x).replace(self.user_wallet.classic_address,'')
+        )
         
         # Convert ripple timestamp to datetime
-        new_memo_df['datetime']= new_memo_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
+        memo_tx_df['datetime']= memo_tx_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
         
         # Extract ledger index
-        new_memo_df['ledger_index'] = new_memo_df['tx_json'].apply(lambda x: x['ledger_index'])
+        memo_tx_df['ledger_index'] = memo_tx_df['tx_json'].apply(lambda x: x['ledger_index'])
 
         # Flag rows with PFT
-        new_memo_df['is_pft'] = new_memo_df['tx_json'].apply(is_pft_transaction)
+        memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
 
         # Concatenate new memos to existing memos and drop duplicates
-        self.memos = pd.concat([self.memos, new_memo_df], ignore_index=True).drop_duplicates(subset=['hash'])
+        self.memo_transactions = pd.concat([self.memo_transactions, memo_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
 
-        logger.debug(f"Added {len(new_memo_df)} memos to local memos dataframe")
+        logger.debug(f"Added {len(memo_tx_df)} memos to local memos dataframe")
 
         # for debugging purposes only
+        if SAVE_MEMO_TRANSACTIONS:
+            self.save_memo_transactions()
+
+        self.sync_tasks(memo_tx_df)
+        self.sync_memos(memo_tx_df)
+        self.sync_system_memos(memo_tx_df)
+
+    @PerformanceMonitor.measure('sync_tasks')
+    def sync_tasks(self, new_memo_tx_df):
+        """ Updates the tasks dataframe with new tasks from the new memos.
+        Task dataframe contains columns: user,task_id,full_output,hash,counterparty_address,datetime,task_type"""
+        if new_memo_tx_df.empty:
+            logger.debug("No new memos to process for tasks")
+            return
+
+        # Filter for memos that have a valid ID pattern 
+        valid_id_df = new_memo_tx_df[
+            new_memo_tx_df['memo_data'].apply(is_valid_id)
+        ].copy()
+
+        if valid_id_df.empty:
+            logger.debug("No memos with valid IDs found")
+            return
+
+        # Filter for task-specific content
+        task_df = valid_id_df[
+            valid_id_df['memo_data'].apply(lambda x: any(
+                task_indicator in str(x['full_output'])
+                for task_indicator in TASK_INDICATORS
+            ))
+        ].copy()
+
+        if task_df.empty:
+            logger.debug("No task-related memos found")
+            return
+
+        # Enrich memo_data with transaction metadata
+        fields_to_add = ['hash','counterparty_address','datetime']
+        task_df['memo_data'] = task_df.apply(
+            lambda row: {
+                **row['memo_data'], 
+                **{field: row[field] for field in fields_to_add if field in row}
+            } # ** is used to unpack the dictionaries
+            , axis=1
+        ).copy()
+
+        # Convert the memo_data to a dataframe and add the task type
+        task_df = pd.DataFrame(task_df['memo_data'].tolist())
+        task_df['task_type'] = task_df['full_output'].apply(classify_task_string)
+
+        # Concatenate new tasks to existing tasks and drop duplicates
+        self.tasks = pd.concat([self.tasks, task_df], ignore_index=True).drop_duplicates(subset=['hash'])
+
+        # for debugging purposes only
+        if SAVE_TASKS:
+            self.save_tasks()
+
+    @PerformanceMonitor.measure('sync_memos')
+    def sync_memos(self, new_memo_tx_df):
+        """Updates messages dataframe with P2P message data"""
+        if new_memo_tx_df.empty:
+            logger.debug("No new memos to process for messages")
+            return
+        
+        # Filter for valid IDs first
+        valid_id_df = new_memo_tx_df[
+            new_memo_tx_df['memo_data'].apply(is_valid_id)
+        ].copy()
+
+        if valid_id_df.empty:
+            logger.debug("No memos with valid IDs found")
+            return
+
+        # Filter for message-specific content
+        memo_df = valid_id_df[
+            valid_id_df['memo_data'].apply(lambda x: any(
+                message_indicator in str(x['full_output'])
+                for message_indicator in MESSAGE_INDICATORS
+            ))
+        ].copy()
+
+        if memo_df.empty:
+            logger.debug("No message-related memos found")
+            return
+        
+        # Enrich memo_data with transaction metadata
+        fields_to_add = ['hash','counterparty_address','datetime', 'direction']
+        memo_df['memo_data'] = memo_df.apply(
+            lambda row: {
+                **row['memo_data'], 
+                **{field: row[field] for field in fields_to_add if field in row}
+            }, 
+            axis=1
+        ).copy()
+
+        # Convert memo_data to new dataframe with all fields
+        memo_df = pd.DataFrame(memo_df['memo_data'].tolist())
+
+        # Process chunked messages, etc.
+        self.memos = pd.concat([self.memos, memo_df], ignore_index=True)
+
         if SAVE_MEMOS:
             self.save_memos()
 
-        self.sync_tasks(new_memo_df)
-
-    @PerformanceMonitor.measure('sync_tasks')
-    def sync_tasks(self, new_memo_df):
-        """ Updates the tasks dataframe with new tasks from the new memos.
-        Task dataframe contains columns: user,task_id,full_output,hash,node_account,datetime,task_type"""
-
-        # Filter for memos that are task IDs
-        new_task_df = new_memo_df[
-            new_memo_df['memo_data'].apply(is_task_id)
+    @PerformanceMonitor.measure('sync_system_memos')
+    def sync_system_memos(self, new_memo_tx_df):
+        """Updates system_memos dataframe with special system messages"""
+        if new_memo_tx_df.empty:
+            logger.debug("No new memos to process for system messages")
+            return
+        
+        # Filter for system message types
+        system_df = new_memo_tx_df[
+            new_memo_tx_df['memo_data'].apply(lambda x: any(
+                indicator in str(x['task_id'])
+                for indicator in SYSTEM_MEMO_TYPES
+            ))
         ].copy()
 
-        if not new_task_df.empty:
-            # Add the transaction hash, node account, and datetime to the dataframe
-            fields_to_add = ['hash','node_account','datetime']
-            new_task_df['memo_data'] = new_task_df.apply(
-            lambda row: {**row['memo_data'], **{field: row[field] for field in fields_to_add if field in row}} # ** is used to unpack the dictionaries
-                , axis=1
-            )
+        if system_df.empty:
+            logger.debug("No system messages found")
+            return
 
-            # Convert the memo_data to a dataframe and add the task type
-            new_task_df = pd.DataFrame(new_task_df['memo_data'].tolist())
-            new_task_df['task_type'] = new_task_df['full_output'].apply(classify_task_string)
+        # Enrich memo_data with transaction metadata
+        fields_to_add = ['hash', 'counterparty_address', 'datetime', 'direction']
+        system_df['memo_data'] = system_df.apply(
+            lambda row: {
+                **row['memo_data'],
+                **{field: row[field] for field in fields_to_add if field in row}
+            },
+            axis=1
+        ).copy()
 
-            # Concatenate new tasks to existing tasks and drop duplicates
-            self.tasks = pd.concat([self.tasks, new_task_df], ignore_index=True).drop_duplicates(subset=['hash'])
+        # Convert memo_data to new dataframe with all fields
+        system_df = pd.DataFrame(system_df['memo_data'].tolist())
 
-            # for debugging purposes only
-            if SAVE_TASKS:
-                self.save_tasks()
-        else:
-            logger.debug("No new tasks to sync")
+        # Update system_memos dataframe with deduplication
+        self.system_memos = pd.concat(
+            [self.system_memos, system_df], 
+            ignore_index=True
+        ).drop_duplicates(subset=['hash'])
+
+        logger.debug(f"Added {len(system_df)} new system messages")
+
+        if SAVE_SYSTEM_MEMOS: 
+            self.save_system_memos()
 
     def get_task(self, task_id):
         """ Returns the task dataframe for a given task ID """
@@ -464,6 +592,13 @@ class PostFiatTaskManager:
         if task_df.empty:
             raise NoMatchingTaskException(f"No task found with task_id {task_id}")
         return task_df
+    
+    def get_memo(self, memo_id):
+        """Returns the memo dataframe for a given memo ID """
+        memo_df = self.memos[self.memos['memo_id'] == memo_id]
+        if memo_df.empty:
+            raise NoMatchingMemoException(f"No memo found with memo_id {memo_id}")
+        return memo_df
     
     def get_task_state(self, task_df):
         """ Returns the latest state of a task given a task dataframe containing a single task_id """
@@ -509,7 +644,15 @@ class PostFiatTaskManager:
         return send_xrp(self.network_url, self.user_wallet, amount, destination, memo)
 
     def convert_memo_dict(self, memo_dict):
-        """Constructs a memo object with user, task_id, and full_output from hex-encoded values."""
+        """Constructs a memo object from hex-encoded XRP memo fields.
+        
+        The mapping from XRP memo fields to our internal format:
+        - MemoFormat -> user: The username that sent the memo
+        - MemoType -> task_id: Either:
+            a) For task messages: A datetime-based ID (e.g., "2024-01-01_12:00")
+            b) For system messages: The system message type (e.g., "HANDSHAKE", "INITIATION_RITE")
+        - MemoData -> full_output: The actual content/payload of the memo
+        """
         fields = {
             'user': 'MemoFormat',
             'task_id': 'MemoType',
@@ -602,11 +745,50 @@ class PostFiatTaskManager:
 
         return response
     
-    @PerformanceMonitor.measure('send_memo')
-    def send_memo(self, destination, memo: str, compress=True):
-        """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE"""
+    @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('send_handshake')
+    def send_handshake(self, destination):
+        """Sends a handshake memo to establish encrypted communication"""
+        logger.debug(f"Sending handshake to {destination}...")
+        ecdh_public_key = self.credential_manager.get_ecdh_public_key()
+        logger.debug(f"ECDH public key: {ecdh_public_key}, username: {self.credential_manager.postfiat_username}")
+        handshake = construct_handshake_memo(
+            user=self.credential_manager.postfiat_username,
+            ecdh_public_key=ecdh_public_key
+        )
+        return self._send_memo_single(destination, handshake)
 
+    @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('encrypt_memo')
+    def encrypt_memo(self, memo: str, shared_secret: str) -> str:
+        """ Encrypts a memo using a shared secret """
+        fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(shared_secret.encode()).digest()))
+        return fernet.encrypt(memo.encode()).decode()        
+
+    @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('send_memo')
+    def send_memo(self, destination, memo: str, compress=True, encrypt=False):
+        """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE, with optional compression and encryption"""
+        
         message_id = self.generate_custom_id()
+
+        # Handle encryption if requested
+        if encrypt:
+            # Check handshake status
+            _, received_key = self.get_handshake_for_address(destination)
+
+            if not received_key:
+                raise HandshakeRequiredError(destination)
+            
+            # Derive the shared secret
+            shared_secret = self.credential_manager.get_shared_secret(received_key)
+            logger.debug(f"Shared secret: {shared_secret[:8]}...")
+
+            # Encrypt the memo using the shared secret
+            logger.debug(f"Encrypting memo: {memo[:8]}...")
+            encrypted_memo = self.encrypt_memo(memo, shared_secret)
+            logger.debug(f"Encrypted memo: {encrypted_memo[:8]}...")
+            memo = "WHISPER__" + encrypted_memo
 
         if compress:
             logger.debug(f"Compressing memo of length {len(memo)}")
@@ -875,11 +1057,11 @@ class PostFiatTaskManager:
         logger.debug("Getting latest outgoing context doc link...")
 
         # Filter for memos that are PFT-related, sent to the default node, outgoing, and are google doc context links
-        redux_tx_list = self.memos[
-            self.memos['is_pft'] & 
-            (self.memos['destination']==self.default_node) &
-            (self.memos['message_type']=='OUTGOING') & 
-            (self.memos['memo_data'].apply(lambda x: x['task_id']) == 'google_doc_context_link')
+        redux_tx_list = self.memo_transactions[
+            self.memo_transactions['is_pft'] & 
+            (self.memo_transactions['destination']==self.default_node) &
+            (self.memo_transactions['direction']=='OUTGOING') & 
+            (self.memo_transactions['memo_data'].apply(lambda x: x['task_id']) == 'google_doc_context_link')
             ]
         
         logger.debug(f"Found {len(redux_tx_list)} outgoing context doc links")
@@ -900,21 +1082,21 @@ class PostFiatTaskManager:
     def output_account_address_node_association(self):
         """this takes the account info frame and figures out what nodes
          the account is associating with and returns them in a dataframe """
-        self.memos['valid_task_id']=self.memos['memo_data'].apply(is_task_id)
-        node_output_df = self.memos[self.memos['message_type']=='INCOMING'][['valid_task_id','account']].groupby('account').sum()
+        self.memo_transactions['valid_task_id']=self.memo_transactions['memo_data'].apply(is_valid_id)
+        node_output_df = self.memo_transactions[self.memo_transactions['direction']=='INCOMING'][['valid_task_id','account']].groupby('account').sum()
    
         return node_output_df[node_output_df['valid_task_id']>0]
     
     def get_user_initiation_rites_destinations(self):
         """Returns all the addresses that have received a user initiation rite"""
-        all_user_initiation_rites = self.memos[self.memos['memo_data'].apply(lambda x: x.get('task_id') == 'INITIATION_RITE')]
+        all_user_initiation_rites = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: x.get('task_id') == 'INITIATION_RITE')]
         return list(all_user_initiation_rites['destination'])
     
     def initiation_rite_sent(self):
         logger.debug("Checking if user has sent initiation rite...")
 
         # Check if memos dataframe is empty or missing required columns
-        if self.memos.empty or not all(col in self.memos.columns for col in ['destination', 'memo_data']):
+        if self.memo_transactions.empty or not all(col in self.memo_transactions.columns for col in ['destination', 'memo_data']):
             logger.debug("Memos dataframe is empty or missing required columns, returning False")
             return False
 
@@ -923,7 +1105,7 @@ class PostFiatTaskManager:
 
     def get_user_genesis_destinations(self):
         """ Returns all the addresses that have received a user genesis transaction"""
-        all_user_genesis = self.memos[self.memos['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
+        all_user_genesis = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
         return list(all_user_genesis['destination'])
 
     def genesis_sent(self):
@@ -1140,8 +1322,8 @@ class PostFiatTaskManager:
         result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
         # Add PFT value information
-        pft_only = self.memos[self.memos['tx_json'].apply(is_pft_transaction)].copy()
-        pft_only['pft_value'] = pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float) * pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
+        pft_only = self.memo_transactions[self.memo_transactions['tx_json'].apply(is_pft_transaction)].copy()
+        pft_only['pft_value'] = pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float) * pft_only['direction'].map({'INCOMING':1,'OUTGOING':-1})
         pft_only['task_id'] = pft_only['memo_data'].apply(lambda x: x['task_id'])
         
         pft_rewards_only = pft_only[pft_only['memo_data'].apply(lambda x: 'REWARD RESPONSE __' in x['full_output'])].copy()
@@ -1158,10 +1340,10 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('get_payments_df')
     def get_payments_df(self):
         """ Returns a dataframe containing payment transaction details"""
-        if self.memos.empty:
+        if self.memo_transactions.empty:
             return pd.DataFrame()
         
-        df = self.memos.copy()
+        df = self.memo_transactions.copy()
 
         # Extract delivered amoutn and determine token type
         def get_payment_details(row):
@@ -1190,18 +1372,15 @@ class PostFiatTaskManager:
         df['amount'] = payment_details.apply(lambda x: x['amount'])
         df['token'] = payment_details.apply(lambda x: x['token'])
 
-        # Create to/from label based on message_type
-        df['direction'] = df['message_type'].map({'INCOMING': 'From', 'OUTGOING': 'To'})
-
-        # Get the external address (sender or recipient)
-        # TODO: Node_account is a bad name for this column
-        df['address'] = df['node_account']
+        # Replace direction with to/from
+        df['direction'] = df['direction'].map({'INCOMING': 'From', 'OUTGOING': 'To'})
         
         # Add contact names where available
         contacts = self.credential_manager.get_contacts()
-        df['contact_name'] = df['address'].map(contacts)
+        df['contact_name'] = df['counterparty_address'].map(contacts)
         df['display_address'] = df.apply(
-            lambda x: x['contact_name'] + ' (' + x['address'] + ')' if pd.notna(x['contact_name']) else x['address'],
+            lambda x: x['contact_name'] + ' (' + x['counterparty_address'] + ')' 
+                if pd.notna(x['contact_name']) else x['counterparty_address'],
             axis=1
         )
 
@@ -1216,20 +1395,68 @@ class PostFiatTaskManager:
         return result_df
     
     @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('get_handshake_for_address')
+    def get_handshake_for_address(self, address: str) -> tuple[bool, str]:
+        """Returns (handshake_sent, their_public_key) tuple where:
+        - handshake_sent: Whether we've already sent our public key
+        - received_key: Their ECDH public key if they've sent it, None otherwise
+        """
+        if self.memos.empty:
+            logger.debug("No memos or handshakes found")
+            return False, None
+        
+        # Filter for handshakes
+        handshakes = self.system_memos[
+            self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
+        ]
+
+        if handshakes.empty:
+            logger.debug("No handshakes found")
+            return False, None
+
+        # Get handshakes sent FROM the user TO this address
+        sent_handshakes = handshakes[
+            (handshakes['counterparty_address'] == address) & 
+            (handshakes['direction'] == 'OUTGOING')
+        ]
+        handshake_sent = not sent_handshakes.empty
+
+        # Get handshakes received FROM this address TO the user
+        received_handshakes = handshakes[
+            (handshakes['counterparty_address'] == address) &
+            (handshakes['direction'] == 'INCOMING')
+        ]
+   
+        received_key = None
+        if not received_handshakes.empty:
+            logger.debug(f"Found {len(received_handshakes)} received handshakes from {address}")
+            latest_received_handshake = received_handshakes.sort_values('datetime').iloc[-1]
+            received_key = latest_received_handshake['full_output'].split('HANDSHAKE ___')[1]
+            logger.debug(f"Most recent received handshake: {received_key[:8]}...")
+
+        return handshake_sent, received_key
+    
+    @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_memos_df')
     def get_memos_df(self):
+        """Returns a dataframe containing only P2P messages (excluding handshakes)"""
+        if self.memos.empty:
+            logger.debug("No memos or handshakes found")
+            return pd.DataFrame()
 
         def remove_chunks(text):
             # Use regular expression to remove all occurrences of chunk_1__, chunk_2__, etc.
             cleaned_text = re.sub(r'chunk_\d+__', '', text)
             return cleaned_text
-        
-        if self.tasks is None or self.tasks.empty or "task_type" not in self.tasks.columns:
-            logger.debug("No self.tasks found to get memos from, returning empty dataframe")
-            return pd.DataFrame()
 
-        # Filter tasks with task_type in ['MEMO']
-        chunked_memos = self.tasks[self.tasks['task_type'].isin(['MEMO'])].copy()
+        # Filter for only MEMO type messages (excluding handshakes)
+        chunked_memos = self.memos[
+            self.memos['full_output'].str.contains(MessageType.MEMO.value, na=False)
+        ].copy()
+
+        if chunked_memos.empty:
+            logger.debug("No memos found")
+            return pd.DataFrame()
 
         # Remove "chunk_[index]_" prefix from the 'full_output' column
         chunked_memos['full_output'] = chunked_memos['full_output'].apply(remove_chunks)
@@ -1265,7 +1492,7 @@ class PostFiatTaskManager:
         if most_recent_status != 'PROPOSAL':
             raise WrongTaskStateException('PROPOSAL', most_recent_status)
 
-        proposal_source = task_df.iloc[0]['node_account']
+        proposal_source = task_df.iloc[0]['counterparty_address']
         if 'ACCEPTANCE REASON ___' not in acceptance_string:
             classified_string='ACCEPTANCE REASON ___ '+acceptance_string
         else:
@@ -1283,10 +1510,11 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
         
+        # TODO: make tasks refusable at any state
         if most_recent_status != 'PROPOSAL':
             raise WrongTaskStateException('PROPOSAL', most_recent_status)
         
-        proposal_source = task_df.iloc[0]['node_account']
+        proposal_source = task_df.iloc[0]['counterparty_address']
         if 'REFUSAL REASON ___' not in refusal_reason:
             refusal_reason = 'REFUSAL REASON ___ ' + refusal_reason
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
@@ -1342,7 +1570,7 @@ class PostFiatTaskManager:
         if most_recent_status != 'ACCEPTANCE':
             raise WrongTaskStateException('ACCEPTANCE', most_recent_status)
         
-        proposal_source = task_df.iloc[0]['node_account']
+        proposal_source = task_df.iloc[0]['counterparty_address']
         if 'COMPLETION JUSTIFICATION ___' not in completion_string:
             classified_completion_str = 'COMPLETION JUSTIFICATION ___ ' + completion_string
         else:
@@ -1371,7 +1599,7 @@ class PostFiatTaskManager:
         if most_recent_status != 'VERIFICATION_PROMPT':
             raise WrongTaskStateException('VERIFICATION_PROMPT', most_recent_status)
         
-        proposal_source = task_df.iloc[0]['node_account']
+        proposal_source = task_df.iloc[0]['counterparty_address']
         if 'VERIFICATION RESPONSE ___' not in response_string:
             classified_response_str = 'VERIFICATION RESPONSE ___ ' + response_string
         else:
@@ -1404,10 +1632,10 @@ class PostFiatTaskManager:
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
         # Slicing data based on conditions
-        google_doc_slice = self.memos[self.memos['memo_data'].apply(lambda x: 
+        google_doc_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 
                                                                    'google_doc_context_link' in str(x))].copy()
 
-        genesis_slice = self.memos[self.memos['memo_data'].apply(lambda x: 
+        genesis_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 
                                                                    'USER GENESIS __' in str(x))].copy()
         
         # Extract genesis username
@@ -1421,20 +1649,20 @@ class PostFiatTaskManager:
             key_google_doc = list(google_doc_slice['memo_data'])[0]['full_output']
 
         # Sorting account info by datetime
-        sorted_account_info = self.memos.sort_values('datetime', ascending=True).copy()
+        sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
 
-        def extract_latest_message(message_type, node, is_outgoing):
+        def extract_latest_message(direction, node, is_outgoing):
             """
             Extract the latest message of a given type for a specific node.
             """
             if is_outgoing:
                 latest_message = sorted_account_info[
-                    (sorted_account_info['message_type'] == message_type) &
+                    (sorted_account_info['direction'] == direction) &
                     (sorted_account_info['destination'] == node)
                 ].tail(1)
             else:
                 latest_message = sorted_account_info[
-                    (sorted_account_info['message_type'] == message_type) &
+                    (sorted_account_info['direction'] == direction) &
                     (sorted_account_info['account'] == node)
                 ].tail(1)
             
@@ -1487,7 +1715,7 @@ class PostFiatTaskManager:
         return response
 
     def get_all_pomodoros(self):
-        task_id_only = self.memos[self.memos['memo_data'].apply(lambda x: 'task_id' in str(x))].copy()
+        task_id_only = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 'task_id' in str(x))].copy()
         pomodoros_only = task_id_only[task_id_only['memo_data'].apply(lambda x: '==' in x['task_id'])].copy()
         pomodoros_only['parent_task_id']=pomodoros_only['memo_data'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
@@ -1526,14 +1754,17 @@ def is_over_1kb(string):
 def to_hex(string):
     return binascii.hexlify(string.encode()).decode()
 
+def construct_handshake_memo(user, ecdh_public_key) -> str:
+    return construct_memo(user=user, memo_type=SystemMemoType.HANDSHAKE.value, memo_data=ecdh_public_key)
+
 def construct_basic_postfiat_memo(user, task_id, full_output):
     return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
 
 def construct_initiation_rite_memo(user='goodalexander', commitment='I commit to generating massive trading profits using AI and investing them to grow the Post Fiat Network'):
-    return construct_memo(user=user, memo_type='INITIATION_RITE', memo_data=commitment)
+    return construct_memo(user=user, memo_type=SystemMemoType.INITIATION_RITE.value, memo_data=commitment)
 
 def construct_google_doc_context_memo(user, google_doc_link):                  
-    return construct_memo(user=user, memo_type='google_doc_context_link', memo_data=google_doc_link) 
+    return construct_memo(user=user, memo_type=SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, memo_data=google_doc_link) 
 
 def construct_genesis_memo(user, task_id, full_output):
     return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
@@ -1607,40 +1838,25 @@ def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
 
     return response
 
-def is_task_id(memo_dict) -> bool:
-    """ This function checks if a memo dictionary contains a task ID or the required fields
-    for a task ID """
+def is_valid_id(memo_dict: dict) -> bool:
+    """ This function checks if a memo dictionary contains a valid ID pattern (used for both tasks and messages)"""
     memo_string = str(memo_dict)
 
     # Check for task ID pattern
-    task_id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
-    if re.search(task_id_pattern, memo_string):
-        return True
-    
-    # Check for required fields
-    required_fields = ['user:', 'full_output:']
-    return all(field in memo_string for field in required_fields)
+    id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
+    has_valid_pattern = bool(re.search(id_pattern, memo_string))
 
-def classify_task_string(string):
-    """ These are the canonical classifications for task strings 
-    on a Post Fiat Node
+    return has_valid_pattern
+
+def classify_task_string(string: str) -> str:
     """ 
-    categories = {
-            'ACCEPTANCE': ['ACCEPTANCE REASON ___'],
-            'PROPOSAL': [' .. ','PROPOSED PF ___'],
-            'REFUSAL': ['REFUSAL REASON ___'],
-            'VERIFICATION_PROMPT': ['VERIFICATION PROMPT ___'],
-            'VERIFICATION_RESPONSE': ['VERIFICATION RESPONSE ___'],
-            'REWARD': ['REWARD RESPONSE __'],
-            'TASK_OUTPUT': ['COMPLETION JUSTIFICATION ___'],
-            'USER_GENESIS': ['USER GENESIS __'],
-            'REQUEST_POST_FIAT':['REQUEST_POST_FIAT ___'],
-            'MEMO': ['chunk_'],
-        }
+    Classifies a task string using TaskType enum patterns.
+    Returns the string name of the task type
+    """ 
 
-    for category, keywords in categories.items():
-        if any(keyword in string for keyword in keywords):
-            return category
+    for task_type, patterns in TASK_PATTERNS.items():
+        if any(pattern in string for pattern in patterns):
+            return task_type.name
 
     return 'UNKNOWN'
 
@@ -1700,7 +1916,7 @@ def generate_trust_line_to_pft_token(network_url, wallet: xrpl.wallet.Wallet):
         account=wallet.address,
         limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
             currency="PFT",
-            issuer='rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW',
+            issuer=ISSUER_ADDRESS,
             value='100000000',  # Large limit, arbitrarily chosen
         )
     )
@@ -1812,6 +2028,12 @@ class NoMatchingTaskException(Exception):
         self.task_id = task_id
         super().__init__(f"No matching task found for task ID: {task_id}")
 
+class NoMatchingMemoException(Exception):
+    """ This exception is raised when no matching memo is found """
+    def __init__(self, memo_id):
+        self.memo_id = memo_id
+        super().__init__(f"No matching memo found for memo ID: {memo_id}")
+
 class WrongTaskStateException(Exception):
     """ This exception is raised when the most recent task status is not the expected status """
     def __init__(self, expected_status, actual_status):
@@ -1842,6 +2064,12 @@ class GoogleDocIsNotSharedException(Exception):
     def __init__(self, google_url):
         self.google_url = google_url
         super().__init__(f"Google Doc is not shared: {google_url}")
+
+class HandshakeRequiredError(Exception):
+    """ This exception is raised when a handshake is required """
+    def __init__(self, destination):
+        self.destination = destination
+        super().__init__(f"Cannot encrypt message: no handshake received from {destination}")
 
 # class ProcessUserWebData:
 #     def __init__(self):
