@@ -5,8 +5,10 @@ from cryptography.fernet import InvalidToken
 from loguru import logger
 import shutil
 import json
-
-CREDENTIAL_FILENAME = "manyasone_cred_list.txt"
+from xrpl.core import addresscodec
+from xrpl.core.keypairs.ed25519 import ED25519
+from pftpyclient.postfiatsecurity.hash_tools import derive_shared_secret
+from pftpyclient.wallet_ux.constants import *
 
 class CredentialManager:
     def __init__(self,username,password):
@@ -21,10 +23,31 @@ class CredentialManager:
 
         try:
             self.pw_map = self.decrypt_creds(pw_decryptor=self.pw_initiator)
+            self._derive_ecdh_public_key()
         except InvalidToken:
             raise ValueError("Invalid username or password")
 
         self.fields_that_need_definition = [i for i in self.key_variables if i not in self.pw_map.keys()]
+
+    def get_raw_entropy(self) -> bytes:
+        """Returns the raw entropy bytes from wallet secret"""
+        decoded_seed = addresscodec.decode_seed(self.pw_map[self.wallet_secret_name])
+        return decoded_seed[0]
+
+    def _derive_ecdh_public_key(self):
+        """Derives ECDH public key from wallet secret"""
+        raw_entropy = self.get_raw_entropy()
+        self.ecdh_public_key, _ = ED25519.derive_keypair(raw_entropy, is_validator=False)
+
+    def get_ecdh_public_key(self) -> str:
+        """Returns ECDH public key as hex string"""
+        if not hasattr(self, 'ecdh_public_key'):
+            self._derive_ecdh_public_key()
+        return self.ecdh_public_key
+    
+    def get_shared_secret(self, received_key: str) -> str:
+        """Derives shared secret from ECDH public key"""
+        return derive_shared_secret(received_key, self.get_raw_entropy())
 
     def decrypt_creds(self, pw_decryptor):
         '''Decrypts all credentials in the file'''
@@ -121,6 +144,10 @@ class CredentialManager:
             if hasattr(self, 'pw_initiator'):
                 self.pw_initiator = '0' * len(self.pw_initiator)  # overwrite with zeros
                 del self.pw_initiator
+
+            # Clear ECDH public key
+            if hasattr(self, 'ecdh_public_key'):
+                del self.ecdh_public_key
 
             # Clear other sensitive data
             self.postfiat_username = None

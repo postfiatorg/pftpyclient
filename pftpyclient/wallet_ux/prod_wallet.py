@@ -47,22 +47,9 @@ wx_sink = configure_logger(
     log_filename="prod_wallet.log",
     level="DEBUG"
 )
+from pftpyclient.wallet_ux.constants import *
 
-MAINNET_WEBSOCKETS = [
-    "wss://xrplcluster.com",
-    "wss://xrpl.ws/",
-    "wss://s1.ripple.com/",
-    "wss://s2.ripple.com/"
-]
-TESTNET_WEBSOCKETS = [
-    "wss://s.altnet.rippletest.net:51233"
-]
-MAINNET_URL = "https://s2.ripple.com:51234"
-TESTNET_URL = "https://s.altnet.rippletest.net:51234"
 USE_TESTNET = False
-
-REMEMBRANCER_ADDRESS = "rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn"
-ISSUER_ADDRESS = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
 
 UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
 REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 10  # 10 seconds
@@ -344,7 +331,9 @@ class WalletApp(wx.Frame):
         'memos': {
             'columns': [
                 ('memo_id', 'Message ID', 190),
-                ('memo', 'Memo', 700)
+                ('memo', 'Memo', 500),
+                ('direction', 'To/From', 55),
+                ('counterparty_address', 'Address', 250)
             ]
         },
         'summary': {
@@ -669,9 +658,37 @@ class WalletApp(wx.Frame):
         self.memos_sizer = wx.BoxSizer(wx.VERTICAL)
         self.memos_tab.SetSizer(self.memos_sizer)
 
-        # Add memo input box
+        self.memos_sizer.AddSpacer(10)
+
+        # Add recipient selection
+        recipient_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        recipient_lbl = wx.StaticText(self.memos_tab, label="Recipient:")
+        recipient_sizer.Add(recipient_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.memo_recipient = wx.ComboBox(
+            self.memos_tab,
+            style=wx.CB_DROPDOWN,
+            size=(200, -1)
+        )
+        self.memo_recipient.Bind(wx.EVT_COMBOBOX, self.on_destination_selected)
+        self.memo_recipient.Bind(wx.EVT_TEXT, self.on_destination_text)
+        recipient_sizer.Add(self.memo_recipient, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        # Add checkboxes
+        self.memo_chk_encrypt = wx.CheckBox(self.memos_tab, label="Encrypt")
+        recipient_sizer.Add(self.memo_chk_encrypt, flag=wx.ALIGN_CENTER_VERTICAL, border=5)
+
+        self.memos_sizer.Add(recipient_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Add memo input box section with encryption requests button
+        memo_header_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.lbl_memo = wx.StaticText(self.memos_tab, label="Enter your memo:")
-        self.memos_sizer.Add(self.lbl_memo, 0, wx.EXPAND | wx.ALL, border=5)
+        memo_header_sizer.Add(self.lbl_memo, 1, wx.ALIGN_CENTER_VERTICAL)
+
+        self.btn_encryption_requests = wx.Button(self.memos_tab, label="Encryption Requests")
+        self.btn_encryption_requests.Bind(wx.EVT_BUTTON, self.on_encryption_requests)
+        memo_header_sizer.Add(self.btn_encryption_requests, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 5)
+
+        self.memos_sizer.Add(memo_header_sizer, 0, wx.EXPAND | wx.ALL, border=5)
         self.txt_memo_input = wx.TextCtrl(self.memos_tab, style=wx.TE_MULTILINE, size=(-1, 200))
         self.memos_sizer.Add(self.txt_memo_input, 1, wx.EXPAND | wx.ALL, border=5)
 
@@ -881,15 +898,33 @@ class WalletApp(wx.Frame):
         """Handle manual text entry - allow any text"""
         event.Skip()
 
-    def populate_destination_combobox(self):
-        """Populate destination combobox with contacts"""
-        self.txt_payment_destination.Clear()
+    def update_all_destination_comboboxes(self):
+        """Update all destination comboboxes"""
+        self._populate_destination_combobox(self.txt_payment_destination)
+        self._populate_destination_combobox(self.memo_recipient, REMEMBRANCER_ADDRESS)
+
+    def _populate_destination_combobox(self, combobox, default_destination=None):
+        """
+        Populate destination combobox with contacts
+        Args:
+            combobox: wx.ComboBox to populate
+            default_destination: Optional default address to select
+        """
+        combobox.Clear()
         contacts = self.task_manager.get_contacts()
 
         # Add contacts in format "name (address)"
         for address, name in contacts.items():
             display_text = f"{name} ({address})"
-            self.txt_payment_destination.Append(display_text, address)
+            combobox.Append(display_text, address)
+
+        # Set default selection
+        if default_destination:
+            if default_destination in contacts:
+                display_text = f"{contacts[default_destination]} ({default_destination})"
+                combobox.SetValue(display_text)
+            else:
+                combobox.SetValue(default_destination)
 
     def on_send_payment(self, event):
         """Handle unified payment submission"""
@@ -1238,7 +1273,7 @@ class WalletApp(wx.Frame):
 
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
-        self.populate_destination_combobox()
+        self.update_all_destination_comboboxes()
 
     @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
@@ -2099,122 +2134,119 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Memo...")
         self.btn_submit_memo.SetLabel("Submitting...")
         self.btn_submit_memo.Update()
-
         logger.info("Submitting Memo")
 
         memo_text = self.txt_memo_input.GetValue()
-
-        if not memo_text:
-            wx.MessageBox("Please enter a memo", "Error", wx.OK | wx.ICON_ERROR)
+        recipient = self.memo_recipient.GetSelection()
+        if recipient != wx.NOT_FOUND:
+            recipient = self.memo_recipient.GetClientData(recipient)
         else:
-            logger.info(f"Memo Text: {memo_text}")
+            recipient = self.memo_recipient.GetValue()
 
-            # Estimate chunks needed with compression
-            compressed_text = compress_string(memo_text)
+        encrypt = self.memo_chk_encrypt.IsChecked()
+
+        if not memo_text or not recipient:
+            wx.MessageBox("Please enter a memo and recipient", "Error", wx.OK | wx.ICON_ERROR)
+            self.btn_submit_memo.SetLabel("Submit Memo")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
+            return
+        
+        logger.debug(f"Preparing memo (encrypt={encrypt})")
+
+        try:
+            # First check if encryption is possible if requested
+            if encrypt:
+                logger.debug(f"Checking handshake for {recipient}")
+                handshake_sent, received_key = self.task_manager.get_handshake_for_address(recipient)
+                logger.debug(f"Handshake sent: {handshake_sent}, received key: {received_key}")
+                if not received_key:
+                    logger.debug(f"No received key for {recipient}")
+                    if not handshake_sent:
+                        logger.debug(f"Handshake not sent for {recipient}")
+                        if wx.YES == wx.MessageBox(
+                            "Encryption requires a handshake exchange. Would you like to send a handshake now?",
+                            "Handshake Required",
+                            wx.YES_NO | wx.ICON_QUESTION
+                        ):
+                            logger.debug(f"Sending handshake to {recipient}")
+                            response = self.task_manager.send_handshake(recipient)
+                            formatted_response = self.format_response(response)
+                            dialog = SelectableMessageDialog(self, "Handshake Submission Result", formatted_response)
+                            dialog.ShowModal()
+                            dialog.Destroy()
+                            wx.MessageBox(
+                                "Handshake sent. You'll need to wait for the recipient to send their handshake "
+                                "before you can send encrypted messages.\n\nWould you like to send this message "
+                                "unencrypted instead?",
+                                "Handshake Sent",
+                                wx.YES_NO | wx.ICON_INFORMATION
+                            )
+                            self.btn_submit_memo.SetLabel("Submit Memo")
+                            self.set_wallet_ui_state(WalletUIState.IDLE)
+                            return
+                    else:
+                        if wx.NO == wx.MessageBox(
+                            "Still waiting for recipient's handshake. Would you like to send "
+                            "this message unencrypted instead?",
+                            "Handshake Pending",
+                            wx.YES_NO | wx.ICON_QUESTION
+                        ):
+                            self.btn_submit_memo.SetLabel("Submit Memo")
+                            self.set_wallet_ui_state(WalletUIState.IDLE)
+                            return
+                        encrypt = False
+
+            # Estimate chunks needed
+            test_memo = memo_text 
+            if encrypt:
+                # Add encryption overhead to size estimate
+                test_memo = self.task_manager.encrypt_memo(test_memo, received_key)
+
+            # Estimate compressed size
+            compressed_text = compress_string(test_memo)
             compressed_bytes = compressed_text.encode('utf-8')
             num_chunks = len(compressed_bytes) // MAX_CHUNK_SIZE
             if len(compressed_bytes) % MAX_CHUNK_SIZE != 0:
                 num_chunks += 1
 
             # Calculate uncompressed chunks for comparison
-            uncompressed_bytes = memo_text.encode('utf-8')
+            uncompressed_bytes = test_memo.encode('utf-8')
             uncompressed_chunks = len(uncompressed_bytes) // MAX_CHUNK_SIZE
             if len(uncompressed_bytes) % MAX_CHUNK_SIZE != 0:
-                uncompressed_chunks += 1
+                uncompressed_chunks += 1        
 
             if num_chunks > 1:
                 message = (
-                    f"Memo will be compressed and sent over {num_chunks} transactions "
-                    f"(reduced from {uncompressed_chunks} without compression) and "
+                    f"Memo will be encrypted, compressed and sent over {num_chunks} transactions "
+                    f"(compared to {uncompressed_chunks} without compression) and "
                     f"cost 1 PFT per chunk ({num_chunks} PFT total). Continue?"
                 )
                 if wx.NO == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
                     self.btn_submit_memo.SetLabel("Submit Memo")
                     return
-                    
-            logger.info("User confirmed, submitting memo")
+                
+            # Send the memo
+            responses = self.task_manager.send_memo(recipient, memo_text, encrypt=encrypt)
+            
+            formatted_responses = [self.format_response(response) for response in responses]
+            logger.info(f"Memo Submission Result: {formatted_responses}")
 
-            try:
-                responses = self.task_manager.send_memo(REMEMBRANCER_ADDRESS, memo_text)
-                formatted_responses = [self.format_response(response) for response in responses]
-                logger.info(f"Memo Submission Result: {formatted_responses}")
+            for idx, formatted_response in enumerate(formatted_responses):
+                if idx == 0:
+                    dialog = SelectableMessageDialog(self, f"Memo Submission Result", formatted_response)
+                else:
+                    dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
 
-                for idx, formatted_response in enumerate(formatted_responses):
-                    if idx == 0:
-                        dialog = SelectableMessageDialog(self, f"Memo Submission Result", formatted_response)
-                    else:
-                        dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
-                    dialog.ShowModal()
-                    dialog.Destroy()
-
-            except Exception as e:
-                logger.error(f"Error submitting memo: {e}")
-                wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
-            else:
-                self.txt_memo_input.SetValue("")
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+        except Exception as e:
+            logger.error(f"Error submitting memo: {e}")
+            wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        else:
+            self.txt_memo_input.SetValue("")
+            wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
         self.btn_submit_memo.SetLabel("Submit Memo")
-        self.set_wallet_ui_state(WalletUIState.IDLE)
-
-    def on_submit_xrp_payment(self, event):
-        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting XRP Payment...")
-        self.btn_submit_xrp_payment.SetLabel("Submitting...")
-        self.btn_submit_xrp_payment.Update()
-
-        # Check that Amount and Destination are valid
-        if not self.txt_xrp_amount.GetValue() or not self.txt_xrp_address_payment.GetValue():
-            wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
-        else:
-            response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
-                                                            destination=self.txt_xrp_address_payment.GetValue(), 
-                                                            memo=self.txt_xrp_memo.GetValue()
-            )
-            logger.debug(f"response: {response}")
-            formatted_response = self.format_response(response)
-
-            logger.info(f"XRP Payment Result: {formatted_response}")
-
-            dialog = SelectableMessageDialog(self, "XRP Payment Result", formatted_response)
-            dialog.ShowModal()
-            dialog.Destroy()
-
-        self.btn_submit_xrp_payment.SetLabel("Submit Payment")
-        self.btn_submit_xrp_payment.Update()
-        self.set_wallet_ui_state(WalletUIState.IDLE)
-
-    def on_submit_pft_payment(self, event):
-        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting PFT Payment...")
-        self.btn_submit_pft_payment.SetLabel("Submitting...")
-        self.btn_submit_pft_payment.Update()
-
-        # Check that Amount and Destination are valid
-        if not self.txt_pft_amount.GetValue() or not self.txt_pft_address_payment.GetValue():
-            wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
-        else:
-            if is_over_1kb(self.txt_pft_memo.GetValue()):
-                memo_chunks = self.task_manager._get_memo_chunks(self.txt_pft_memo.GetValue())
-                message = f"Memo is over 1 KB, transaction will be batch-sent over {len(memo_chunks)} transactions. Continue?"
-                if wx.YES == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
-                    pass
-                else:
-                    self.btn_submit_pft_payment.SetLabel("Submit Payment")
-                    return
-
-            response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
-                                                    destination=self.txt_pft_address_payment.GetValue(), 
-                                                    memo=self.txt_pft_memo.GetValue()
-            )
-            formatted_response = self.format_response(response)
-
-            logger.info(f"PFT Payment Result: {formatted_response}")
-
-            dialog = SelectableMessageDialog(self, "PFT Payment Result", formatted_response)
-            dialog.ShowModal()
-            dialog.Destroy()
-
-        self.btn_submit_pft_payment.SetLabel("Submit Payment")
-        self.btn_submit_pft_payment.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_show_secret(self, event):
@@ -2538,7 +2570,7 @@ class WalletApp(wx.Frame):
         dialog = ContactsDialog(self)
         if dialog.ShowModal() == wx.ID_OK:
             self.refresh_grids()
-            self.populate_destination_combobox()
+            self.update_all_destination_comboboxes()
         dialog.Destroy()
 
     def show_payment_confirmation(self, amount, destination, token_type):
@@ -2551,10 +2583,15 @@ class WalletApp(wx.Frame):
             contact_name = dialog.get_contact_info()
             if contact_name:
                 self.task_manager.save_contact(destination, contact_name)
-                self.populate_destination_combobox()
-
+                self.update_all_destination_comboboxes()
         dialog.Destroy()
         return result == wx.ID_OK
+    
+    def on_encryption_requests(self, event):
+        """Show the encryption requests dialog"""
+        dialog = EncryptionRequestsDialog(self)
+        dialog.ShowModal()
+        dialog.Destroy()
 
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
@@ -2710,6 +2747,86 @@ class DeleteCredentialsDialog(wx.Dialog):
     def on_cancel(self, event):
         self.EndModal(wx.ID_CANCEL)
 
+class EncryptionRequestsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Pending Encryption Requests", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.parent: WalletApp = parent
+        self.task_manager: PostFiatTaskManager = parent.task_manager
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        help_text = (
+            "The following users would like to set up encrypted messaging with you. "
+            "Accepting a request will allow you to exchange private messages with them."
+        )
+        text = wx.StaticText(self, label=help_text)
+        text.Wrap(400)
+        sizer.Add(text, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Create list control
+        self.list_ctrl = wx.ListCtrl(self, style=wx.LC_REPORT | wx.BORDER_SUNKEN | wx.LC_SINGLE_SEL)
+        self.list_ctrl.InsertColumn(0, "From", width=300)
+        self.list_ctrl.InsertColumn(1, "Received", width=150)
+        sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Add buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.accept_btn = wx.Button(self, label="Accept")
+        self.accept_btn.Bind(wx.EVT_BUTTON, self.on_accept)
+        btn_sizer.Add(self.accept_btn, 0, wx.RIGHT, 5)
+        
+        self.skip_btn = wx.Button(self, label="Skip")
+        self.skip_btn.Bind(wx.EVT_BUTTON, self.on_skip)
+        btn_sizer.Add(self.skip_btn)
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        self.SetSizer(sizer)
+        self.load_requests()
+
+        # Enable/disable accept button based on selection
+        self.accept_btn.Enable(False)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_selection_changed)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_selection_changed)
+
+        start_size = (600, 400)
+        self.SetSize(start_size)
+        self.SetMinSize(start_size)
+
+    def on_selection_changed(self, event):
+        """Enable accept button if an item is selected"""
+        self.accept_btn.Enable(self.list_ctrl.GetFirstSelected() != -1)
+
+    def load_requests(self):
+        """Load pending encryption requests into the list control"""
+        self.list_ctrl.DeleteAllItems()
+        requests = self.task_manager.get_pending_handshakes()
+
+        for idx, request in requests.iterrows():
+            index = self.list_ctrl.GetItemCount()
+            self.list_ctrl.InsertItem(index, request['address'])
+            self.list_ctrl.SetItem(index, 1, request['received_at'].strftime('%Y-%m-%d %H:%M:%S'))
+            self.list_ctrl.SetItemData(index, idx)
+
+    def on_accept(self, event):
+        idx = self.list_ctrl.GetFirstSelected()
+        if idx == -1:
+            return
+        
+        address = self.task_manager.get_pending_handshakes().iloc[self.list_ctrl.GetItemData(idx)]['address']
+        
+        try:
+            response = self.task_manager.send_handshake(address)
+            formatted_response = self.parent.format_response(response)
+            handshake_dialog = SelectableMessageDialog(self, "Handshake Sent", formatted_response)
+            handshake_dialog.ShowModal()
+            handshake_dialog.Destroy()
+            self.load_requests()
+        except Exception as e:
+            wx.MessageBox(f"Failed to send handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_skip(self, event):
+        self.Close()
 
 class PreferencesDialog(wx.Dialog):
     def __init__(self, parent):
