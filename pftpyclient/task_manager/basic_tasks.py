@@ -1511,24 +1511,62 @@ class PostFiatTaskManager:
         # Rename full_output to memos, and task_id to message_id
         chunked_memos.rename(columns={'task_id' : 'memo_id', 'full_output': 'memo'}, inplace=True)
 
-        # Unchunk the memos
-        memos = chunked_memos.groupby('memo_id')['memo'].apply(''.join).reset_index()
+        # Replace direction with to/from
+        chunked_memos['direction'] = chunked_memos['direction'].map({'INCOMING': 'From', 'OUTGOING': 'To'})
 
-        def decompress_memo(memo):
+        # Group by memo_id to combine chunks and get sender info
+        grouped = chunked_memos.groupby('memo_id').agg({
+            'memo': ''.join,
+            'counterparty_address': 'first',  # Get sender address
+            'datetime': 'first',  # Get latest datetime
+            'direction': 'first'  # Get direction (INCOMING/OUTGOING)
+        }).reset_index()
+
+        def process_memo(row):
+            memo = row['memo']
+            sender = row['counterparty_address']
+
+            # First handle compression
             if memo.startswith("COMPRESSED__"):
                 try:
-                    return decompress_string(memo.replace("COMPRESSED__", ""))
+                    memo = decompress_string(memo.replace("COMPRESSED__", ""))
                 except ValueError as e:
                     logger.error(f"Error decompressing memo: {e}")
                     return f"[Decompression failed: {memo[:100]}...]"
+        
+            # Then handle encryption
+            if memo.startswith("WHISPER__"):
+                try:
+                    encrypted_content = memo.replace("WHISPER__", "")
+
+                    # Get their handshake
+                    _, received_key = self.get_handshake_for_address(sender)
+                    if not received_key:
+                        return "[Encrypted message - handshake not found]"
+                    
+                    # Derive shared secret
+                    shared_secret = self.credential_manager.get_shared_secret(received_key)
+
+                    # Decrypt
+                    key = base64.urlsafe_b64encode(hashlib.sha256(shared_secret).digest())
+                    fernet = Fernet(key)
+                    decrypted_bytes = fernet.decrypt(encrypted_content.encode())
+                    decrypted_memo = "[Decrypted] " + decrypted_bytes.decode()
+                    return decrypted_memo
+
+                except Exception as e:
+                    logger.error(f"Error decrypting memo: {e}")
+                    return "[Decryption failed]"
+                
             return memo
         
-        memos['memo'] = memos['memo'].apply(decompress_memo)
+        # Apply processing to each row
+        grouped['memo'] = grouped.apply(process_memo, axis=1)
 
-        # Reverse order to get the most recent memos first
-        memos = memos.iloc[::-1].reset_index(drop=True).copy()
-        
-        return memos
+        # Sort by datetime descending
+        result = grouped.sort_values(by='datetime', ascending=False).reset_index(drop=True)
+
+        return result[['memo_id', 'memo', 'direction', 'counterparty_address']]
 
     @PerformanceMonitor.measure('send_acceptance_for_task_id')
     def send_acceptance_for_task_id(self, task_id, acceptance_string):

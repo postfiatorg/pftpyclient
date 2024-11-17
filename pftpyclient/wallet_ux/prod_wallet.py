@@ -331,7 +331,9 @@ class WalletApp(wx.Frame):
         'memos': {
             'columns': [
                 ('memo_id', 'Message ID', 190),
-                ('memo', 'Memo', 700)
+                ('memo', 'Memo', 500),
+                ('direction', 'To/From', 55),
+                ('counterparty_address', 'Address', 250)
             ]
         },
         'summary': {
