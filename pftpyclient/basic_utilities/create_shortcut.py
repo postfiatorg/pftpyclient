@@ -71,7 +71,7 @@ echo "Post Fiat Wallet closed."
 read -p "Press Enter to exit..."
 """
 
-    command_file_path = os.path.join(save_location, 'Post_Fiat_Wallet.command')
+    command_file_path = os.path.join(save_location, 'Post Fiat Wallet.command')
     with open(command_file_path, 'w') as file:
         file.write(script)
 
