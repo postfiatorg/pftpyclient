@@ -369,39 +369,62 @@ class PostFiatTaskManager:
             logger.error(f"Error checking account status: {e}")
             return
 
-        # Attempt to load transactions from local csv
-        if self.transactions.empty: 
-            loaded_tx_df = self.load_transactions()
-            if not loaded_tx_df.empty:
-                logger.debug(f"Loaded {len(loaded_tx_df)} transactions from {self.tx_history_filepath}")
-                self.transactions = loaded_tx_df
-                self.sync_memo_transactions(loaded_tx_df)
+        try:
+            # Attempt to load transactions from local csv
+            if self.transactions.empty: 
+                loaded_tx_df = self.load_transactions()
+                if not loaded_tx_df.empty:
+                    logger.debug(f"Loaded {len(loaded_tx_df)} transactions from {self.tx_history_filepath}")
+                    self.transactions = loaded_tx_df
+                    self.sync_memo_transactions(loaded_tx_df)
 
-        # Choose ledger index to start sync from
-        if self.transactions.empty:
-            next_ledger_index = -1
-        else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
-            next_ledger_index = self.transactions['ledger_index'].max() + 1
-            logger.debug(f"Next ledger index: {next_ledger_index}")
+            # Choose ledger index to start sync from
+            if self.transactions.empty:
+                next_ledger_index = -1
+            else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
+                next_ledger_index = self.transactions['ledger_index'].max() + 1
+                logger.debug(f"Next ledger index: {next_ledger_index}")
 
-        # fetch new transactions from the node
-        new_tx_list = self.get_new_transactions(next_ledger_index)
+            # fetch new transactions from the node
+            new_tx_list = self.get_new_transactions(next_ledger_index)
 
-        # Add new transactions to the dataframe
-        if new_tx_list:
-            logger.debug(f"Adding {len(new_tx_list)} new transactions...")
-            new_tx_df = pd.DataFrame(new_tx_list)
-            self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
-            self.save_transactions()
-            self.sync_memo_transactions(new_tx_df)
-            return True
-        else:
-            logger.debug("No new transactions found. Finished updating local tx history")
-            return False
+            # Add new transactions to the dataframe
+            if new_tx_list:
+                logger.debug(f"Adding {len(new_tx_list)} new transactions...")
+                new_tx_df = pd.DataFrame(new_tx_list)
+                self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
+                self.save_transactions()
+                self.sync_memo_transactions(new_tx_df)
+                return True
+            else:
+                logger.debug("No new transactions found. Finished updating local tx history")
+                return False
+            
+        except (TypeError, AttributeError) as e:
+            logger.error(f"Error processing transaction history: {e}")
+            logger.warning("Corrupted transaction history file detected. Deleting and starting fresh.")
+
+            try:
+                if os.path.exists(self.tx_history_filepath):
+                    os.remove(self.tx_history_filepath)
+                    logger.debug(f"Deleted corrupted cache file: {self.tx_history_filepath}")
+            except Exception as delete_error:
+                logger.error(f"Error deleting corrupted cache file: {delete_error}")
+
+            # Reset dataframes
+            self.transactions = pd.DataFrame()
+            self.memo_transactions = pd.DataFrame()
+            self.tasks = pd.DataFrame()
+            self.memos = pd.DataFrame()
+            self.system_memos = pd.DataFrame()
+
+            # Try syncing transactions again with fresh state
+            return self.sync_transactions()
 
     @PerformanceMonitor.measure('sync_memo_transactions')
     def sync_memo_transactions(self, new_tx_df):
         """Enriches transactions that contain memos with additional columns for easier processing"""
+        logger.debug(f"Syncing transactions with memos")
         # flag rows with memos
         new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x)
 
@@ -450,6 +473,7 @@ class PostFiatTaskManager:
     def sync_tasks(self, new_memo_tx_df):
         """ Updates the tasks dataframe with new tasks from the new memos.
         Task dataframe contains columns: user,task_id,full_output,hash,counterparty_address,datetime,task_type"""
+        logger.debug(f"Syncing tasks")
         if new_memo_tx_df.empty:
             logger.debug("No new memos to process for tasks")
             return
@@ -499,6 +523,7 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('sync_memos')
     def sync_memos(self, new_memo_tx_df):
         """Updates messages dataframe with P2P message data"""
+        logger.debug(f"Syncing memos")
         if new_memo_tx_df.empty:
             logger.debug("No new memos to process for messages")
             return
@@ -546,6 +571,7 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('sync_system_memos')
     def sync_system_memos(self, new_memo_tx_df):
         """Updates system_memos dataframe with special system messages"""
+        logger.debug(f"Syncing system memos")
         if new_memo_tx_df.empty:
             logger.debug("No new memos to process for system messages")
             return
@@ -745,35 +771,57 @@ class PostFiatTaskManager:
 
         return response
     
-    @PerformanceMonitor.measure('get_pending_handshakes')
-    def get_pending_handshakes(self):
-        """Returns a DataFrame of received handshakes"""
+    @PerformanceMonitor.measure('get_handshakes')
+    def get_handshakes(self):
+        """ Returns a DataFrame of all handshake interactions with their current status"""
         if self.system_memos.empty:
             return pd.DataFrame()
         
-        # Get incoming handshakes
+        # Get all handshakes (both incoming and outgoing)
         handshakes = self.system_memos[
-            (self.system_memos['task_id'] == SystemMemoType.HANDSHAKE.value) &
-            (self.system_memos['direction'] == 'INCOMING')
+            self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
         ]
 
         if handshakes.empty:
             return pd.DataFrame()
         
-        # For each sender, check if we've sent them a handshake back
+        # Process each unique counterparty address
         results = []
-        for _, handshake in handshakes.iterrows():
-            sender = handshake['counterparty_address']
-            handshake_sent, _ = self.get_handshake_for_address(sender)
+        unique_addresses = handshakes['counterparty_address'].unique()
 
-            if not handshake_sent:
-                # Get sender's display name from contacts, if available
-                results.append({
-                    'address': sender,
-                    'received_at': handshake['datetime'],
-                })
+        for address in unique_addresses:
+            # Get the earliest incoming handshake from this address (if any)
+            incoming = handshakes[
+                (handshakes['counterparty_address'] == address) &
+                (handshakes['direction'] == 'INCOMING')
+            ].sort_values('datetime')
 
-        return pd.DataFrame(results)
+            # Get the outgoing handshake to this address (if any)
+            outgoing = handshakes[
+                (handshakes['counterparty_address'] == address) &
+                (handshakes['direction'] == 'OUTGOING')
+            ].sort_values('datetime')
+
+            result = {
+                'address': address,
+                'received_at': incoming.iloc[0]['datetime'] if not incoming.empty else None,
+                'sent_at': outgoing.iloc[0]['datetime'] if not outgoing.empty else None,
+                'encryption_ready': not incoming.empty and not outgoing.empty
+            }
+
+            results.append(result)
+
+        # Create DataFrame and add contact information if available
+        df = pd.DataFrame(results)
+        contacts = self.credential_manager.get_contacts()
+        df['contact_name'] = df['address'].map(contacts)
+        df['display_address'] = df.apply(
+            lambda x: x['contact_name'] + ' (' + x['address'] + ')' 
+                if pd.notna(x['contact_name']) else x['address'],
+            axis=1
+        )
+
+        return df
 
     @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_handshake_for_address')
@@ -1566,7 +1614,16 @@ class PostFiatTaskManager:
         # Sort by datetime descending
         result = grouped.sort_values(by='datetime', ascending=False).reset_index(drop=True)
 
-        return result[['memo_id', 'memo', 'direction', 'counterparty_address']]
+        # Add contact names where available
+        contacts = self.credential_manager.get_contacts()
+        result['contact_name'] = result['counterparty_address'].map(contacts)
+        result['display_address'] = result.apply(
+            lambda x: x['contact_name'] + ' (' + x['counterparty_address'] + ')' 
+                if pd.notna(x['contact_name']) else x['counterparty_address'],
+            axis=1
+        )
+
+        return result[['memo_id', 'memo', 'direction', 'display_address']]
 
     @PerformanceMonitor.measure('send_acceptance_for_task_id')
     def send_acceptance_for_task_id(self, task_id, acceptance_string):

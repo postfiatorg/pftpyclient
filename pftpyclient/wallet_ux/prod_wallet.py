@@ -333,7 +333,7 @@ class WalletApp(wx.Frame):
                 ('memo_id', 'Message ID', 190),
                 ('memo', 'Memo', 500),
                 ('direction', 'To/From', 55),
-                ('counterparty_address', 'Address', 250)
+                ('display_address', 'Address', 250)
             ]
         },
         'summary': {
@@ -2096,6 +2096,7 @@ class WalletApp(wx.Frame):
                 wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
             else:
                 self.verification_txt_details.SetValue("")
+                self.verification_txt_task_id.SetValue("")
                 wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
@@ -2181,6 +2182,7 @@ class WalletApp(wx.Frame):
                                 "Handshake Sent",
                                 wx.YES_NO | wx.ICON_INFORMATION
                             )
+                            self._sync_and_refresh()
                             self.btn_submit_memo.SetLabel("Submit Memo")
                             self.set_wallet_ui_state(WalletUIState.IDLE)
                             return
@@ -2749,24 +2751,29 @@ class DeleteCredentialsDialog(wx.Dialog):
 
 class EncryptionRequestsDialog(wx.Dialog):
     def __init__(self, parent):
-        super().__init__(parent, title="Pending Encryption Requests", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        super().__init__(parent, title="Encryption Requests", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.parent: WalletApp = parent
         self.task_manager: PostFiatTaskManager = parent.task_manager
 
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         help_text = (
-            "The following users would like to set up encrypted messaging with you. "
-            "Accepting a request will allow you to exchange private messages with them."
+            "This dialog shows the status of encryption setup with other users.\n\n"
+            "• When you receive a handshake request, it appears in the 'Received' column\n"
+            "• After you send a handshake, the time appears in the 'Sent' column\n"
+            "• Encryption is ready when both handshakes are exchanged\n\n"
+            "Select a received request and click 'Accept' to enable encrypted messaging with that user."
         )
         text = wx.StaticText(self, label=help_text)
-        text.Wrap(400)
+        text.Wrap(450)
         sizer.Add(text, 0, wx.ALL | wx.EXPAND, 5)
 
         # Create list control
         self.list_ctrl = wx.ListCtrl(self, style=wx.LC_REPORT | wx.BORDER_SUNKEN | wx.LC_SINGLE_SEL)
         self.list_ctrl.InsertColumn(0, "From", width=300)
         self.list_ctrl.InsertColumn(1, "Received", width=150)
+        self.list_ctrl.InsertColumn(2, "Sent", width=150)
+        self.list_ctrl.InsertColumn(3, "Encryption Ready", width=110)
         sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 5)
 
         # Add buttons
@@ -2775,9 +2782,9 @@ class EncryptionRequestsDialog(wx.Dialog):
         self.accept_btn.Bind(wx.EVT_BUTTON, self.on_accept)
         btn_sizer.Add(self.accept_btn, 0, wx.RIGHT, 5)
         
-        self.skip_btn = wx.Button(self, label="Skip")
-        self.skip_btn.Bind(wx.EVT_BUTTON, self.on_skip)
-        btn_sizer.Add(self.skip_btn)
+        self.close_btn = wx.Button(self, label="Close")
+        self.close_btn.Bind(wx.EVT_BUTTON, self.on_close)
+        btn_sizer.Add(self.close_btn)
         
         sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
         
@@ -2789,23 +2796,50 @@ class EncryptionRequestsDialog(wx.Dialog):
         self.list_ctrl.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_selection_changed)
         self.list_ctrl.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_selection_changed)
 
-        start_size = (600, 400)
+        start_size = (800, 400)
         self.SetSize(start_size)
         self.SetMinSize(start_size)
 
     def on_selection_changed(self, event):
-        """Enable accept button if an item is selected"""
-        self.accept_btn.Enable(self.list_ctrl.GetFirstSelected() != -1)
+        """Enable accept button if an item is selected and not already accepted"""
+        idx = self.list_ctrl.GetFirstSelected()
+        if idx != -1:
+            handshakes = self.task_manager.get_handshakes()
+            selected_handshake = handshakes.iloc[self.list_ctrl.GetItemData(idx)]
+            # Only enable Accept if we received a handshake but haven't sent one
+            can_accept = (pd.notna(selected_handshake['received_at']) and pd.isna(selected_handshake['sent_at']))
+            self.accept_btn.Enable(can_accept)
+        else:
+            self.accept_btn.Enable(False)
 
     def load_requests(self):
         """Load pending encryption requests into the list control"""
         self.list_ctrl.DeleteAllItems()
-        requests = self.task_manager.get_pending_handshakes()
+        handshakes = self.task_manager.get_handshakes()
 
-        for idx, request in requests.iterrows():
+        for idx, handshake in handshakes.iterrows():
             index = self.list_ctrl.GetItemCount()
-            self.list_ctrl.InsertItem(index, request['address'])
-            self.list_ctrl.SetItem(index, 1, request['received_at'].strftime('%Y-%m-%d %H:%M:%S'))
+            display_name = handshake['contact_name'] if pd.notna(handshake['contact_name']) else handshake['address']
+            self.list_ctrl.InsertItem(index, display_name)
+
+            # Show received time or "Not received" if we haven't received a handshake
+            received_at = handshake['received_at']
+            if pd.notna(received_at):  # check if timestamp is not NaT/None
+                self.list_ctrl.SetItem(index, 1, received_at.strftime('%Y-%m-%d %H:%M:%S'))
+            else:
+                self.list_ctrl.SetItem(index, 1, "")
+
+            # Show accepted time or "Not sent" if we haven't sent a handshake
+            sent_at = handshake['sent_at']
+            if pd.notna(sent_at):  # check if timestamp is not NaT/None
+                self.list_ctrl.SetItem(index, 2, sent_at.strftime('%Y-%m-%d %H:%M:%S'))
+            else:
+                self.list_ctrl.SetItem(index, 2, "")
+
+            # Show encryption ready status
+            encryption_ready = handshake['encryption_ready']
+            self.list_ctrl.SetItem(index, 3, "Yes" if encryption_ready else "No")
+
             self.list_ctrl.SetItemData(index, idx)
 
     def on_accept(self, event):
@@ -2813,7 +2847,7 @@ class EncryptionRequestsDialog(wx.Dialog):
         if idx == -1:
             return
         
-        address = self.task_manager.get_pending_handshakes().iloc[self.list_ctrl.GetItemData(idx)]['address']
+        address = self.task_manager.get_handshakes().iloc[self.list_ctrl.GetItemData(idx)]['address']
         
         try:
             response = self.task_manager.send_handshake(address)
@@ -2821,11 +2855,12 @@ class EncryptionRequestsDialog(wx.Dialog):
             handshake_dialog = SelectableMessageDialog(self, "Handshake Sent", formatted_response)
             handshake_dialog.ShowModal()
             handshake_dialog.Destroy()
+            self.parent._sync_and_refresh()
             self.load_requests()
         except Exception as e:
             wx.MessageBox(f"Failed to send handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
-    def on_skip(self, event):
+    def on_close(self, event):
         self.Close()
 
 class PreferencesDialog(wx.Dialog):
