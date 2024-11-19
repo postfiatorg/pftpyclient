@@ -19,17 +19,13 @@ from pftpyclient.task_manager.wallet_state import (
     PFT_STATES
 )
 from pftpyclient.task_manager.basic_tasks import (
-    GoogleDocNotFoundException, 
-    InvalidGoogleDocException, 
     PostFiatTaskManager, 
-    WalletInitiationFunctions, 
     NoMatchingTaskException, 
     WrongTaskStateException, 
-    is_over_1kb, 
     MAX_CHUNK_SIZE, 
     compress_string
 )
-from pftpyclient.user_login.credential_input import get_cached_usernames
+from pftpyclient.user_login.credentials import CredentialManager
 import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
@@ -1014,7 +1010,7 @@ class WalletApp(wx.Frame):
     def populate_username_dropdown(self):
         """Populates the username dropdown with cached usernames"""
         try:
-            cached_usernames = get_cached_usernames()
+            cached_usernames = CredentialManager.get_cached_usernames()
             self.login_txt_username.Clear()
             self.login_txt_username.AppendItems(cached_usernames)
 
@@ -1185,8 +1181,6 @@ class WalletApp(wx.Frame):
         dialog.Destroy()
 
     def on_cache_user(self, event):
-        #TODO: Phase out this method in favor of automatic caching on genesis
-        logger.debug("User clicked Cache Credentials button")
         """Caches the user's credentials"""
         input_map = {
             'Username_Input': self.create_txt_username.GetValue(),
@@ -1196,34 +1190,26 @@ class WalletApp(wx.Frame):
             'Confirm Password_Input': self.create_txt_confirm_password.GetValue(),
         }
 
-        is_valid, error_message = self.validate_password(input_map['Password_Input'])
-        if not is_valid:
-            logger.error(error_message)
-            wx.MessageBox(error_message, 'Error', wx.OK | wx.ICON_ERROR)
-        elif self.create_txt_password.GetValue() != self.create_txt_confirm_password.GetValue():
+        if self.create_txt_password.GetValue() != self.create_txt_confirm_password.GetValue():
             logger.error("Passwords Do Not Match! Please Retry.")
             wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
         elif any(not value for value in input_map.values()):
             logger.error("All fields are required for caching!")
             wx.MessageBox('All fields are required for caching!', 'Error', wx.OK | wx.ICON_ERROR)
         else:
-            wallet_functions = WalletInitiationFunctions(input_map, self.network_url)
             try:
-                response = wallet_functions.cache_credentials(input_map)
+                response = CredentialManager.cache_credentials(input_map)
                 wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
             except Exception as e:
                 logger.error(f"{e}")
-                # TODO: This check was inserted for instances when Google Docs were still being checked and were invalid
-                # TODO: Since google docs were removed, this check is probably no longer needed
-                if wx.YES == wx.MessageBox(f"{e}. \n\nContinue caching anyway?", 'Error', wx.YES_NO | wx.ICON_ERROR):
-                    try:
-                        logger.debug("Attempting to cache credentials despite error")
-                        response = wallet_functions.cache_credentials(input_map)
-                    except Exception as e:
-                        logger.error(f"Error caching credentials: {e}")
-                        wx.MessageBox(f"Error caching credentials: {e}", 'Error', wx.OK | wx.ICON_ERROR)
-                    else:
-                        wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
+                wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
+            else:
+                # Clear all fields if caching was successful
+                self.create_txt_username.SetValue('')
+                self.create_txt_password.SetValue('')
+                self.create_txt_xrp_address.SetValue('')
+                self.create_txt_xrp_secret.SetValue('')
+                self.create_txt_confirm_password.SetValue('')
 
     def on_login(self, event):
         self.set_wallet_ui_state(WalletUIState.BUSY, "Logging in...")
@@ -2200,9 +2186,9 @@ class WalletApp(wx.Frame):
                                 wx.YES_NO | wx.ICON_INFORMATION
                             )
                             self._sync_and_refresh()
-                            self.btn_submit_memo.SetLabel("Submit Memo")
-                            self.set_wallet_ui_state(WalletUIState.IDLE)
-                            return
+                        self.btn_submit_memo.SetLabel("Submit Memo")
+                        self.set_wallet_ui_state(WalletUIState.IDLE)
+                        return
                     else:
                         if wx.NO == wx.MessageBox(
                             "Still waiting for recipient's handshake. Would you like to send "
@@ -2294,12 +2280,6 @@ class WalletApp(wx.Frame):
         else:
             dialog.Destroy()
 
-    def validate_password(self, password):
-        """Validate password requirements"""
-        if len(password) < 8:
-            return False, "Password must be at least 8 characters long"
-        return True, ""
-
     def on_change_password(self, event):
         """Handle password change request"""
         dialog = ChangePasswordDialog(self)
@@ -2315,18 +2295,15 @@ class WalletApp(wx.Frame):
                         raise ValueError("Incorrect password")
 
                     # Validate new password
-                    is_valid, error_message = self.validate_password(new_password)
-                    if not is_valid:
-                        raise ValueError(error_message)
+                    if not CredentialManager.is_valid_password(new_password):
+                        raise ValueError("Invalid password. Must be at least 8 characters long and contain only letters, numbers, or basic symbols")
                         
                     # Check if passwords match
                     if new_password != confirm_password:
                         raise ValueError("New passwords do not match")
                         
                     # Attempt password change
-                    success = self.task_manager.credential_manager.change_password(
-                        current_password, new_password
-                    )
+                    success = self.task_manager.change_password(new_password)
                     
                     if success:
                         wx.MessageBox(
@@ -2708,11 +2685,10 @@ class DeleteCredentialsDialog(wx.Dialog):
 
         warning_text = (
             "WARNING: This action cannot be undone!\n\n"
-            "• All local credentials will be deleted for this account.\n"
-            "• Your XRP wallet will remain on the XRPL but you will lose access\n"
-            "• Any PFT tokens in your wallet will become inaccessible\n\n"
-            "MAKE SURE YOU HAVE BACKED UP YOUR XRP SECRET KEY\n"
-            "BEFORE PROCEEDING!\n\n"
+            "• All local credentials and saved contacts will be deleted for this account.\n"
+            "• Your XRP wallet will remain on the XRPL but you will lose access.\n"
+            "• Any PFT tokens in your wallet will become inaccessible.\n\n"
+            "MAKE SURE YOU HAVE BACKED UP YOUR XRP SECRET KEY BEFORE PROCEEDING!\n\n"
         )
 
         warning_label = wx.StaticText(self, label=warning_text)
@@ -3012,11 +2988,16 @@ class ContactsDialog(wx.Dialog):
         address = self.address_ctrl.GetValue().strip()
         if name and address:
             logger.debug(f"Saving contact: {name} - {address}")
-            self.task_manager.save_contact(address, name)
-            self.load_contacts()
-            self.name_ctrl.SetValue("")
-            self.address_ctrl.SetValue("")
-            self.changes_made = True
+            try:
+                self.task_manager.save_contact(address, name)
+            except ValueError as e:
+                wx.MessageBox(f"Error saving contact: {e}", 'Error', wx.OK | wx.ICON_ERROR)
+                return
+            else:
+                self.load_contacts()
+                self.name_ctrl.SetValue("")
+                self.address_ctrl.SetValue("")
+                self.changes_made = True
 
     def on_delete(self, event):
         index = self.contacts_list.GetFirstSelected()

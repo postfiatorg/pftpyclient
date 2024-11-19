@@ -1,5 +1,5 @@
 from xrpl.wallet import Wallet
-from pftpyclient.user_login.credential_input import cache_credentials, CredentialManager
+from pftpyclient.user_login.credentials import CredentialManager
 
 def test_ecdh_key_derivation():
     # Setup test credentials
@@ -14,7 +14,7 @@ def test_ecdh_key_derivation():
         "XRP Address_Input": wallet.classic_address,
         "XRP Secret_Input": wallet.seed
     }
-    cache_credentials(input_map)
+    CredentialManager.cache_credentials(input_map)
 
     # Initialize credential manager
     cred_manager = CredentialManager(username, password)
@@ -33,12 +33,18 @@ def test_ecdh_key_derivation():
 
     # Clear and assert key is no longer available
     cred_manager.clear_credentials()
-    assert not hasattr(cred_manager, 'ecdh_public_key')
+    assert cred_manager.ecdh_public_key is None
 
     # Rederive and verify key is same after re-derivation
     cred_manager = CredentialManager(username, password)
     key3 = cred_manager.get_ecdh_public_key()
     assert key1 == key3
+
+    # Delete credentials for test_user
+    cred_manager.delete_credentials()
+    assert username not in CredentialManager.get_cached_usernames()
+
+    print("All tests passed")
 
 if __name__ == "__main__":
     test_ecdh_key_derivation()
