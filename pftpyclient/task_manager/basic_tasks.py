@@ -666,8 +666,8 @@ class PostFiatTaskManager:
         return output
     
     @PerformanceMonitor.measure('send_xrp')
-    def send_xrp(self, amount, destination, memo=""):
-        return send_xrp(self.network_url, self.user_wallet, amount, destination, memo)
+    def send_xrp(self, amount, destination, memo="", destination_tag=None):
+        return send_xrp(self.network_url, self.user_wallet, amount, destination, memo, destination_tag=destination_tag)
 
     def convert_memo_dict(self, memo_dict):
         """Constructs a memo object from hex-encoded XRP memo fields.
@@ -1943,7 +1943,7 @@ def get_xrp_balance(network_url, address):
         logger.error(f"Exception when fetching XRP balance: {e}")
         return None
 
-def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=""):
+def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo="", destination_tag=None):
     client = xrpl.clients.JsonRpcClient(network_url)
 
     logger.debug(f"Sending {amount} XRP to {destination} with memo {memo}")
@@ -1956,13 +1956,21 @@ def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
     else:
         logger.error("Memo is not a string or a Memo object, raising ValueError")
         raise ValueError("Memo must be either a string or a Memo object")
+    
+    # Create payment transaction with optional destination tag
+    payment_args = {
+        "account": wallet.address,
+        "amount": xrpl.utils.xrp_to_drops(Decimal(amount)),
+        "destination": destination,
+        "memos": memos
+    }
 
-    payment = xrpl.models.transactions.Payment(
-        account=wallet.address,
-        amount=xrpl.utils.xrp_to_drops(Decimal(amount)),
-        destination=destination,
-        memos=memos,
-    )
+    # Add destination tag if provided
+    if destination_tag:
+        payment_args["destination_tag"] = destination_tag
+
+    payment = xrpl.models.transactions.Payment(**payment_args)
+
     # Sign the transaction to get the hash
     # We need to derive the hash because the submit_and_wait function doesn't return a hash if transaction fails
     # TODO: tx_hash currently not used because it doesn't match the hash produced by xrpl.transaction.submit_and_wait

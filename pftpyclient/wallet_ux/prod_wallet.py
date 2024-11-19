@@ -825,14 +825,14 @@ class WalletApp(wx.Frame):
         left_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Amount, token and destination input section
-        required_input_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        top_row_input_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
         # Amount input with label
         amount_label = wx.StaticText(self.payments_tab, label="Send Amount:")
-        required_input_sizer.Add(amount_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        top_row_input_sizer.Add(amount_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
         self.payment_txt_amount = wx.TextCtrl(self.payments_tab, size=(100, -1))
-        required_input_sizer.Add(self.payment_txt_amount, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        top_row_input_sizer.Add(self.payment_txt_amount, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
         # Token selector
         self.token_selector = wx.ComboBox(
@@ -842,11 +842,11 @@ class WalletApp(wx.Frame):
             size=(70, -1)
         )
         self.token_selector.SetSelection(0)  # Default to XRP
-        required_input_sizer.Add(self.token_selector, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        top_row_input_sizer.Add(self.token_selector, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
 
         # Destination input with label
         dest_label = wx.StaticText(self.payments_tab, label="To:")
-        required_input_sizer.Add(dest_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        top_row_input_sizer.Add(dest_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
         self.txt_payment_destination = wx.ComboBox(
             self.payments_tab,
@@ -856,9 +856,21 @@ class WalletApp(wx.Frame):
         self.txt_payment_destination.Bind(wx.EVT_COMBOBOX, self.on_destination_selected)
         self.txt_payment_destination.Bind(wx.EVT_TEXT, self.on_destination_text)
 
-        required_input_sizer.Add(self.txt_payment_destination, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        top_row_input_sizer.Add(self.txt_payment_destination, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
-        left_sizer.Add(required_input_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        # Destination tags / Memo ID inputs
+        dest_tag_label = wx.StaticText(self.payments_tab, label="Memo ID (optional):")
+        top_row_input_sizer.Add(dest_tag_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        self.txt_destination_tag = wx.TextCtrl(self.payments_tab, size=(100, -1))
+        tooltip_text = ("Some exchanges and services require a Memo ID (also called Destination Tag) " 
+                       "for XRP deposits.\nCheck your recipient's requirements - sending XRP without " 
+                       "a required Memo ID may result in lost funds.")
+        self.txt_destination_tag.SetToolTip(tooltip_text)
+        dest_tag_label.SetToolTip(tooltip_text)
+        top_row_input_sizer.Add(self.txt_destination_tag, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        left_sizer.Add(top_row_input_sizer, 0, wx.EXPAND | wx.ALL, 5)
 
         # Optional memo field
         memo_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -952,6 +964,7 @@ class WalletApp(wx.Frame):
         amount = self.payment_txt_amount.GetValue()
         destination = self.txt_payment_destination.GetValue()
         memo = self.txt_payment_memo.GetValue()
+        destination_tag = self.txt_destination_tag.GetValue()
 
         self.btn_send.SetLabel("Sending...")
 
@@ -974,7 +987,8 @@ class WalletApp(wx.Frame):
 
         try:
             if token_type == "XRP":
-                response = self.task_manager.send_xrp(amount, destination, memo)
+                dest_tag = int(destination_tag) if destination_tag.strip() else None
+                response = self.task_manager.send_xrp(amount, destination, memo, destination_tag=dest_tag)
             else: # PFT
                 response = self.task_manager.send_pft(amount, destination, memo)
 
@@ -983,6 +997,9 @@ class WalletApp(wx.Frame):
             dialog.ShowModal()
             dialog.Destroy()
 
+        except ValueError as e:
+            logger.error(f"Invalid input: {e}")
+            wx.MessageBox(f"Invalid input: {e}", "Error", wx.OK | wx.ICON_ERROR)
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             logger.error(f"Error submitting payment: {e}")
             wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
