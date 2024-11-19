@@ -666,6 +666,11 @@ class WalletApp(wx.Frame):
         self.txt_xrp_memo = wx.TextCtrl(self.payments_tab)
         self.payments_sizer.Add(self.txt_xrp_memo, flag=wx.EXPAND | wx.ALL, border=5)
 
+        self.lbl_xrp_destination_tag = wx.StaticText(self.payments_tab, label="Destination Tag (Optional):")
+        self.payments_sizer.Add(self.lbl_xrp_destination_tag, flag=wx.ALL, border=5)
+        self.txt_xrp_destination_tag = wx.TextCtrl(self.payments_tab)
+        self.payments_sizer.Add(self.txt_xrp_destination_tag, flag=wx.EXPAND | wx.ALL, border=5)
+
         self.btn_submit_xrp_payment = wx.Button(self.payments_tab, label="Submit Payment")
         self.payments_sizer.Add(self.btn_submit_xrp_payment, flag=wx.ALL, border=5)
         self.btn_submit_xrp_payment.Bind(wx.EVT_BUTTON, self.on_submit_xrp_payment)
@@ -1925,8 +1930,10 @@ class WalletApp(wx.Frame):
                             logger.error("No response from send_verification_response")
                 except Exception as e:
                     logger.error(f"Error converting response to status message: {e}")
+                else:
+                    self.txt_verification_details.SetValue("")
+                    self.txt_task_id.SetValue("")
 
-        self.txt_verification_details.SetValue("")
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -2023,7 +2030,8 @@ class WalletApp(wx.Frame):
         else:
             response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
                                                             destination=self.txt_xrp_address_payment.GetValue(), 
-                                                            memo=self.txt_xrp_memo.GetValue()
+                                                            memo=self.txt_xrp_memo.GetValue(),
+                                                            destination_tag=self.txt_xrp_destination_tag.GetValue()
             )
             logger.debug(f"response: {response}")
             formatted_response = self.format_response(response)
