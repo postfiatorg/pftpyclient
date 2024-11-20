@@ -49,99 +49,20 @@ SAVE_TASKS = True
 SAVE_MEMOS = True
 SAVE_SYSTEM_MEMOS = True
 
-# class WalletInitiationFunctions:
-#     def __init__(self, input_map, network_url, user_commitment=""):
-#         """
-#         input_map = {
-#             'Username_Input': Username,
-#             'Password_Input': Password,
-#             'Google Doc Share Link_Input': Google Doc Share Link,
-#             'XRP Address_Input': XRP Address,
-#             'XRP Secret_Input': XRP Secret,
-#         }
-#         """
-#         self.network_url = network_url
-#         self.default_node = DEFAULT_NODE
-#         self.username = input_map['Username_Input']
-#         self.google_doc_share_link = input_map.get('Google Doc Share Link_Input', None)
-#         self.xrp_address = input_map['XRP Address_Input']
-#         self.wallet = xrpl.wallet.Wallet.from_seed(input_map['XRP Secret_Input'])
-#         self.user_commitment = user_commitment
-#         self.pft_issuer = ISSUER_ADDRESS
-
-#     def get_xrp_balance(self):
-#         return get_xrp_balance(self.network_url, self.wallet.classic_address)
-
-#     def handle_trust_line(self):
-#         return handle_trust_line(self.network_url, self.pft_issuer, self.wallet)
-    
-#     def get_google_doc_text(self, share_link):
-#         return get_google_doc_text(share_link)
-
-#     @requires_wallet_state(TRUSTLINED_STATES)
-#     @PerformanceMonitor.measure('send_initiation_rite')
-#     def send_initiation_rite(self):
-#         memo = construct_initiation_rite_memo(user=self.username, commitment=self.user_commitment)
-#         return send_xrp(network_url=self.network_url,
-#                         wallet=self.wallet, 
-#                         amount=1, 
-#                         destination=self.default_node, 
-#                         memo=memo)
-
-#     def get_account_info(self, accountId):
-#         """get_account_info"""
-#         client = xrpl.clients.JsonRpcClient(self.network_url)
-#         acct_info = xrpl.models.requests.account_info.AccountInfo(
-#             account=accountId,
-#             ledger_index="validated"
-#         )
-#         response = client.request(acct_info)
-#         return response.result['account_data']
-    
-#     def check_if_google_doc_is_valid(self):
-#         """ Checks if the google doc is valid by """
-
-#         # Check 1: google doc is a valid url
-#         if not self.google_doc_share_link.startswith('https://docs.google.com/document/d/'):
-#             raise InvalidGoogleDocException(self.google_doc_share_link)
-        
-#         google_doc_text = self.get_google_doc_text(self.google_doc_share_link)
-
-#         # Check 2: google doc exists
-#         if google_doc_text == "Failed to retrieve the document. Status code: 404":
-#             raise GoogleDocNotFoundException(self.google_doc_share_link)
-
-#         # Check 3: google doc is shared
-#         if google_doc_text == "Failed to retrieve the document. Status code: 401":
-#             raise GoogleDocIsNotSharedException(self.google_doc_share_link)
-        
-#         # Check 4: google doc contains the correct XRP address at the top
-#         if retrieve_xrp_address_from_google_doc(google_doc_text) != self.xrp_address:
-#             raise GoogleDocDoesNotContainXrpAddressException(self.xrp_address)
-        
-#         # Check 5: XRP address has a balance
-#         if self.get_xrp_balance() == 0:
-#             raise GoogleDocIsNotFundedException(self.google_doc_share_link)
-    
-#     @staticmethod
-#     def cache_credentials(input_map):
-#         """ Caches the user's credentials """
-#         return CredentialManager.cache_credentials(input_map)
-
 class PostFiatTaskManager:
     
     def __init__(self, username, password, network_url, config: ConfigurationManager):
         self.credential_manager=CredentialManager(username,password)
         self.network_url= network_url
-        self.pft_issuer = ISSUER_ADDRESS
         self.trust_line_default = '100000000'
         self.default_node = DEFAULT_NODE
         self.user_wallet = self.spawn_user_wallet()
         self.google_doc_link = self.credential_manager.get_credential('googledoc')
 
         self.config = config
-
         file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
+        use_testnet = self.config.get_global_config('use_testnet')
+        self.pft_issuer = ISSUER_ADDRESS if not use_testnet else TESTNET_ISSUER_ADDRESS
 
         # initialize dataframe filepaths for caching
         self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.{file_extension}")

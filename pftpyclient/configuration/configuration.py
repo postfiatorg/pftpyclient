@@ -6,7 +6,8 @@ GLOBAL_CONFIG = {
     'performance_monitor': False,
     'transaction_cache_format': 'csv', # or pickle
     'last_logged_in_user': '',
-    'require_password_for_payment': True
+    'require_password_for_payment': True,
+    'use_testnet': False
 }
 
 USER_CONFIG = {
@@ -14,6 +15,13 @@ USER_CONFIG = {
 }
 
 class ConfigurationManager:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
     def __init__(self):
         self.config_dir = Path.home().joinpath("postfiatcreds")
         self.config_file = self.config_dir / "pft_config.json"

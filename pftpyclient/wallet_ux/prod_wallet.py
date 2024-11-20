@@ -45,8 +45,6 @@ wx_sink = configure_logger(
 )
 from pftpyclient.wallet_ux.constants import *
 
-USE_TESTNET = False
-
 UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
 REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 10  # 10 seconds
 
@@ -87,7 +85,8 @@ class XRPLMonitorThread(Thread):
     def __init__(self, gui):
         Thread.__init__(self, daemon=True)
         self.gui = gui
-        self.nodes = MAINNET_WEBSOCKETS if not USE_TESTNET else TESTNET_WEBSOCKETS
+        use_testnet = ConfigurationManager().get_global_config('use_testnet')
+        self.nodes = MAINNET_WEBSOCKETS if not use_testnet else TESTNET_WEBSOCKETS
         self.current_node_index = 0
         self.url = self.nodes[self.current_node_index]
         self.loop = asyncio.new_event_loop()
@@ -376,10 +375,12 @@ class WalletApp(wx.Frame):
         icon = wx.Icon(icon_path, wx.BITMAP_TYPE_ICO)
         self.SetIcon(icon)
 
-        self.perf_monitor = None
-
         self.config = ConfigurationManager()
+        use_testnet = self.config.get_global_config('use_testnet')
+        self.network_url = MAINNET_URL if not use_testnet else TESTNET_URL
+        self.pft_issuer = ISSUER_ADDRESS if not use_testnet else TESTNET_ISSUER_ADDRESS
         
+        self.perf_monitor = None
         if self.config.get_global_config('performance_monitor'):
             self.launch_perf_monitor()
 
@@ -402,8 +403,6 @@ class WalletApp(wx.Frame):
         self.grid_column_widths = {}
         self.grid_base_row_height = 125
         self.row_height_margin = 25
-
-        self.network_url = MAINNET_URL if not USE_TESTNET else TESTNET_URL
 
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""
@@ -488,10 +487,14 @@ class WalletApp(wx.Frame):
         # Create Summary tab elements
         username_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.summary_lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
+        network_text = "Testnet" if self.config.get_global_config('use_testnet') else "Mainnet"
+        self.summary_lbl_network = wx.StaticText(self.summary_tab, label=f"Network: {network_text}")
         self.summary_lbl_wallet_state = wx.StaticText(self.summary_tab, label="Wallet State: ")
+
         username_row_sizer.Add(self.summary_lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         username_row_sizer.AddStretchSpacer()
-        username_row_sizer.Add(self.summary_lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        username_row_sizer.Add(self.summary_lbl_network, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
+        username_row_sizer.Add(self.summary_lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         self.summary_sizer.Add(username_row_sizer, 0, wx.EXPAND)
 
         # Create XRP balance row
@@ -1604,7 +1607,7 @@ class WalletApp(wx.Frame):
             pft_balance = 0.0
             for line in lines:
                 logger.debug(f"Processing line: {line}")
-                if line['currency'] == 'PFT' and line['account'] == ISSUER_ADDRESS:
+                if line['currency'] == 'PFT' and line['account'] == self.pft_issuer:
                     pft_balance = float(line['balance'])
                     logger.debug(f"Found PFT balance: {pft_balance}")
 
@@ -2895,6 +2898,21 @@ class PreferencesDialog(wx.Dialog):
         cache_sbs.Add(self.cache_pickle, 0, wx.ALL, 5)
         sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
 
+        # Network selection radio buttons
+        network_box = wx.StaticBox(panel, label="XRPL Network")
+        network_sbs = wx.StaticBoxSizer(network_box, wx.VERTICAL)
+
+        self.mainnet_radio = wx.RadioButton(panel, label="Mainnet", style=wx.RB_GROUP)
+        self.testnet_radio = wx.RadioButton(panel, label="Testnet")
+
+        use_testnet = self.config.get_global_config('use_testnet')
+        self.testnet_radio.SetValue(use_testnet)
+        self.mainnet_radio.SetValue(not use_testnet)
+
+        network_sbs.Add(self.mainnet_radio, 0, wx.ALL, 5)
+        network_sbs.Add(self.testnet_radio, 0, wx.ALL, 5)
+        sbs.Add(network_sbs, 0, wx.ALL | wx.EXPAND, 5)
+
         # Add the static box to the main vertical box
         vbox.Add(sbs, 0, wx.ALL | wx.EXPAND, 10)
 
@@ -2917,6 +2935,14 @@ class PreferencesDialog(wx.Dialog):
 
     def on_ok(self, event):
         """Save config when OK is clicked"""
+        # Check if network setting changed
+        old_network = self.config.get_global_config('use_testnet')
+        new_network = self.testnet_radio.GetValue()
+
+        if old_network != new_network:
+            wx.MessageBox("Network change requires a restart to take effect", "Restart Required", wx.OK | wx.ICON_WARNING)
+            
+        self.config.set_global_config('use_testnet', new_network)
         self.config.set_global_config('require_password_for_payment', self.require_password_for_payment.GetValue())
         self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
         self.config.set_global_config('transaction_cache_format', 'csv' if self.cache_csv.GetValue() else 'pickle')
