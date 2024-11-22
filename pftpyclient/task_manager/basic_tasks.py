@@ -1,11 +1,9 @@
 from pftpyclient.user_login.credentials import CredentialManager
 import xrpl
-from xrpl.wallet import Wallet
 from xrpl.models.requests import AccountTx
-from xrpl.models.transactions import Payment, Memo
+from xrpl.models.transactions import Memo
 from xrpl.utils import str_to_hex
 from pftpyclient.basic_utilities.settings import *
-import asyncio
 import nest_asyncio
 import pandas as pd
 import numpy as np
@@ -14,9 +12,6 @@ import binascii
 import re
 import random 
 import string
-import re
-from browser_history import get_history
-from sec_cik_mapper import StockMapper
 import datetime
 import os 
 from pftpyclient.basic_utilities.settings import DATADUMP_DIRECTORY_PATH
@@ -42,6 +37,7 @@ from pftpyclient.configuration.configuration import ConfigurationManager
 nest_asyncio.apply()
 from pftpyclient.wallet_ux.constants import *
 from cryptography.fernet import Fernet
+import pftpyclient.wallet_ux.constants as constants
 MAX_CHUNK_SIZE = 760
 
 SAVE_MEMO_TRANSACTIONS = True
@@ -53,23 +49,25 @@ class PostFiatTaskManager:
     
     def __init__(self, username, password, network_url, config: ConfigurationManager):
         self.credential_manager=CredentialManager(username,password)
-        self.network_url= network_url
-        self.trust_line_default = '100000000'
-        self.default_node = DEFAULT_NODE
+        self.config = config
+        self.network_url = network_url
+        self.default_node = (
+            DEFAULT_NODE_ADDRESS if not self.config.get_global_config('use_testnet') else TESTNET_DEFAULT_NODE_ADDRESS
+        )
         self.user_wallet = self.spawn_user_wallet()
         self.google_doc_link = self.credential_manager.get_credential('googledoc')
 
-        self.config = config
-        file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
         use_testnet = self.config.get_global_config('use_testnet')
         self.pft_issuer = ISSUER_ADDRESS if not use_testnet else TESTNET_ISSUER_ADDRESS
 
         # initialize dataframe filepaths for caching
-        self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.{file_extension}")
-        self.memo_tx_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memo_transactions.{file_extension}")
-        self.memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.{file_extension}")  # only used for debugging
-        self.tasks_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.{file_extension}")  # only used for debugging
-        self.system_memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_system_memos.{file_extension}")  # only used for debugging
+        network_suffix = '_TESTNET' if use_testnet else ''
+        file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
+        self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_transaction_history.{file_extension}")
+        self.memo_tx_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_memo_transactions.{file_extension}")
+        self.memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_memos.{file_extension}")  # only used for debugging
+        self.tasks_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_tasks.{file_extension}")  # only used for debugging
+        self.system_memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_system_memos.{file_extension}")  # only used for debugging
         
         # initialize dataframes for caching
         self.transactions = pd.DataFrame()
@@ -142,11 +140,6 @@ class PostFiatTaskManager:
                 return "No action required, Wallet is fully initialized"
             case _:
                 return "Unknown wallet state"
-
-    def has_trust_line(self):
-        """Checks if the user has a trust line"""
-        logger.debug(f"Checking if user has a trust line")
-        return has_trust_line(self.network_url, self.pft_issuer, self.user_wallet)
         
     @requires_wallet_state(TRUSTLINED_STATES)
     def send_initiation_rite(self, commitment):
@@ -616,10 +609,6 @@ class PostFiatTaskManager:
         seed = self.credential_manager.get_credential('v1xrpsecret')
         live_wallet = xrpl.wallet.Wallet.from_seed(seed)
         return live_wallet
-
-    @requires_wallet_state(FUNDED_STATES)
-    def handle_trust_line(self):
-        handle_trust_line(self.network_url, self.pft_issuer, self.user_wallet)
 
     @PerformanceMonitor.measure('send_pft')
     def send_pft(self, amount, destination, memo=""):
@@ -1735,7 +1724,7 @@ class PostFiatTaskManager:
 
         def format_dict(data):
             if data:
-                standard_format = f"https://livenet.xrpl.org/transactions/{data.get('hash', '')}/detailed"
+                standard_format = self.get_explorer_transaction_url(data.get('hash', ''))
                 full_output = data.get('memo_data', {}).get('full_output', 'N/A')
                 task_id = data.get('memo_data', {}).get('task_id', 'N/A')
                 formatted_string = (
@@ -1798,6 +1787,88 @@ class PostFiatTaskManager:
     
     def delete_contact(self, address):
         return self.credential_manager.delete_contact(address)
+    
+    def get_explorer_transaction_url(self, tx_hash: str) -> str:
+        """Returns the appropriate explorer URL for a transaction based on network configuration"""
+        template = (
+            constants.TESTNET_EXPLORER_TRANSACTION_URL 
+            if self.config.get_global_config('use_testnet') 
+            else constants.MAINNET_EXPLORER_TRANSACTION_URL
+        )
+        return template.format(hash=tx_hash)
+    
+    def get_explorer_account_url(self, address: str) -> str:
+        """Returns the appropriate explorer URL for an account based on network configuration"""
+        template = (
+            constants.TESTNET_EXPLORER_ACCOUNT_URL 
+            if self.config.get_global_config('use_testnet') 
+            else constants.MAINNET_EXPLORER_ACCOUNT_URL
+        )
+        return template.format(address=address)
+    
+    def has_trust_line(self):
+        """ Checks if the user has a trust line to the PFT token"""
+        try:
+            pft_holders = self.get_pft_holder_df()
+            existing_pft_accounts = list(pft_holders['account'])
+            user_is_in_pft_accounts = self.user_wallet.address in existing_pft_accounts
+            return user_is_in_pft_accounts
+        except Exception as e:
+            logger.error(f"Error checking if user has a trust line: {e}")
+            return False
+
+    @requires_wallet_state(FUNDED_STATES)
+    def handle_trust_line(self):
+        """ Handles the creation of a trust line to the PFT token if it doesn't exist"""
+        logger.debug("Checking if trust line exists...")
+        if not self.has_trust_line():
+            _ = self.generate_trust_line_to_pft_token()
+            logger.debug("Trust line created")
+        else:
+            logger.debug("Trust line already exists")
+
+    def generate_trust_line_to_pft_token(self):
+        """ Note this transaction consumes XRP to create a trust
+        line for the PFT Token so the holder DF should be checked 
+        before this is run
+        """ 
+        client = xrpl.clients.JsonRpcClient(self.network_url)
+        trust_set_tx = xrpl.models.transactions.TrustSet(
+            account=self.user_wallet.address,
+            limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
+                currency="PFT",
+                issuer=self.pft_issuer,
+                value=constants.DEFAULT_PFT_LIMIT,
+            )
+        )
+        logger.debug(f"Creating trust line from {self.user_wallet.address} to issuer...")
+        try:
+            response = xrpl.transaction.submit_and_wait(trust_set_tx, client, self.user_wallet)
+        except xrpl.transaction.XRPLReliableSubmissionException as e:
+            response = f"Submit failed: {e}"
+            logger.error(f"Trust line creation failed: {response}")
+        return response
+    
+    def get_pft_holder_df(self):
+        """ This function outputs a detail of all accounts holding PFT tokens
+        with a float of their balances as pft_holdings. note this is from
+        the view of the issuer account so balances appear negative so the pft_holdings 
+        are reverse signed.
+        """
+        client = xrpl.clients.JsonRpcClient(self.network_url)
+        logger.debug("Getting dataframe of all accounts holding PFT tokens...")
+        response = client.request(xrpl.models.requests.AccountLines(
+            account=self.pft_issuer,
+            ledger_index="validated",
+            peer=None,
+            limit=None))
+        if not response.is_successful():
+            raise Exception(f"Error fetching PFT holders: {response.result.get('error')}")
+        full_post_fiat_holder_df = pd.DataFrame(response.result)
+        for xfield in ['account','balance','currency','limit_peer']:
+            full_post_fiat_holder_df[xfield] = full_post_fiat_holder_df['lines'].apply(lambda x: x[xfield])
+        full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
+        return full_post_fiat_holder_df
 
 def is_over_1kb(string):
     # 1KB = 1024 bytes
@@ -1923,70 +1994,6 @@ def classify_task_string(string: str) -> str:
 def is_pft_transaction(tx) -> bool:
     deliver_max = tx.get('DeliverMax', {})
     return isinstance(deliver_max, dict) and deliver_max.get('currency') == 'PFT'
-
-def get_pft_holder_df(network_url, pft_issuer):
-    """ This function outputs a detail of all accounts holding PFT tokens
-    with a float of their balances as pft_holdings. note this is from
-    the view of the issuer account so balances appear negative so the pft_holdings 
-    are reverse signed.
-    """
-    client = xrpl.clients.JsonRpcClient(network_url)
-    logger.debug("Getting dataframe of all accounts holding PFT tokens...")
-    response = client.request(xrpl.models.requests.AccountLines(
-        account=pft_issuer,
-        ledger_index="validated",
-        peer=None,
-        limit=None))
-    if not response.is_successful():
-        raise Exception(f"Error fetching PFT holders: {response.result.get('error')}")
-    full_post_fiat_holder_df = pd.DataFrame(response.result)
-    for xfield in ['account','balance','currency','limit_peer']:
-        full_post_fiat_holder_df[xfield] = full_post_fiat_holder_df['lines'].apply(lambda x: x[xfield])
-    full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
-    return full_post_fiat_holder_df
-    
-def has_trust_line(network_url, pft_issuer, wallet):
-    """ This function checks if the user has a trust line to the PFT token"""
-    try:
-        pft_holders = get_pft_holder_df(network_url, pft_issuer)
-        existing_pft_accounts = list(pft_holders['account'])
-        user_is_in_pft_accounts = wallet.address in existing_pft_accounts
-        return user_is_in_pft_accounts
-    except Exception as e:
-        logger.error(f"Error checking if user has a trust line: {e}")
-        return False
-
-def handle_trust_line(network_url, pft_issuer, wallet):
-    """ This function checks if the user has a trust line to the PFT token
-    and if not establishes one"""
-    logger.debug("Checking if trust line exists...")
-    if not has_trust_line(network_url, pft_issuer, wallet):
-        _ = generate_trust_line_to_pft_token(network_url, wallet)
-        logger.debug("Trust line created")
-    else:
-        logger.debug("Trust line already exists")
-
-def generate_trust_line_to_pft_token(network_url, wallet: xrpl.wallet.Wallet):
-    """ Note this transaction consumes XRP to create a trust
-    line for the PFT Token so the holder DF should be checked 
-    before this is run
-    """ 
-    client = xrpl.clients.JsonRpcClient(network_url)
-    trust_set_tx = xrpl.models.transactions.TrustSet(
-        account=wallet.address,
-        limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
-            currency="PFT",
-            issuer=ISSUER_ADDRESS,
-            value='100000000',  # Large limit, arbitrarily chosen
-        )
-    )
-    logger.debug(f"Creating trust line from {wallet.address} to issuer...")
-    try:
-        response = xrpl.transaction.submit_and_wait(trust_set_tx, client, wallet)
-    except xrpl.transaction.XRPLReliableSubmissionException as e:
-        response = f"Submit failed: {e}"
-        logger.error(f"Trust line creation failed: {response}")
-    return response
 
 def generate_random_utf8_friendly_hash(length=6):
     # Generate a random sequence of bytes

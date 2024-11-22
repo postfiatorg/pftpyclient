@@ -404,6 +404,8 @@ class WalletApp(wx.Frame):
         self.grid_base_row_height = 125
         self.row_height_margin = 25
 
+        self.username = None
+
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""
         columns = self.GRID_CONFIGS[grid_name]['columns']
@@ -1219,12 +1221,12 @@ class WalletApp(wx.Frame):
         self.btn_login.SetLabel("Logging in...")
         self.btn_login.Update()
 
-        username = self.login_txt_username.GetValue()
+        self.username = self.login_txt_username.GetValue()
         password = self.login_txt_password.GetValue()
 
         try:
             self.task_manager = PostFiatTaskManager(
-                username=username, 
+                username=self.username, 
                 password=password,
                 network_url=self.network_url,
                 config=self.config
@@ -1250,16 +1252,16 @@ class WalletApp(wx.Frame):
 
         self.update_ui_based_on_wallet_state()
 
-        logger.info(f"Logged in as {username}")
+        logger.info(f"Logged in as {self.username}")
 
         # Save the last logged-in user
-        self.config.set_global_config('last_logged_in_user', username)
+        self.config.set_global_config('last_logged_in_user', self.username)
 
         # Hide login panel and show tabs
         self.login_panel.Hide()
         self.tabs.Show()
 
-        self.update_account_display(username, classic_address)
+        self.update_account_display(self.username, classic_address)
 
         # Update layout and ensure correct sizing
         self.panel.Layout()
@@ -1410,7 +1412,7 @@ class WalletApp(wx.Frame):
                     try:
                         self.worker.expecting_state_change = True
                         self.task_manager.handle_trust_line()
-                        wx.CallAfter(self.update_account_info)  # TODO: Not sure if this is needed
+                        wx.CallAfter(self.update_account_display, self.username, self.task_manager.user_wallet.address)
                         wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
                     except Exception as e:
                         logger.error(f"Error setting trust line: {e}")
@@ -2375,7 +2377,8 @@ class WalletApp(wx.Frame):
         if hasattr(response, 'status') and response.status == "success":
             tx_json = response.result.get('tx_json', {})
             meta = response.result.get('meta', {})
-            livenet_link = f"https://livenet.xrpl.org/transactions/{response.result.get('hash', 'N/A')}"
+            hash = response.result.get('hash', 'N/A')
+            livenet_link = self.task_manager.get_explorer_transaction_url(hash)
 
             # Determine the currency and amount
             deliver_max = tx_json.get('DeliverMax', '0')
@@ -2414,7 +2417,7 @@ class WalletApp(wx.Frame):
             return formatted_response
         
         elif hasattr(self, 'wallet.classic_address'):
-            livenet_link = f"https://livenet.xrpl.org/accounts/{self.wallet.classic_address}"
+            livenet_link = self.task_manager.get_explorer_account_url(self.wallet.address)
 
             formatted_response = (
                 f"Transaction Failed\n"

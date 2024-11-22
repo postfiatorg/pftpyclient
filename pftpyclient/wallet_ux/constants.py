@@ -1,13 +1,44 @@
-from enum import Enum, auto
+from enum import Enum
 
-DEFAULT_NODE = "r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD"
+DEFAULT_PFT_LIMIT = 100_000_000
+
+# MAINNET CONSTANTS
+DEFAULT_NODE_NAME = 'postfiatfoundation'
+DEFAULT_NODE_ADDRESS = "r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD"
 REMEMBRANCER_ADDRESS = "rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn"
 ISSUER_ADDRESS = "rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW"
 TREASURY_WALLET_ADDRESS = "r46SUhCzyGE4KwBnKQ6LmDmJcECCqdKy4q"
 
-# TESTNET
+MAINNET_WEBSOCKETS = [
+    "wss://xrplcluster.com",
+    "wss://xrpl.ws/",
+    "wss://s1.ripple.com/",
+    "wss://s2.ripple.com/"
+]
+
+MAINNET_URL = "https://s2.ripple.com:51234"
+
+MAINNET_EXPLORER_URL = "https://livenet.xrpl.org"
+MAINNET_EXPLORER_TRANSACTION_URL = "https://livenet.xrpl.org/transactions/{hash}/detailed"
+MAINNET_EXPLORER_ACCOUNT_URL = "https://livenet.xrpl.org/accounts/{address}"
+
+# TESTNET CONSTANTS
+TESTNET_DEFAULT_NODE_NAME = "postfiatfoundation_testnet"
+TESTNET_DEFAULT_NODE_ADDRESS = "rUWuJJLLSH5TUdajVqsHx7M59Vj3P7giQV"
+TESTNET_REMEMBRANCER_ADDRESS = "rN2oaXBhFE9urGN5hXup937XpoFVkrnUhu"
 TESTNET_ISSUER_ADDRESS = "rLX2tgumpiUE6kjr757Ao8HWiJzC8uuBSN"
 
+TESTNET_WEBSOCKETS = [
+    "wss://s.altnet.rippletest.net:51233"
+]
+
+TESTNET_URL = "https://s.altnet.rippletest.net:51234"
+
+TESTNET_EXPLORER_URL = "https://testnet.xrpl.org"
+TESTNET_EXPLORER_TRANSACTION_URL = "https://testnet.xrpl.org/transactions/{hash}/detailed"
+TESTNET_EXPLORER_ACCOUNT_URL = "https://testnet.xrpl.org/accounts/{address}"
+
+# SPECIAL ADDRESS ATTRIBUTES - WIP
 SPECIAL_ADDRESSES = {
     REMEMBRANCER_ADDRESS: {
         "memo_pft_requirement": 1,
@@ -19,18 +50,7 @@ SPECIAL_ADDRESSES = {
     }
 }
 
-MAINNET_WEBSOCKETS = [
-    "wss://xrplcluster.com",
-    "wss://xrpl.ws/",
-    "wss://s1.ripple.com/",
-    "wss://s2.ripple.com/"
-]
-TESTNET_WEBSOCKETS = [
-    "wss://s.altnet.rippletest.net:51233"
-]
-MAINNET_URL = "https://s2.ripple.com:51234"
-TESTNET_URL = "https://s.altnet.rippletest.net:51234"
-
+# DEPRECATED - TODO: remove
 CREDENTIAL_FILENAME = "manyasone_cred_list.txt"
 
 class SystemMemoType(Enum):
