@@ -1107,7 +1107,7 @@ class PostFiatTaskManager:
             self.memo_transactions['is_pft'] & 
             (self.memo_transactions['destination']==self.default_node) &
             (self.memo_transactions['direction']=='OUTGOING') & 
-            (self.memo_transactions['memo_data'].apply(lambda x: x['task_id']) == 'google_doc_context_link')
+            (self.memo_transactions['memo_data'].apply(lambda x: x['task_id']) == SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value)
             ]
         
         logger.debug(f"Found {len(redux_tx_list)} outgoing context doc links")
@@ -1135,7 +1135,9 @@ class PostFiatTaskManager:
     
     def get_user_initiation_rites_destinations(self):
         """Returns all the addresses that have received a user initiation rite"""
-        all_user_initiation_rites = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: x.get('task_id') == 'INITIATION_RITE')]
+        all_user_initiation_rites = self.memo_transactions[
+            self.memo_transactions['memo_data'].apply(lambda x: x.get('task_id') == SystemMemoType.INITIATION_RITE.value)
+        ]
         return list(all_user_initiation_rites['destination'])
     
     def initiation_rite_sent(self):
@@ -1149,15 +1151,18 @@ class PostFiatTaskManager:
         user_initiation_rites_destinations = self.get_user_initiation_rites_destinations()
         return self.default_node in user_initiation_rites_destinations
 
+    # TODO: Deprecate this method
     def get_user_genesis_destinations(self):
         """ Returns all the addresses that have received a user genesis transaction"""
         all_user_genesis = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
         return list(all_user_genesis['destination'])
 
+    # TODO: Deprecate this method
     def genesis_sent(self):
         user_genesis_destinations = self.get_user_genesis_destinations()
         return self.default_node in user_genesis_destinations
     
+    # TODO: Deprecate this method
     @requires_wallet_state(INITIATED_STATES)
     def handle_genesis(self):
         """ Checks if the user has sent a genesis to the node, and sends one if not """
@@ -1167,6 +1172,7 @@ class PostFiatTaskManager:
         else:
             logger.debug("User has already sent genesis, skipping...")
     
+    # TODO: Deprecate this method
     def send_genesis(self):
         """ Sends a user genesis transaction to the default node 
         Currently requires 7 PFT
@@ -1248,7 +1254,7 @@ class PostFiatTaskManager:
         """ Sends the Google Doc context link to the node """
         logger.debug(f"Sending Google Doc context link to the node: {self.google_doc_link}")
         google_doc_memo = construct_google_doc_context_memo(user=self.credential_manager.postfiat_username,
-                                                                    google_doc_link=self.google_doc_link)
+                                                            google_doc_link=self.google_doc_link)
         self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
         logger.debug("Google Doc context link sent.")
 
@@ -1258,12 +1264,12 @@ class PostFiatTaskManager:
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
         # Filter tasks with task_type in ['PROPOSAL','ACCEPTANCE']
-        filtered_tasks = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','ACCEPTANCE'])]
+        filtered_tasks = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.ACCEPTANCE.name])]
 
         # Get task_ids where the latest state is 'PROPOSAL' or 'ACCEPTANCE'
         proposal_task_ids = [
             task_id for task_id in filtered_tasks['task_id'].unique()
-            if self.get_task_state_using_task_id(task_id) in ['PROPOSAL','ACCEPTANCE']
+            if self.get_task_state_using_task_id(task_id) in [TaskType.PROPOSAL.name, TaskType.ACCEPTANCE.name]
         ]
 
         # Filter for these tasks
@@ -1273,7 +1279,9 @@ class PostFiatTaskManager:
             return pd.DataFrame()
 
         # Create new 'RESPONSE' column to combine acceptance and refusal
-        filtered_df['response_type'] = filtered_df['task_type'].apply(lambda x: 'RESPONSE' if x in ['ACCEPTANCE','REFUSAL'] else x)
+        filtered_df['response_type'] = filtered_df['task_type'].apply(
+            lambda x: 'RESPONSE' if x in [TaskType.ACCEPTANCE.name, TaskType.REFUSAL.name] else x
+        )
 
         # Pivot the dataframe to get proposals and responses side by side and reset index to make task_id a column
         pivoted_df = filtered_df.pivot_table(index='task_id', columns='response_type', values='full_output', aggfunc='first').reset_index().copy()
@@ -1282,15 +1290,15 @@ class PostFiatTaskManager:
         pivoted_df.rename(columns={'REQUEST_POST_FIAT':'request', 'PROPOSAL':'proposal', 'RESPONSE':'response'}, inplace=True)
 
         # Clean up the proposal column
-        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace(TaskType.PROPOSAL.value,'').replace('nan',''))
 
         # Clean up the request column
-        pivoted_df['request'] = pivoted_df['request'].apply(lambda x: str(x).replace('REQUEST_POST_FIAT ___ ','').replace('nan',''))
+        pivoted_df['request'] = pivoted_df['request'].apply(lambda x: str(x).replace(TaskType.REQUEST_POST_FIAT.value,'').replace('nan',''))
         
         # Clean up the response column, if it exists (does not exist for the first proposal)
         if 'response' in pivoted_df.columns:
-            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('ACCEPTANCE REASON ___ ','ACCEPTED: ').replace('nan',''))
-            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('REFUSAL REASON ___ ','REFUSED: ').replace('nan',''))
+            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace(TaskType.ACCEPTANCE.value,'ACCEPTED: ').replace('nan',''))
+            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace(TaskType.REFUSAL.value,'REFUSED: ').replace('nan',''))
         else:
             pivoted_df['response'] = ''
         
@@ -1305,12 +1313,12 @@ class PostFiatTaskManager:
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
         # Filter tasks with task_type in ['PROPOSAL','VERIFICATION_PROMPT']
-        filtered_tasks = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','VERIFICATION_PROMPT'])]
+        filtered_tasks = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.VERIFICATION_PROMPT.name])]
 
         # Get task_ids where the latest state is 'VERIFICATION_PROMPT'
         verification_task_ids = [
             task_id for task_id in filtered_tasks['task_id'].unique()
-            if self.get_task_state_using_task_id(task_id) == 'VERIFICATION_PROMPT'
+            if self.get_task_state_using_task_id(task_id) == TaskType.VERIFICATION_PROMPT.name
         ]
 
         # Filter for these tasks
@@ -1326,8 +1334,8 @@ class PostFiatTaskManager:
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'VERIFICATION_PROMPT':'verification'}, inplace=True)
 
         # clean up the proposal and verification columns
-        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___',''))
-        pivoted_df['verification'] = pivoted_df['verification'].apply(lambda x: str(x).replace('VERIFICATION PROMPT ___',''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace(TaskType.PROPOSAL.value,''))
+        pivoted_df['verification'] = pivoted_df['verification'].apply(lambda x: str(x).replace(TaskType.VERIFICATION_PROMPT.value,''))
 
         # Reverse order to get the most recent proposals first
         result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
@@ -1340,12 +1348,12 @@ class PostFiatTaskManager:
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
 
         # Filter for only PROPOSAL and REWARD rows
-        filtered_df = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','REWARD'])]
+        filtered_df = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.REWARD.name])]
 
         # Get task_ids where the latest state is 'REWARD'
         reward_task_ids = [
             task_id for task_id in filtered_df['task_id'].unique()
-            if self.get_task_state_using_task_id(task_id) == 'REWARD'
+            if self.get_task_state_using_task_id(task_id) == TaskType.REWARD.name
         ]
 
         # Filter for these tasks
@@ -1357,22 +1365,24 @@ class PostFiatTaskManager:
         # Pivot the dataframe to get proposals and rewards side by side and reset index to make task_id a column
         pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index().copy()
 
-        # Rename the columns for clarity
+        # Rename the columns for clarity # TODO: this seems pointless
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'REWARD':'reward'}, inplace=True)
 
         # Clean up the proposal and reward columns
-        pivoted_df['reward'] = pivoted_df['reward'].apply(lambda x: str(x).replace('REWARD RESPONSE __ ',''))
-        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
+        pivoted_df['reward'] = pivoted_df['reward'].apply(lambda x: str(x).replace(TaskType.REWARD.value,''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace(TaskType.PROPOSAL.value,'').replace('nan',''))
 
         # Reverse order to get the most recent proposals first
         result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
         # Add PFT value information
         pft_only = self.memo_transactions[self.memo_transactions['tx_json'].apply(is_pft_transaction)].copy()
-        pft_only['pft_value'] = pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float) * pft_only['direction'].map({'INCOMING':1,'OUTGOING':-1})
+        pft_only['pft_value'] = pft_only['tx_json'].apply(
+            lambda x: x['DeliverMax']['value']).astype(float) * pft_only['direction'].map({'INCOMING':1,'OUTGOING':-1}
+        )
         pft_only['task_id'] = pft_only['memo_data'].apply(lambda x: x['task_id'])
         
-        pft_rewards_only = pft_only[pft_only['memo_data'].apply(lambda x: 'REWARD RESPONSE __' in x['full_output'])].copy()
+        pft_rewards_only = pft_only[pft_only['memo_data'].apply(lambda x: TaskType.REWARD.value in x['full_output'])].copy()
         task_id_to_payout = pft_rewards_only.groupby('task_id').last()['pft_value']
         
         result_df['payout'] = result_df['task_id'].map(task_id_to_payout)
@@ -1561,15 +1571,16 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
         
-        # TODO: make tasks refusable at any state
-        if most_recent_status != 'PROPOSAL':
-            raise WrongTaskStateException('PROPOSAL', most_recent_status)
+        # Only prevent refusal if the task has already been rewarded
+        if most_recent_status == TaskType.REWARD.name:
+            raise WrongTaskStateException(TaskType.REWARD.name, most_recent_status, restricted_flag=True)
         
         proposal_source = task_df.iloc[0]['counterparty_address']
-        if 'REFUSAL REASON ___' not in refusal_reason:
-            refusal_reason = 'REFUSAL REASON ___ ' + refusal_reason
+        if TaskType.REFUSAL.value not in refusal_reason:
+            refusal_reason = TaskType.REFUSAL.value + refusal_reason
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                               task_id=task_id, full_output=refusal_reason)
+                                                        task_id=task_id, 
+                                                        full_output=refusal_reason)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_refusal_for_task response: {response}")
         return response
@@ -1592,14 +1603,13 @@ class PostFiatTaskManager:
         task_id = self.generate_custom_id()
         
         # Construct the memo with the request message
-        if 'REQUEST_POST_FIAT ___' not in request_message:
-            classified_request_msg = 'REQUEST_POST_FIAT ___ ' + request_message
+        if TaskType.REQUEST_POST_FIAT.value not in request_message:
+            classified_request_msg = TaskType.REQUEST_POST_FIAT.value + request_message
         else:
             classified_request_msg = request_message
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                               task_id=task_id, 
-                                                               full_output=classified_request_msg)
-        # Send the memo to the default node
+                                                        task_id=task_id, 
+                                                        full_output=classified_request_msg)
         response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
         logger.debug(f"request_post_fiat response: {response}")
         return response
@@ -1618,17 +1628,17 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
 
-        if most_recent_status != 'ACCEPTANCE':
-            raise WrongTaskStateException('ACCEPTANCE', most_recent_status)
+        if most_recent_status != TaskType.ACCEPTANCE.name:
+            raise WrongTaskStateException(TaskType.ACCEPTANCE.name, most_recent_status)
         
         proposal_source = task_df.iloc[0]['counterparty_address']
-        if 'COMPLETION JUSTIFICATION ___' not in completion_string:
-            classified_completion_str = 'COMPLETION JUSTIFICATION ___ ' + completion_string
+        if TaskType.TASK_OUTPUT.value not in completion_string:
+            classified_completion_str = TaskType.TASK_OUTPUT.value + completion_string
         else:
             classified_completion_str = completion_string
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                              task_id=task_id, 
-                                                              full_output=classified_completion_str)
+                                                        task_id=task_id, 
+                                                        full_output=classified_completion_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"submit_initial_completion Response: {response}")
         return response
@@ -1647,17 +1657,17 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
         
-        if most_recent_status != 'VERIFICATION_PROMPT':
-            raise WrongTaskStateException('VERIFICATION_PROMPT', most_recent_status)
+        if most_recent_status != TaskType.VERIFICATION_PROMPT.name:
+            raise WrongTaskStateException(TaskType.VERIFICATION_PROMPT.name, most_recent_status)
         
         proposal_source = task_df.iloc[0]['counterparty_address']
-        if 'VERIFICATION RESPONSE ___' not in response_string:
-            classified_response_str = 'VERIFICATION RESPONSE ___ ' + response_string
+        if TaskType.VERIFICATION_RESPONSE.value not in response_string:
+            classified_response_str = TaskType.VERIFICATION_RESPONSE.value + response_string
         else:
             classified_response_str = response_string
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                              task_id=task_id, 
-                                                              full_output=classified_response_str)
+                                                        task_id=task_id, 
+                                                        full_output=classified_response_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_verification_response Response: {response}")
         return response
@@ -1683,11 +1693,14 @@ class PostFiatTaskManager:
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
         # Slicing data based on conditions
-        google_doc_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 
-                                                                   'google_doc_context_link' in str(x))].copy()
+        google_doc_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(
+            lambda x: SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value in str(x)
+        )].copy()
 
-        genesis_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 
-                                                                   'USER GENESIS __' in str(x))].copy()
+        # TODO: Remove User Genesis
+        genesis_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(
+            lambda x: TaskType.USER_GENESIS.value in str(x)
+        )].copy()
         
         # Extract genesis username
         genesis_username = "Unknown"
@@ -2102,11 +2115,15 @@ class NoMatchingMemoException(Exception):
         super().__init__(f"No matching memo found for memo ID: {memo_id}")
 
 class WrongTaskStateException(Exception):
-    """ This exception is raised when the most recent task status is not the expected status """
-    def __init__(self, expected_status, actual_status):
+    # TODO: restricted_flag is a hack and is confusing
+    """ This exception is raised when the most recent task status is not the expected status 
+    Alternatively, it can be raised when the task status is restricted 
+    """
+    def __init__(self, expected_status, actual_status, restricted_flag=False):
         self.expected_status = expected_status
         self.actual_status = actual_status
-        super().__init__(f"Expected status: {expected_status}, actual status: {actual_status}")
+        prefix = "Restricted" if restricted_flag else "Expected"
+        super().__init__(f"{prefix} status: {expected_status}, actual status: {actual_status}")
 
 class InvalidGoogleDocException(Exception):
     """ This exception is raised when the google doc is not valid """
@@ -2137,79 +2154,3 @@ class HandshakeRequiredError(Exception):
     def __init__(self, destination):
         self.destination = destination
         super().__init__(f"Cannot encrypt message: no handshake received from {destination}")
-
-# class ProcessUserWebData:
-#     def __init__(self):
-#         print('kick off web history')
-#         self.ticker_regex = re.compile(r'\b[A-Z]{1,5}\b')
-#         #self.cik_regex = re.compile(r'CIK=(\d{10})|data/(\d{10})')
-#         self.cik_regex = re.compile(r'CIK=(\d+)|data/(\d+)')
-#         # THIS DOES NOT WORK FOR 'https://www.sec.gov/edgar/browse/?CIK=1409375&owner=exclude'
-#         mapper = StockMapper()
-#         self.cik_to_ticker_map = mapper.cik_to_tickers
-#     def get_user_web_history_df(self):
-#         outputs = get_history()
-#         historical_info = pd.DataFrame(outputs.histories)
-#         historical_info.columns=['date','url','content']
-#         return historical_info
-#     def get_primary_ticker_for_cik(self, cik):
-#         ret = ''
-#         try:
-#             ret = list(self.cik_to_ticker_map[cik])[0]
-#         except:
-#             pass
-#         return ret
-
-#     def extract_cik_to_ticker(self, input_string):
-#         # Define a regex pattern to match CIKs
-#         cik_regex = self.cik_regex
-        
-#         # Find all matches in the input string
-#         matches = cik_regex.findall(input_string)
-        
-#         # Extract CIKs from the matches and zfill to 10 characters
-#         ciks = [match[0] or match[1] for match in matches]
-#         padded_ciks = [cik.zfill(10) for cik in ciks]
-#         output = ''
-#         if len(padded_ciks) > 0:
-#             output = self.get_primary_ticker_for_cik(padded_ciks[0])
-        
-#         return output
-    
-
-#     def extract_tickers(self, stringer):
-#         tickers = list(set(self.ticker_regex.findall(stringer)))
-#         return tickers
-
-#     def create_basic_web_history_frame(self):
-#         all_web_history_df = self.get_user_web_history_df()
-#         all_web_history_df['cik_ticker_extraction']= all_web_history_df['url'].apply(lambda x: [self.extract_cik_to_ticker(x)])
-#         all_web_history_df['content_tickers']=all_web_history_df['content'].apply(lambda x: self.extract_tickers(x))#.tail(20)
-#         all_web_history_df['url_tickers']=all_web_history_df['url'].apply(lambda x: self.extract_tickers(x))#.tail(20)
-#         all_web_history_df['all_tickers']=all_web_history_df['content_tickers']+all_web_history_df['url_tickers']+all_web_history_df['cik_ticker_extraction']
-#         all_web_history_df['date_str']=all_web_history_df['date'].apply(lambda x: x.strftime('%Y-%m-%d'))
-#         str_map = pd.DataFrame(all_web_history_df['date_str'].unique())
-#         str_map.columns=['date_str']
-#         str_map['date']=pd.to_datetime(str_map['date_str'])
-#         all_web_history_df['simplified_date']=all_web_history_df['date_str'].map(str_map.groupby('date_str').last()['date'])
-#         all_web_history_df['all_tickers']=all_web_history_df['all_tickers'].apply(lambda x: list(set(x)))
-#         return all_web_history_df
-
-#     def convert_all_web_history_to_simple_web_data_json(self,all_web_history):
-#         recent_slice = all_web_history[all_web_history['simplified_date']>=datetime.datetime.now()-datetime.timedelta(7)].copy()
-#         recent_slice['explode_block']=recent_slice.apply(lambda x: pd.DataFrame(([[i,x['simplified_date']] for i in x['all_tickers']])),axis=1)
-        
-#         full_ticker_history  =pd.concat(list(recent_slice['explode_block']))
-#         full_ticker_history.columns=['ticker','date']
-#         full_ticker_history['included']=1
-#         stop_tickers=['EDGAR','CIK','ETF','FORM','API','HOME','GAAP','EPS','NYSE','XBRL','AI','SBF','I','US','USD','SEO','','A','X','SEC','PC','EX','UTF','SIC']
-#         multidex = full_ticker_history.groupby(['ticker','date']).last().sort_index()
-#         financial_attention_df = multidex[~multidex.index.get_level_values(0).isin(stop_tickers)]['included'].unstack(0).sort_values('date').resample('D').last()
-#         last_day = financial_attention_df[-1:].sum()
-#         last_week = financial_attention_df[-7:].sum()
-        
-#         ld_lw = pd.concat([last_day, last_week],axis=1)
-#         ld_lw.columns=['last_day','last_week']
-#         ld_lw=ld_lw.astype(int)
-#         ld_lw[ld_lw.sum(1)>0].to_json()
-#         return ld_lw

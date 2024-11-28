@@ -62,15 +62,15 @@ SYSTEM_MEMO_TYPES = [memo_type.value for memo_type in SystemMemoType]
 
 # Task types where the memo_type = task_id, requiring further disambiguation in the memo_data
 class TaskType(Enum):
-    REQUEST_POST_FIAT = 'REQUEST_POST_FIAT ___'
-    PROPOSAL = 'PROPOSED PF ___'
-    ACCEPTANCE = 'ACCEPTANCE REASON ___'
-    REFUSAL = 'REFUSAL REASON ___'
-    TASK_OUTPUT = 'COMPLETION JUSTIFICATION ___'
-    VERIFICATION_PROMPT = 'VERIFICATION PROMPT ___'
-    VERIFICATION_RESPONSE = 'VERIFICATION RESPONSE ___'
-    REWARD = 'REWARD RESPONSE __'
-    USER_GENESIS = 'USER GENESIS __'
+    REQUEST_POST_FIAT = 'REQUEST_POST_FIAT ___ '
+    PROPOSAL = 'PROPOSED PF ___ '
+    ACCEPTANCE = 'ACCEPTANCE REASON ___ '
+    REFUSAL = 'REFUSAL REASON ___ '
+    TASK_OUTPUT = 'COMPLETION JUSTIFICATION ___ '
+    VERIFICATION_PROMPT = 'VERIFICATION PROMPT ___ '
+    VERIFICATION_RESPONSE = 'VERIFICATION RESPONSE ___ '
+    REWARD = 'REWARD RESPONSE __ '
+    USER_GENESIS = 'USER GENESIS __ '  # TODO: Remove
 
 # Additional patterns for specific task types
 TASK_PATTERNS = {
@@ -86,6 +86,9 @@ for task_type in TaskType:
 # Helper to get all task indicators
 TASK_INDICATORS = [task_type.value for task_type in TaskType]
 
+# TODO: Examine the scope of this enum. It's currently used to identify messages 
+# TODO: Should it also be used to identify operations needed to perform on a message? 
+# TODO: I.e. unchunking, decompression, decryption, etc.
 class MessageType(Enum):
     MEMO = 'chunk_'
 
