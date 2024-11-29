@@ -85,8 +85,8 @@ class XRPLMonitorThread(Thread):
     def __init__(self, gui):
         Thread.__init__(self, daemon=True)
         self.gui = gui
-        use_testnet = ConfigurationManager().get_global_config('use_testnet')
-        self.nodes = MAINNET_WEBSOCKETS if not use_testnet else TESTNET_WEBSOCKETS
+        self.network_config = get_network_config()
+        self.nodes = self.network_config.websockets
         self.current_node_index = 0
         self.url = self.nodes[self.current_node_index]
         self.loop = asyncio.new_event_loop()
@@ -376,9 +376,9 @@ class WalletApp(wx.Frame):
         self.SetIcon(icon)
 
         self.config = ConfigurationManager()
-        use_testnet = self.config.get_global_config('use_testnet')
-        self.network_url = MAINNET_URL if not use_testnet else TESTNET_URL
-        self.pft_issuer = ISSUER_ADDRESS if not use_testnet else TESTNET_ISSUER_ADDRESS
+        self.network_config = get_network_config()
+        self.network_url = self.network_config.public_rpc_url
+        self.pft_issuer = self.network_config.issuer_address
         
         self.perf_monitor = None
         if self.config.get_global_config('performance_monitor'):
@@ -900,11 +900,6 @@ class WalletApp(wx.Frame):
 
     def on_destination_selected(self, event):
         """Handle selection from dropdown - extract the address"""
-        selection = event.GetSelection()
-        if selection != wx.NOT_FOUND:
-            # Get the stored address from client data
-            address = self.txt_payment_destination.GetClientData(selection)
-            wx.CallAfter(self.txt_payment_destination.ChangeValue, address)
         event.Skip()
 
     def on_destination_text(self, event):
@@ -914,7 +909,7 @@ class WalletApp(wx.Frame):
     def update_all_destination_comboboxes(self):
         """Update all destination comboboxes"""
         self._populate_destination_combobox(self.txt_payment_destination)
-        self._populate_destination_combobox(self.memo_recipient, REMEMBRANCER_ADDRESS)
+        self._populate_destination_combobox(self.memo_recipient, self.network_config.remembrancer_address)
 
     def _populate_destination_combobox(self, combobox, default_destination=None):
         """
@@ -933,11 +928,24 @@ class WalletApp(wx.Frame):
 
         # Set default selection
         if default_destination:
-            if default_destination in contacts:
-                display_text = f"{contacts[default_destination]} ({default_destination})"
-                combobox.SetValue(display_text)
-            else:
-                combobox.SetValue(default_destination)
+            # First try to find it in existing contacts
+            found = False
+            for i in range(combobox.GetCount()):
+                if combobox.GetClientData(i) == default_destination:
+                    combobox.SetSelection(i)  # Use SetSelection instead of SetValue
+                    found = True
+                    break
+
+            if not found:
+                # For system addresses like remembrancer, try to get the name from network config
+                network_config = get_network_config()
+                if default_destination == network_config.remembrancer_address:
+                    display_text = f"{network_config.remembrancer_name} ({default_destination})"
+                else:
+                    display_text = default_destination
+
+                combobox.Append(display_text, default_destination)
+                combobox.SetSelection(combobox.GetCount() - 1)
 
     def on_send_payment(self, event):
         """Handle unified payment submission"""
@@ -2139,22 +2147,26 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_memo(self, event):
-        """Submits a memo to the remembrancer."""
+        """Submits a memo."""
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Memo...")
         self.btn_submit_memo.SetLabel("Submitting...")
         self.btn_submit_memo.Update()
         logger.info("Submitting Memo")
 
         memo_text = self.txt_memo_input.GetValue()
-        recipient = self.memo_recipient.GetSelection()
-        if recipient != wx.NOT_FOUND:
-            recipient = self.memo_recipient.GetClientData(recipient)
+
+        # Get selected recipient data
+        recipient_idx = self.memo_recipient.GetSelection()
+        if recipient_idx != wx.NOT_FOUND:
+            recipient = self.memo_recipient.GetClientData(recipient_idx)
         else:
             recipient = self.memo_recipient.GetValue()
 
+        logger.debug(f"Selected recipient address: {recipient}")
+
         encrypt = self.memo_chk_encrypt.IsChecked()
 
-        if not memo_text or not recipient:
+        if not memo_text or not recipient_idx:
             wx.MessageBox("Please enter a memo and recipient", "Error", wx.OK | wx.ICON_ERROR)
             self.btn_submit_memo.SetLabel("Submit Memo")
             self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -2545,6 +2557,10 @@ class WalletApp(wx.Frame):
                 grid = getattr(self, f"{grid_name}_grid", None)
                 if grid and grid.GetNumberRows() > 0:
                     grid.DeleteRows(0, grid.GetNumberRows())
+
+            # Clear miscellaneous text fields
+            self.txt_memo_input.SetValue("")
+            self.verification_txt_details.SetValue("")
 
             self.tabs.Hide()
 

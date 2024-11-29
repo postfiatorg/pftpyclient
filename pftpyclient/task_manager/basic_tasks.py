@@ -50,17 +50,16 @@ class PostFiatTaskManager:
     def __init__(self, username, password, network_url, config: ConfigurationManager):
         self.credential_manager=CredentialManager(username,password)
         self.config = config
-        self.network_url = network_url
-        self.default_node = (
-            DEFAULT_NODE_ADDRESS if not self.config.get_global_config('use_testnet') else TESTNET_DEFAULT_NODE_ADDRESS
-        )
+        self.network_config = get_network_config()
+        self.network_url = self.network_config.public_rpc_url
+        self.default_node = self.network_config.node_address
+        self.pft_issuer = self.network_config.issuer_address
+
         self.user_wallet = self.spawn_user_wallet()
         self.google_doc_link = self.credential_manager.get_credential('googledoc')
 
-        use_testnet = self.config.get_global_config('use_testnet')
-        self.pft_issuer = ISSUER_ADDRESS if not use_testnet else TESTNET_ISSUER_ADDRESS
-
         # initialize dataframe filepaths for caching
+        use_testnet = self.config.get_global_config('use_testnet')
         network_suffix = '_TESTNET' if use_testnet else ''
         file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
         self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_transaction_history.{file_extension}")
@@ -879,7 +878,7 @@ class PostFiatTaskManager:
             raise ValueError("Memo must be either a string or a Memo object")
 
         # Get PFT requirement for destination
-        pft_value = SPECIAL_ADDRESSES.get(destination, {}).get("memo_pft_requirement", 0)
+        pft_value = self.network_config.get_pft_requirement(destination)
 
         payment_args = {
             "account": self.user_wallet.address,
@@ -1803,20 +1802,12 @@ class PostFiatTaskManager:
     
     def get_explorer_transaction_url(self, tx_hash: str) -> str:
         """Returns the appropriate explorer URL for a transaction based on network configuration"""
-        template = (
-            constants.TESTNET_EXPLORER_TRANSACTION_URL 
-            if self.config.get_global_config('use_testnet') 
-            else constants.MAINNET_EXPLORER_TRANSACTION_URL
-        )
+        template = self.network_config.explorer_tx_url_mask
         return template.format(hash=tx_hash)
     
     def get_explorer_account_url(self, address: str) -> str:
         """Returns the appropriate explorer URL for an account based on network configuration"""
-        template = (
-            constants.TESTNET_EXPLORER_ACCOUNT_URL 
-            if self.config.get_global_config('use_testnet') 
-            else constants.MAINNET_EXPLORER_ACCOUNT_URL
-        )
+        template = self.network_config.explorer_account_url_mask
         return template.format(address=address)
     
     def has_trust_line(self):
