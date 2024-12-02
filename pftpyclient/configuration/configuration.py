@@ -7,16 +7,6 @@ from pftpyclient.configuration.address_types import AddressType, PFT_REQUIREMENT
 from dataclasses import dataclass
 from decimal import Decimal
 
-GLOBAL_CONFIG = {
-    'performance_monitor': False,
-    'transaction_cache_format': 'csv', # or pickle
-    'last_logged_in_user': '',
-    'require_password_for_payment': True,
-    'use_testnet': False,
-    'mainnet_rpc_endpoints': [],
-    'testnet_rpc_endpoints': []
-}
-
 USER_CONFIG = {
     # template for per-user preferences
 }
@@ -38,7 +28,7 @@ class ConfigurationManager:
         """Load config from file or create with defaults"""
         if not self.config_file.exists():
             config = {
-                'global': GLOBAL_CONFIG.copy(),
+                'global': GLOBAL_CONFIG_DEFAULTS.copy(),
                 'user': USER_CONFIG.copy()
             }
             self._save_config(config)
@@ -61,11 +51,11 @@ class ConfigurationManager:
 
     def get_global_config(self, key):
         """Get a global config value"""
-        return self.config['global'].get(key, GLOBAL_CONFIG.get(key))
+        return self.config['global'].get(key, GLOBAL_CONFIG_DEFAULTS.get(key))
     
     def set_global_config(self, key, value):
         """Set a global config value"""
-        if key in GLOBAL_CONFIG:
+        if key in GLOBAL_CONFIG_DEFAULTS:
             self.config['global'][key] = value
             self._save_config(self.config)
 
@@ -83,8 +73,23 @@ class ConfigurationManager:
     def get_network_endpoints(self) -> list:
         """Get recent endpoints for a specified network"""
         is_testnet = self.get_global_config('use_testnet')
+        network = XRPL_TESTNET if is_testnet else XRPL_MAINNET
         key = 'testnet_rpc_endpoints' if is_testnet else 'mainnet_rpc_endpoints'
-        return self.config['global'].get(key, [])
+        
+        stored_endpoints = self.config['global'].get(key, [])
+        default_endpoints = network.public_rpc_url
+
+        all_endpoints = []
+
+        for endpoint in stored_endpoints:
+            if endpoint not in all_endpoints:
+                all_endpoints.append(endpoint)
+
+        for endpoint in default_endpoints:
+            if endpoint not in all_endpoints:
+                all_endpoints.append(endpoint)
+
+        return all_endpoints
     
     def get_current_endpoint(self) -> str:
         """Get current endpoint for a specified network"""
@@ -97,7 +102,7 @@ class ConfigurationManager:
 
         # Otherwise use default from constants
         network = XRPL_TESTNET if is_testnet else XRPL_MAINNET
-        endpoint = network.public_rpc_url
+        endpoint = network.public_rpc_url[0]  # Get first endpoint from list
         self.set_current_endpoint(endpoint)
         return endpoint
 
@@ -115,7 +120,7 @@ class ConfigurationManager:
         endpoints.insert(0, endpoint)
         
         # Keep only last 3
-        self.config['global'][key] = endpoints[:3]
+        self.config['global'][key] = endpoints
         self._save_config(self.config)
 
 @dataclass
@@ -128,7 +133,7 @@ class NetworkConfig:
     remembrancer_address: str
     issuer_address: str
     websockets: List[str]
-    public_rpc_url: str
+    public_rpc_url: List[str]
     explorer_tx_url_mask: str
     explorer_account_url_mask: str
     local_rpc_url: Optional[str] = None
@@ -161,7 +166,10 @@ XRPL_MAINNET = NetworkConfig(
         "wss://s1.ripple.com/", 
         "wss://s2.ripple.com/"
     ],
-    public_rpc_url="https://s2.ripple.com:51234",
+    public_rpc_url=[
+        "https://xrplcluster.com/",
+        "https://s2.ripple.com:51234"
+    ],
     local_rpc_url=None,  # No local node for mainnet yet
     explorer_tx_url_mask='https://livenet.xrpl.org/transactions/{hash}/detailed',
     explorer_account_url_mask='https://livenet.xrpl.org/accounts/{address}'
@@ -177,7 +185,10 @@ XRPL_TESTNET = NetworkConfig(
     websockets=[
         "wss://s.altnet.rippletest.net:51233"
     ],
-    public_rpc_url="https://s.altnet.rippletest.net:51234",
+    public_rpc_url=[
+        "https://testnet.xrpl-labs.com/",
+        "https://s.altnet.rippletest.net:51234"
+    ],
     local_rpc_url=None,  # No local node for testnet yet
     explorer_tx_url_mask='https://testnet.xrpl.org/transactions/{hash}/detailed',
     explorer_account_url_mask='https://testnet.xrpl.org/accounts/{address}'
@@ -204,3 +215,13 @@ def get_network_config(network: Optional[Network] = None) -> NetworkConfig:
         network = Network.XRPL_TESTNET if use_testnet else Network.XRPL_MAINNET
 
     return network.value
+
+GLOBAL_CONFIG_DEFAULTS = {
+    'performance_monitor': False,
+    'transaction_cache_format': 'csv', # or pickle
+    'last_logged_in_user': '',
+    'require_password_for_payment': True,
+    'use_testnet': False,
+    'mainnet_rpc_endpoints': Network.XRPL_MAINNET.value.public_rpc_url,
+    'testnet_rpc_endpoints': Network.XRPL_TESTNET.value.public_rpc_url
+}

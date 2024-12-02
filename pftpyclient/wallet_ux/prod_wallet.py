@@ -2241,7 +2241,7 @@ class WalletApp(wx.Frame):
 
         encrypt = self.memo_chk_encrypt.IsChecked()
 
-        if not memo_text or not recipient_idx:
+        if not memo_text or not recipient:
             wx.MessageBox("Please enter a memo and recipient", "Error", wx.OK | wx.ICON_ERROR)
             self.btn_submit_memo.SetLabel("Submit Memo")
             self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -3066,6 +3066,7 @@ class PreferencesDialog(wx.Dialog):
         panel.SetSizer(vbox)
         vbox.Fit(panel)
 
+        self.SetMinSize((500, -1))
         self.SetSize(self.GetBestSize())
         self.Center()
 
