@@ -19,27 +19,25 @@ from pftpyclient.task_manager.wallet_state import (
     PFT_STATES
 )
 from pftpyclient.task_manager.basic_tasks import (
-    GoogleDocNotFoundException, 
-    InvalidGoogleDocException, 
     PostFiatTaskManager, 
-    WalletInitiationFunctions, 
     NoMatchingTaskException, 
     WrongTaskStateException, 
-    is_over_1kb, 
     MAX_CHUNK_SIZE, 
     compress_string
 )
-from pftpyclient.user_login.credential_input import get_cached_usernames
+from pftpyclient.user_login.credentials import CredentialManager
 import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from pftpyclient.performance.monitor import PerformanceMonitor
-from pftpyclient.configuration.configuration import ConfigurationManager
+from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
 from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
 import pandas as pd
 from enum import Enum, auto
+from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
+
 # Configure the logger at module level
 wx_sink = configure_logger(
     log_to_file=True,
@@ -47,24 +45,10 @@ wx_sink = configure_logger(
     log_filename="prod_wallet.log",
     level="DEBUG"
 )
+from pftpyclient.configuration.constants import *
 
-MAINNET_WEBSOCKETS = [
-    "wss://xrplcluster.com",
-    "wss://xrpl.ws/",
-    "wss://s1.ripple.com/",
-    "wss://s2.ripple.com/"
-]
-TESTNET_WEBSOCKETS = [
-    "wss://s.altnet.rippletest.net:51233"
-]
-MAINNET_URL = "https://s2.ripple.com:51234"
-TESTNET_URL = "https://s.altnet.rippletest.net:51234"
-USE_TESTNET = False
-
-REMEMBRANCER_ADDRESS = "rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn"
-ISSUER_ADDRESS = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
-
-UPDATE_TIMER_INTERVAL_SEC = 60  # Every 60 Seconds
+UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
+REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 10  # 10 seconds
 
 # Try to use the default browser
 if os.name == 'nt':
@@ -103,7 +87,8 @@ class XRPLMonitorThread(Thread):
     def __init__(self, gui):
         Thread.__init__(self, daemon=True)
         self.gui = gui
-        self.nodes = MAINNET_WEBSOCKETS if not USE_TESTNET else TESTNET_WEBSOCKETS
+        self.network_config = get_network_config()
+        self.nodes = self.network_config.websockets
         self.current_node_index = 0
         self.url = self.nodes[self.current_node_index]
         self.loop = asyncio.new_event_loop()
@@ -343,13 +328,25 @@ class WalletApp(wx.Frame):
         'memos': {
             'columns': [
                 ('memo_id', 'Message ID', 190),
-                ('memo', 'Memo', 700)
+                ('memo', 'Memo', 500),
+                ('direction', 'To/From', 55),
+                ('display_address', 'Address', 250)
             ]
         },
         'summary': {
             'columns': [
                 ('Key', 'Key', 125),
                 ('Value', 'Value', 550)
+            ]
+        },
+        'payments': {
+            'columns': [
+                ('datetime', 'Date', 120),
+                ('amount', 'Amount', 70),
+                ('token', 'Token', 50),
+                ('direction', 'To/From', 55),
+                ('display_address', 'Address', 250),
+                ('tx_hash', 'Tx Hash', 450)
             ]
         }
     }
@@ -380,10 +377,12 @@ class WalletApp(wx.Frame):
         icon = wx.Icon(icon_path, wx.BITMAP_TYPE_ICO)
         self.SetIcon(icon)
 
-        self.perf_monitor = None
-
         self.config = ConfigurationManager()
+        self.network_config = get_network_config()
+        self.network_url = self.config.get_current_endpoint()
+        self.pft_issuer = self.network_config.issuer_address
         
+        self.perf_monitor = None
         if self.config.get_global_config('performance_monitor'):
             self.launch_perf_monitor()
 
@@ -407,7 +406,10 @@ class WalletApp(wx.Frame):
         self.grid_base_row_height = 125
         self.row_height_margin = 25
 
-        self.network_url = MAINNET_URL if not USE_TESTNET else TESTNET_URL
+        self.username = None
+
+        # Check for migration
+        check_and_show_migration_dialog(parent=self)
 
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""
@@ -434,19 +436,23 @@ class WalletApp(wx.Frame):
 
         # Create Account menu
         self.account_menu = wx.Menu()
+        self.contacts_item = self.account_menu.Append(wx.ID_ANY, "Manage Contacts")
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
         self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
         self.menubar.Append(self.account_menu, "Account")
 
         # Bind menu events
+        self.Bind(wx.EVT_MENU, self.on_manage_contacts, self.contacts_item)
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
         self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
 
         # Extras menu
         extras_menu = wx.Menu()
+        self.migrate_item = extras_menu.Append(wx.ID_ANY, "Migrate Old Credentials", "Migrate credentials from old format")
         self.perf_monitor_item = extras_menu.Append(wx.ID_ANY, "Performance Monitor", "Monitor client's performance")
+        self.Bind(wx.EVT_MENU, self.on_migrate_credentials, self.migrate_item)
         self.Bind(wx.EVT_MENU, self.launch_perf_monitor, self.perf_monitor_item)
         self.menubar.Append(extras_menu, "Extras")
 
@@ -489,47 +495,53 @@ class WalletApp(wx.Frame):
 
         # Create Summary tab elements
         username_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
-        self.lbl_wallet_state = wx.StaticText(self.summary_tab, label="Wallet State: ")
-        username_row_sizer.Add(self.lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
+        self.summary_lbl_endpoint = wx.StaticText(self.summary_tab, label=f"Endpoint: {self.network_url}")
+        network_text = "Testnet" if self.config.get_global_config('use_testnet') else "Mainnet"
+        self.summary_lbl_network = wx.StaticText(self.summary_tab, label=f"Network: {network_text}")
+        self.summary_lbl_wallet_state = wx.StaticText(self.summary_tab, label="Wallet State: ")
+
+        username_row_sizer.Add(self.summary_lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         username_row_sizer.AddStretchSpacer()
-        username_row_sizer.Add(self.lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        username_row_sizer.Add(self.summary_lbl_endpoint, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
+        username_row_sizer.Add(self.summary_lbl_network, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
+        username_row_sizer.Add(self.summary_lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         self.summary_sizer.Add(username_row_sizer, 0, wx.EXPAND)
 
         # Create XRP balance row
         xrp_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_xrp_balance = wx.StaticText(self.summary_tab, label="XRP Balance: ")
-        self.lbl_next_action = wx.StaticText(self.summary_tab, label="Next Action: ")
-        xrp_balance_row_sizer.Add(self.lbl_xrp_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        self.summary_lbl_xrp_balance = wx.StaticText(self.summary_tab, label="XRP Balance: ")
+        self.summary_lbl_next_action = wx.StaticText(self.summary_tab, label="Next Action: ")
+        xrp_balance_row_sizer.Add(self.summary_lbl_xrp_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         xrp_balance_row_sizer.AddStretchSpacer()
-        xrp_balance_row_sizer.Add(self.lbl_next_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        xrp_balance_row_sizer.Add(self.summary_lbl_next_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         self.summary_sizer.Add(xrp_balance_row_sizer, 0, wx.EXPAND)
 
         # Create PFT balance row
         pft_balance_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: ")
+        self.summary_lbl_pft_balance = wx.StaticText(self.summary_tab, label="PFT Balance: ")
         self.btn_wallet_action = wx.Button(self.summary_tab, label="Take Action")
-        pft_balance_row_sizer.Add(self.lbl_pft_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
+        pft_balance_row_sizer.Add(self.summary_lbl_pft_balance, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         pft_balance_row_sizer.AddStretchSpacer()
         pft_balance_row_sizer.Add(self.btn_wallet_action, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         self.summary_sizer.Add(pft_balance_row_sizer, 0, wx.EXPAND)
 
         # Create address section
-        self.lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
-        self.summary_sizer.Add(self.lbl_address, 0, flag=wx.ALL, border=5)
+        self.summary_lbl_address = wx.StaticText(self.summary_tab, label="XRP Address: ")
+        self.summary_sizer.Add(self.summary_lbl_address, 0, flag=wx.ALL, border=5)
 
         # Bind wallet action button
         self.btn_wallet_action.Bind(wx.EVT_BUTTON, self.on_take_action)
 
         # Set font weights
-        font = self.lbl_next_action.GetFont()
+        font = self.summary_lbl_next_action.GetFont()
         font.SetWeight(wx.FONTWEIGHT_BOLD)
-        self.lbl_next_action.SetFont(font)
+        self.summary_lbl_next_action.SetFont(font)
         self.btn_wallet_action.SetFont(font)
 
         # Create Key Account Details section
-        self.lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
-        self.summary_sizer.Add(self.lbl_key_details, 0, flag=wx.ALL, border=5)
+        self.summary_lbl_key_details = wx.StaticText(self.summary_tab, label="Key Account Details:")
+        self.summary_sizer.Add(self.summary_lbl_key_details, 0, flag=wx.ALL, border=5)
         self.summary_grid = self.setup_grid(gridlib.Grid(self.summary_tab), 'summary')
         self.summary_sizer.Add(self.summary_grid, 1, wx.EXPAND | wx.ALL, 5)
 
@@ -545,30 +557,39 @@ class WalletApp(wx.Frame):
         self.proposals_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.proposals_tab, "Proposals")
         self.proposals_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.proposals_sizer.AddSpacer(10)
         self.proposals_tab.SetSizer(self.proposals_sizer)
 
         # Add the task management buttons in the Accepted tab
-        self.button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.proposals_button_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_request_task = wx.Button(self.proposals_tab, label="Request Task")
-        self.button_sizer.Add(self.btn_request_task, 1, wx.EXPAND | wx.ALL, 5)
+        self.proposals_button_sizer.Add(self.btn_request_task, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_request_task.Bind(wx.EVT_BUTTON, self.on_request_task)
 
         self.btn_accept_task = wx.Button(self.proposals_tab, label="Accept Task")
-        self.button_sizer.Add(self.btn_accept_task, 1, wx.EXPAND | wx.ALL, 5)
+        self.proposals_button_sizer.Add(self.btn_accept_task, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_accept_task.Bind(wx.EVT_BUTTON, self.on_accept_task)
 
-        self.proposals_sizer.Add(self.button_sizer, 0, wx.EXPAND)
+        self.proposals_sizer.Add(self.proposals_button_sizer, 0, wx.EXPAND)
 
-        self.button_sizer2 = wx.BoxSizer(wx.HORIZONTAL)
+        self.proposals_button_sizer_2 = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_refuse_task = wx.Button(self.proposals_tab, label="Refuse Task")
-        self.button_sizer2.Add(self.btn_refuse_task, 1, wx.EXPAND | wx.ALL, 5)
+        self.proposals_button_sizer_2.Add(self.btn_refuse_task, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_refuse_task.Bind(wx.EVT_BUTTON, self.on_refuse_task)
 
         self.btn_submit_for_verification = wx.Button(self.proposals_tab, label="Submit for Verification")
-        self.button_sizer2.Add(self.btn_submit_for_verification, 1, wx.EXPAND | wx.ALL, 5)
+        self.proposals_button_sizer_2.Add(self.btn_submit_for_verification, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_submit_for_verification.Bind(wx.EVT_BUTTON, self.on_submit_for_verification)
 
-        self.proposals_sizer.Add(self.button_sizer2, 0, wx.EXPAND)
+        self.proposals_sizer.Add(self.proposals_button_sizer_2, 0, wx.EXPAND)
+
+        # Add checkbox for showing refused tasks
+        bottom_controls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        bottom_controls_sizer.AddStretchSpacer()
+        self.chk_show_refused = wx.CheckBox(self.proposals_tab, label="Show Refused Tasks")
+        self.chk_show_refused.Bind(wx.EVT_CHECKBOX, self.on_toggle_refused_tasks)
+        bottom_controls_sizer.Add(self.chk_show_refused, 0, wx.ALL, 2)
+        self.proposals_sizer.Add(bottom_controls_sizer, 0, wx.EXPAND | wx.ALL, 2)
 
         # Add grid to Proposals tab
         self.proposals_grid = self.setup_grid(gridlib.Grid(self.proposals_tab), 'proposals')
@@ -587,28 +608,28 @@ class WalletApp(wx.Frame):
         self.verification_tab.SetSizer(self.verification_sizer)
 
         # Task ID input box
-        self.lbl_task_id = wx.StaticText(self.verification_tab, label="Task ID:")
-        self.verification_sizer.Add(self.lbl_task_id, flag=wx.ALL, border=5)
-        self.txt_task_id = wx.TextCtrl(self.verification_tab)
-        self.verification_sizer.Add(self.txt_task_id, flag=wx.EXPAND | wx.ALL, border=5)
+        self.verification_lbl_task_id = wx.StaticText(self.verification_tab, label="Task ID:")
+        self.verification_sizer.Add(self.verification_lbl_task_id, flag=wx.ALL, border=5)
+        self.verification_txt_task_id = wx.TextCtrl(self.verification_tab)
+        self.verification_sizer.Add(self.verification_txt_task_id, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Verification Details input box
-        self.lbl_verification_details = wx.StaticText(self.verification_tab, label="Verification Details:")
-        self.verification_sizer.Add(self.lbl_verification_details, flag=wx.ALL, border=5)
-        self.txt_verification_details = wx.TextCtrl(self.verification_tab, style=wx.TE_MULTILINE, size=(-1, 100))
-        self.verification_sizer.Add(self.txt_verification_details, flag=wx.EXPAND | wx.ALL, border=5)
+        self.verification_lbl_details = wx.StaticText(self.verification_tab, label="Verification Details:")
+        self.verification_sizer.Add(self.verification_lbl_details, flag=wx.ALL, border=5)
+        self.verification_txt_details = wx.TextCtrl(self.verification_tab, style=wx.TE_MULTILINE, size=(-1, 100))
+        self.verification_sizer.Add(self.verification_txt_details, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Submit Verification Details and Log Pomodoro buttons
-        self.button_sizer_verification = wx.BoxSizer(wx.HORIZONTAL)
+        self.verification_button_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_submit_verification_details = wx.Button(self.verification_tab, label="Submit Verification Details")
-        self.button_sizer_verification.Add(self.btn_submit_verification_details, 1, wx.EXPAND | wx.ALL, 5)
+        self.verification_button_sizer.Add(self.btn_submit_verification_details, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_submit_verification_details.Bind(wx.EVT_BUTTON, self.on_submit_verification_details)
 
         self.btn_log_pomodoro = wx.Button(self.verification_tab, label="Log Pomodoro")
-        self.button_sizer_verification.Add(self.btn_log_pomodoro, 1, wx.EXPAND | wx.ALL, 5)
+        self.verification_button_sizer.Add(self.btn_log_pomodoro, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_log_pomodoro.Bind(wx.EVT_BUTTON, self.on_log_pomodoro)
 
-        self.verification_sizer.Add(self.button_sizer_verification, 0, wx.EXPAND)
+        self.verification_sizer.Add(self.verification_button_sizer, 0, wx.EXPAND)
 
         # Add a Force Update button to the Verification tab
         self.btn_force_update = wx.Button(self.verification_tab, label="Force Update")
@@ -642,68 +663,7 @@ class WalletApp(wx.Frame):
         # PAYMENTS
         #################################
 
-        self.payments_tab = wx.Panel(self.tabs)
-        self.tabs.AddPage(self.payments_tab, "Payments")
-        self.payments_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.payments_tab.SetSizer(self.payments_sizer)
-
-        # XRP Payment section
-        self.lbl_xrp_payment = wx.StaticText(self.payments_tab, label="XRP Payments:")
-        self.payments_sizer.Add(self.lbl_xrp_payment, flag=wx.ALL, border=5)
-
-        self.lbl_xrp_amount = wx.StaticText(self.payments_tab, label="Amount of XRP:")
-        self.payments_sizer.Add(self.lbl_xrp_amount, flag=wx.ALL, border=5)
-        self.txt_xrp_amount = wx.TextCtrl(self.payments_tab)
-        self.payments_sizer.Add(self.txt_xrp_amount, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_xrp_address = wx.StaticText(self.payments_tab, label="Payment Address:")
-        self.payments_sizer.Add(self.lbl_xrp_address, flag=wx.ALL, border=5)
-        self.txt_xrp_address_payment = wx.TextCtrl(self.payments_tab)
-        self.payments_sizer.Add(self.txt_xrp_address_payment, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_xrp_memo = wx.StaticText(self.payments_tab, label="Memo (Optional):")
-        self.payments_sizer.Add(self.lbl_xrp_memo, flag=wx.ALL, border=5)
-        self.txt_xrp_memo = wx.TextCtrl(self.payments_tab)
-        self.payments_sizer.Add(self.txt_xrp_memo, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_xrp_destination_tag = wx.StaticText(self.payments_tab, label="Destination Tag (Optional):")
-        self.payments_sizer.Add(self.lbl_xrp_destination_tag, flag=wx.ALL, border=5)
-        self.txt_xrp_destination_tag = wx.TextCtrl(self.payments_tab)
-        self.payments_sizer.Add(self.txt_xrp_destination_tag, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.btn_submit_xrp_payment = wx.Button(self.payments_tab, label="Submit Payment")
-        self.payments_sizer.Add(self.btn_submit_xrp_payment, flag=wx.ALL, border=5)
-        self.btn_submit_xrp_payment.Bind(wx.EVT_BUTTON, self.on_submit_xrp_payment)
-
-        # PFT Payment section
-        self.lbl_pft_payment = wx.StaticText(self.payments_tab, label="PFT Payments:")
-        self.payments_sizer.Add(self.lbl_pft_payment, flag=wx.ALL, border=5)
-
-        self.lbl_pft_amount = wx.StaticText(self.payments_tab, label="Amount of PFT:")
-        self.payments_sizer.Add(self.lbl_pft_amount, flag=wx.ALL, border=5)
-        self.txt_pft_amount = wx.TextCtrl(self.payments_tab)
-        self.payments_sizer.Add(self.txt_pft_amount, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_pft_address = wx.StaticText(self.payments_tab, label="Payment Address:")
-        self.payments_sizer.Add(self.lbl_pft_address, flag=wx.ALL, border=5)
-        self.txt_pft_address_payment = wx.TextCtrl(self.payments_tab)
-        self.payments_sizer.Add(self.txt_pft_address_payment, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.lbl_pft_memo = wx.StaticText(self.payments_tab, label="Memo (Optional):")
-        self.payments_sizer.Add(self.lbl_pft_memo, flag=wx.ALL, border=5)
-        self.txt_pft_memo = wx.TextCtrl(self.payments_tab)
-        self.payments_sizer.Add(self.txt_pft_memo, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.btn_submit_pft_payment = wx.Button(self.payments_tab, label="Submit Payment")
-        self.payments_sizer.Add(self.btn_submit_pft_payment, flag=wx.ALL, border=5)
-        self.btn_submit_pft_payment.Bind(wx.EVT_BUTTON, self.on_submit_pft_payment)
-
-        # # Add "Show Secret" button
-        # self.btn_show_secret = wx.Button(self.payments_tab, label="Show Secret")
-        # self.payments_sizer.Add(self.btn_show_secret, flag=wx.ALL, border=5)
-        # self.btn_show_secret.Bind(wx.EVT_BUTTON, self.on_show_secret)
-
-        self.panel.SetSizer(self.sizer)
+        self.build_payments_tab()
 
         # Store reference to payments tab page
         self.tab_pages["Payments"] = self.payments_tab
@@ -717,9 +677,42 @@ class WalletApp(wx.Frame):
         self.memos_sizer = wx.BoxSizer(wx.VERTICAL)
         self.memos_tab.SetSizer(self.memos_sizer)
 
-        # Add memo input box
+        self.memos_sizer.AddSpacer(10)
+
+        # Add recipient selection
+        recipient_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        recipient_lbl = wx.StaticText(self.memos_tab, label="Recipient:")
+        recipient_sizer.Add(recipient_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.memo_recipient = wx.ComboBox(
+            self.memos_tab,
+            style=wx.CB_DROPDOWN,
+            size=(200, -1)
+        )
+        self.memo_recipient.Bind(wx.EVT_COMBOBOX, self.on_destination_selected)
+        self.memo_recipient.Bind(wx.EVT_TEXT, self.on_destination_text)
+        recipient_sizer.Add(self.memo_recipient, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        # Temporary encryption handling while NodeTools is being updated
+        self.memo_recipient.Bind(wx.EVT_COMBOBOX, self.on_memo_recipient_changed)
+        self.memo_recipient.Bind(wx.EVT_TEXT, self.on_memo_recipient_changed)
+
+        # Add checkboxes
+        self.memo_chk_encrypt = wx.CheckBox(self.memos_tab, label="Encrypt")
+
+        recipient_sizer.Add(self.memo_chk_encrypt, flag=wx.ALIGN_CENTER_VERTICAL, border=5)
+
+        self.memos_sizer.Add(recipient_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Add memo input box section with encryption requests button
+        memo_header_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.lbl_memo = wx.StaticText(self.memos_tab, label="Enter your memo:")
-        self.memos_sizer.Add(self.lbl_memo, 0, wx.EXPAND | wx.ALL, border=5)
+        memo_header_sizer.Add(self.lbl_memo, 1, wx.ALIGN_CENTER_VERTICAL)
+
+        self.btn_encryption_requests = wx.Button(self.memos_tab, label="Encryption Requests")
+        self.btn_encryption_requests.Bind(wx.EVT_BUTTON, self.on_encryption_requests)
+        memo_header_sizer.Add(self.btn_encryption_requests, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 5)
+
+        self.memos_sizer.Add(memo_header_sizer, 0, wx.EXPAND | wx.ALL, border=5)
         self.txt_memo_input = wx.TextCtrl(self.memos_tab, style=wx.TE_MULTILINE, size=(-1, 200))
         self.memos_sizer.Add(self.txt_memo_input, 1, wx.EXPAND | wx.ALL, border=5)
 
@@ -753,6 +746,8 @@ class WalletApp(wx.Frame):
 
         #################################
 
+        self.panel.SetSizer(self.sizer)
+
         self.status_bar = self.CreateStatusBar()
         self.status_bar.SetFieldsCount(2)
         self.status_bar.SetStatusWidths([-3, -1])  # 75% for message, 25% for state
@@ -769,7 +764,6 @@ class WalletApp(wx.Frame):
         logo = logo.Scale(230, 230, wx.IMAGE_QUALITY_HIGH)
         bitmap = wx.Bitmap(logo)
         logo_ctrl = wx.StaticBitmap(panel, -1, bitmap=bitmap)
-        # sizer.Add(logo_ctrl, 0, wx.ALIGN_CENTER | wx.TOP, 20)
 
         # Create a box to center the content
         box = wx.Panel(panel)
@@ -799,7 +793,6 @@ class WalletApp(wx.Frame):
         self.login_error_label = wx.StaticText(box, label="")
         self.login_error_label.SetForegroundColour(wx.RED)
         box_sizer.Add(self.login_error_label, flag=wx.EXPAND |wx.ALL, border=5)
-        # self.login_error_label.Hide()
 
         # Login button
         self.btn_login = wx.Button(box, label="Login")
@@ -810,7 +803,6 @@ class WalletApp(wx.Frame):
         self.btn_new_user = wx.Button(box, label="Create New User")
         box_sizer.Add(self.btn_new_user, flag=wx.EXPAND | wx.ALL, border=5)
         self.btn_new_user.Bind(wx.EVT_BUTTON, self.on_create_new_user)
-        # box_sizer.Add(wx.StaticLine(box), 0, wx.EXPAND | wx.TOP, 5)
 
         box.SetSizer(box_sizer)
 
@@ -840,10 +832,264 @@ class WalletApp(wx.Frame):
 
         return panel
     
+    def build_payments_tab(self):
+        """Build the unified payments interface"""
+        self.payments_tab = wx.Panel(self.tabs)
+        self.tabs.AddPage(self.payments_tab, "Payments")
+        self.payments_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.payments_tab.SetSizer(self.payments_sizer)
+
+        # Add spacing at the top
+        self.payments_sizer.AddSpacer(10)
+
+        # Create a horizontal sizer for inputs and send button
+        main_input_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        # left side - inputs and memo
+        left_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Amount, token and destination input section
+        top_row_input_sizer = wx.BoxSizer(wx.HORIZONTAL)
+
+        # Amount input with label
+        amount_label = wx.StaticText(self.payments_tab, label="Send Amount:")
+        top_row_input_sizer.Add(amount_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        self.payment_txt_amount = wx.TextCtrl(self.payments_tab, size=(100, -1))
+        top_row_input_sizer.Add(self.payment_txt_amount, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        # Token selector
+        self.token_selector = wx.ComboBox(
+            self.payments_tab,
+            choices=["XRP", "PFT"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+            size=(70, -1)
+        )
+        self.token_selector.SetSelection(0)  # Default to XRP
+        top_row_input_sizer.Add(self.token_selector, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+
+        # Destination input with label
+        dest_label = wx.StaticText(self.payments_tab, label="To:")
+        top_row_input_sizer.Add(dest_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        self.txt_payment_destination = wx.ComboBox(
+            self.payments_tab,
+            style=wx.CB_DROPDOWN,
+            size=(200, -1)  # Wider to accommodate XRP addresses
+        )
+        self.txt_payment_destination.Bind(wx.EVT_COMBOBOX, self.on_destination_selected)
+        self.txt_payment_destination.Bind(wx.EVT_TEXT, self.on_destination_text)
+
+        top_row_input_sizer.Add(self.txt_payment_destination, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        # Destination tags / Memo ID inputs
+        dest_tag_label = wx.StaticText(self.payments_tab, label="Memo ID (optional):")
+        top_row_input_sizer.Add(dest_tag_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        self.txt_destination_tag = wx.TextCtrl(self.payments_tab, size=(100, -1))
+        tooltip_text = ("Some exchanges and services require a Memo ID (also called Destination Tag) " 
+                       "for XRP deposits.\nCheck your recipient's requirements - sending XRP without " 
+                       "a required Memo ID may result in lost funds.")
+        self.txt_destination_tag.SetToolTip(tooltip_text)
+        dest_tag_label.SetToolTip(tooltip_text)
+        top_row_input_sizer.Add(self.txt_destination_tag, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        left_sizer.Add(top_row_input_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Optional memo field
+        memo_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        memo_label = wx.StaticText(self.payments_tab, label="Memo (Optional):")
+        self.txt_payment_memo = wx.TextCtrl(self.payments_tab)
+        memo_sizer.Add(memo_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        memo_sizer.Add(self.txt_payment_memo, 1)
+        
+        left_sizer.Add(memo_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        main_input_sizer.Add(left_sizer, 1, wx.EXPAND | wx.RIGHT, 5)
+
+        # Send button - height matches both input rows
+        button_height = self.payment_txt_amount.GetSize().height * 2 + 5
+        self.btn_send = wx.Button(self.payments_tab, label="Send", size=(-1, button_height))
+        main_input_sizer.Add(self.btn_send, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        self.payments_sizer.Add(main_input_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Payments history grid
+        self.payments_grid = self.setup_grid(gridlib.Grid(self.payments_tab), 'payments')
+        self.payments_sizer.Add(self.payments_grid, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Bind events
+        self.btn_send.Bind(wx.EVT_BUTTON, self.on_send_payment)
+
+    def on_destination_selected(self, event):
+        """Handle selection from dropdown - extract the address"""
+        event.Skip()
+
+    def on_destination_text(self, event):
+        """Handle manual text entry - allow any text"""
+        event.Skip()
+
+    def on_memo_recipient_changed(self, event=None):
+        """
+        TEMPORARY METHOD WHILE NODETOOLS IS BEING UPDATED
+        Handle memo recipient changes to update encryption checkbox state
+        """
+        if event is not None:
+            event.Skip()  # Allow other event handlers to process
+        
+        # Get the actual address from client data if it's a selection, otherwise use the raw value
+        selection = self.memo_recipient.GetSelection()
+        if selection != wx.NOT_FOUND:
+            address = self.memo_recipient.GetClientData(selection)
+        else:
+            address = self.memo_recipient.GetValue()
+
+        network_config = get_network_config()        
+        is_system_address = (
+            address == network_config.remembrancer_address or 
+            address == network_config.node_address
+        )
+        
+        # Disable encryption for system addresses
+        self.memo_chk_encrypt.Enable(not is_system_address)
+        
+        # Uncheck if disabled
+        if is_system_address and self.memo_chk_encrypt.GetValue():
+            self.memo_chk_encrypt.SetValue(False)
+
+    def on_toggle_refused_tasks(self, event):
+        """Handle toggling of the refused tasks checkbox"""
+        try:
+            include_refused = self.chk_show_refused.IsChecked()
+            # Get proposals data with the new include_refused setting
+            proposals_df = self.task_manager.get_proposals_df(include_refused=include_refused)
+            # Update only the proposals grid
+            wx.PostEvent(self, UpdateGridEvent(data=proposals_df, target="proposals", caller=f"{self.__class__.__name__}.on_toggle_refused_tasks"))
+        except Exception as e:
+            logger.error(f"Error updating proposals grid: {e}")
+            wx.MessageBox(f"Error updating proposals grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def update_all_destination_comboboxes(self):
+        """Update all destination comboboxes"""
+        self._populate_destination_combobox(combobox=self.txt_payment_destination)
+        self._populate_destination_combobox(
+            combobox=self.memo_recipient, 
+            default_destination=self.network_config.remembrancer_address
+        )
+
+    def _populate_destination_combobox(self, combobox, default_destination=None):
+        """
+        Populate destination combobox with contacts
+        Args:
+            combobox: wx.ComboBox to populate
+            default_destination: Optional default address to select
+        """
+        combobox.Clear()
+        contacts = self.task_manager.get_contacts()
+
+        # Add contacts in format "name (address)"
+        for address, name in contacts.items():
+            display_text = f"{name} ({address})"
+            combobox.Append(display_text, address)
+
+        # Set default selection
+        if default_destination:
+            # First try to find it in existing contacts
+            found = False
+            for i in range(combobox.GetCount()):
+                if combobox.GetClientData(i) == default_destination:
+                    combobox.SetSelection(i)  # Use SetSelection instead of SetValue
+                    found = True
+                    break
+
+            if not found:
+                # For system addresses like remembrancer, try to get the name from network config
+                network_config = get_network_config()
+                if default_destination == network_config.remembrancer_address:
+                    display_text = f"{network_config.remembrancer_name} ({default_destination})"
+                else:
+                    display_text = default_destination
+
+                combobox.Append(display_text, default_destination)
+                combobox.SetSelection(combobox.GetCount() - 1)
+
+    def on_send_payment(self, event):
+        """Handle unified payment submission"""
+        # Check if password is required
+        if self.config.get_global_config('require_password_for_payment'):
+            dialog = wx.PasswordEntryDialog(
+                self, 
+                "Enter Password", 
+                "Please enter your password to confirm payment."
+            )
+        
+            if dialog.ShowModal() != wx.ID_OK:
+                dialog.Destroy()
+                return
+                
+            password = dialog.GetValue()
+            dialog.Destroy()
+            wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+        
+            if not self.task_manager.verify_password(password):
+                wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
+                return
+    
+        token_type = self.token_selector.GetValue()
+        amount = self.payment_txt_amount.GetValue()
+        destination = self.txt_payment_destination.GetValue()
+        memo = self.txt_payment_memo.GetValue()
+        destination_tag = self.txt_destination_tag.GetValue()
+
+        self.btn_send.SetLabel("Sending...")
+
+        # TODO: Consider adding more validation here
+        if not amount or not destination:
+            wx.MessageBox("Please enter a valid amount and destination!", "Error", wx.OK | wx.ICON_ERROR)
+            self.btn_send.SetLabel("Send")
+            return
+        
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Confirming payment...")
+        
+        # Show confirmation dialog with contact saving option
+        if not self.show_payment_confirmation(amount, destination, token_type):
+            self.btn_send.SetLabel("Send")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
+            return
+        
+        self.set_wallet_ui_state(message="Submitting payment...")
+        self.btn_send.Disable()
+
+        try:
+            if token_type == "XRP":
+                dest_tag = int(destination_tag) if destination_tag.strip() else None
+                response = self.task_manager.send_xrp(amount, destination, memo, destination_tag=dest_tag)
+            else: # PFT
+                response = self.task_manager.send_pft(amount, destination, memo)
+
+            formatted_response = self.format_response(response)
+            dialog = SelectableMessageDialog(self, f"{token_type} Payment Submitted", formatted_response)
+            dialog.ShowModal()
+            dialog.Destroy()
+
+        except ValueError as e:
+            logger.error(f"Invalid input: {e}")
+            wx.MessageBox(f"Invalid input: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        except xrpl.transaction.XRPLReliableSubmissionException as e:
+            logger.error(f"Error submitting payment: {e}")
+            wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        except Exception as e:
+            logger.error(f"Error submitting payment: {e}")
+            wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        
+        self.btn_send.Enable()
+        self.btn_send.SetLabel("Send")
+        self.set_wallet_ui_state(WalletUIState.IDLE)
+
     def populate_username_dropdown(self):
         """Populates the username dropdown with cached usernames"""
         try:
-            cached_usernames = get_cached_usernames()
+            cached_usernames = CredentialManager.get_cached_usernames()
             self.login_txt_username.Clear()
             self.login_txt_username.AppendItems(cached_usernames)
 
@@ -1014,8 +1260,6 @@ class WalletApp(wx.Frame):
         dialog.Destroy()
 
     def on_cache_user(self, event):
-        #TODO: Phase out this method in favor of automatic caching on genesis
-        logger.debug("User clicked Cache Credentials button")
         """Caches the user's credentials"""
         input_map = {
             'Username_Input': self.create_txt_username.GetValue(),
@@ -1025,46 +1269,38 @@ class WalletApp(wx.Frame):
             'Confirm Password_Input': self.create_txt_confirm_password.GetValue(),
         }
 
-        is_valid, error_message = self.validate_password(input_map['Password_Input'])
-        if not is_valid:
-            logger.error(error_message)
-            wx.MessageBox(error_message, 'Error', wx.OK | wx.ICON_ERROR)
-        elif self.create_txt_password.GetValue() != self.create_txt_confirm_password.GetValue():
+        if self.create_txt_password.GetValue() != self.create_txt_confirm_password.GetValue():
             logger.error("Passwords Do Not Match! Please Retry.")
             wx.MessageBox('Passwords Do Not Match! Please Retry.', 'Error', wx.OK | wx.ICON_ERROR)
         elif any(not value for value in input_map.values()):
             logger.error("All fields are required for caching!")
             wx.MessageBox('All fields are required for caching!', 'Error', wx.OK | wx.ICON_ERROR)
         else:
-            wallet_functions = WalletInitiationFunctions(input_map, self.network_url)
             try:
-                response = wallet_functions.cache_credentials(input_map)
+                response = CredentialManager.cache_credentials(input_map)
                 wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
             except Exception as e:
                 logger.error(f"{e}")
-                # TODO: This check was inserted for instances when Google Docs were still being checked and were invalid
-                # TODO: Since google docs were removed, this check is probably no longer needed
-                if wx.YES == wx.MessageBox(f"{e}. \n\nContinue caching anyway?", 'Error', wx.YES_NO | wx.ICON_ERROR):
-                    try:
-                        logger.debug("Attempting to cache credentials despite error")
-                        response = wallet_functions.cache_credentials(input_map)
-                    except Exception as e:
-                        logger.error(f"Error caching credentials: {e}")
-                        wx.MessageBox(f"Error caching credentials: {e}", 'Error', wx.OK | wx.ICON_ERROR)
-                    else:
-                        wx.MessageBox(response, 'Info', wx.OK | wx.ICON_INFORMATION)
+                wx.MessageBox(f"{e}", 'Error', wx.OK | wx.ICON_ERROR)
+            else:
+                # Clear all fields if caching was successful
+                self.create_txt_username.SetValue('')
+                self.create_txt_password.SetValue('')
+                self.create_txt_xrp_address.SetValue('')
+                self.create_txt_xrp_secret.SetValue('')
+                self.create_txt_confirm_password.SetValue('')
 
     def on_login(self, event):
         self.set_wallet_ui_state(WalletUIState.BUSY, "Logging in...")
         self.btn_login.SetLabel("Logging in...")
         self.btn_login.Update()
 
-        username = self.login_txt_username.GetValue()
+        self.username = self.login_txt_username.GetValue()
         password = self.login_txt_password.GetValue()
 
         try:
             self.task_manager = PostFiatTaskManager(
-                username=username, 
+                username=self.username, 
                 password=password,
                 network_url=self.network_url,
                 config=self.config
@@ -1090,16 +1326,16 @@ class WalletApp(wx.Frame):
 
         self.update_ui_based_on_wallet_state()
 
-        logger.info(f"Logged in as {username}")
+        logger.info(f"Logged in as {self.username}")
 
         # Save the last logged-in user
-        self.config.set_global_config('last_logged_in_user', username)
+        self.config.set_global_config('last_logged_in_user', self.username)
 
         # Hide login panel and show tabs
         self.login_panel.Hide()
         self.tabs.Show()
 
-        self.update_account_display(username, classic_address)
+        self.update_account_display(self.username, classic_address)
 
         # Update layout and ensure correct sizing
         self.panel.Layout()
@@ -1118,6 +1354,17 @@ class WalletApp(wx.Frame):
         self.start_transaction_update_timer()
 
         self.set_wallet_ui_state(WalletUIState.IDLE)
+
+        self.update_all_destination_comboboxes()
+
+        # TEMPORARY METHOD WHILE NODETOOLS IS BEING UPDATED
+        self.on_memo_recipient_changed(None)
+
+    def update_network_display(self):
+        """Update UI elements that display network information"""
+        self.summary_lbl_endpoint.SetLabel(f"Endpoint: {self.network_url}")
+        self.summary_sizer.Layout()
+        self.summary_tab.Layout()
 
     @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
@@ -1142,18 +1389,18 @@ class WalletApp(wx.Frame):
         self.tabs.Thaw()
 
         # Update summary tab wallet state labels
-        if hasattr(self, 'lbl_wallet_state'):
-            self.lbl_wallet_state.SetLabel(f"Wallet State: {current_state.value}")
+        if hasattr(self, 'summary_lbl_wallet_state'):
+            self.summary_lbl_wallet_state.SetLabel(f"Wallet State: {current_state.value}")
 
         if current_state == WalletState.ACTIVE:
-            if hasattr(self, 'lbl_next_action'):
-                self.lbl_next_action.Hide()
+            if hasattr(self, 'summary_lbl_next_action'):
+                self.summary_lbl_next_action.Hide()
             if hasattr(self, 'btn_wallet_action'):
                 self.btn_wallet_action.Hide()
         else:
-            if hasattr(self, 'lbl_next_action'):
-                self.lbl_next_action.Show()
-                self.lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
+            if hasattr(self, 'summary_lbl_next_action'):
+                self.summary_lbl_next_action.Show()
+                self.summary_lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
             if hasattr(self, 'btn_wallet_action'):
                 self.btn_wallet_action.Show()
 
@@ -1208,18 +1455,18 @@ class WalletApp(wx.Frame):
         logger.debug(f"Updating account display for {username}")
 
         # Update basic account info
-        self.lbl_username.SetLabel(f"Username: {username}")
-        self.lbl_address.SetLabel(f"XRP Address: {classic_address}")
+        self.summary_lbl_username.SetLabel(f"Username: {username}")
+        self.summary_lbl_address.SetLabel(f"XRP Address: {classic_address}")
 
         xrp_balance = self.task_manager.get_xrp_balance()
         xrp_balance = xrpl.utils.drops_to_xrp(str(xrp_balance))
-        self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
+        self.summary_lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
         # PFT balance pending update
-        self.lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
+        self.summary_lbl_pft_balance.SetLabel(f"PFT Balance: Updating...")
 
-        self.lbl_wallet_state.SetLabel(f"Wallet State: {self.task_manager.wallet_state.value}")
-        self.lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
+        self.summary_lbl_wallet_state.SetLabel(f"Wallet State: {self.task_manager.wallet_state.value}")
+        self.summary_lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
 
     def on_take_action(self, event):
         """Handle wallet action button click based on current state"""
@@ -1248,7 +1495,7 @@ class WalletApp(wx.Frame):
                     try:
                         self.worker.expecting_state_change = True
                         self.task_manager.handle_trust_line()
-                        wx.CallAfter(self.update_account_info)  # TODO: Not sure if this is needed
+                        wx.CallAfter(self.update_account_display, self.username, self.task_manager.user_wallet.address)
                         wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
                     except Exception as e:
                         logger.error(f"Error setting trust line: {e}")
@@ -1345,7 +1592,7 @@ class WalletApp(wx.Frame):
     def update_account(self, acct):
         logger.debug(f"Updating account: {acct}")
         xrp_balance = str(xrpl.utils.drops_to_xrp(acct["Balance"]))
-        self.lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
+        self.summary_lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
         # Check if account state should change
         if self.task_manager:
@@ -1445,11 +1692,11 @@ class WalletApp(wx.Frame):
             pft_balance = 0.0
             for line in lines:
                 logger.debug(f"Processing line: {line}")
-                if line['currency'] == 'PFT' and line['account'] == ISSUER_ADDRESS:
+                if line['currency'] == 'PFT' and line['account'] == self.pft_issuer:
                     pft_balance = float(line['balance'])
                     logger.debug(f"Found PFT balance: {pft_balance}")
 
-            self.lbl_pft_balance.SetLabel(f"PFT Balance: {pft_balance}")
+            self.summary_lbl_pft_balance.SetLabel(f"PFT Balance: {pft_balance}")
 
         except Exception as e:
             logger.exception(f"Exception in update_tokens: {e}")
@@ -1530,13 +1777,17 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Failed updating summary grid: {e}")
 
-        # Memos grid (available in TRUSTLINED_STATES)
+        # Memos, payments grid (available in TRUSTLINED_STATES)
         if current_state in TRUSTLINED_STATES:
-            try:
-                memos_df = self.task_manager.get_memos_df()
-                wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos", caller=f"{self.__class__.__name__}.refresh_grids"))
-            except Exception as e:
-                logger.error(f"Failed updating memos grid: {e}")
+            for grid_type, getter_method in [
+                ("memos", self.task_manager.get_memos_df),
+                ("payments", self.task_manager.get_payments_df)
+            ]:
+                try:
+                    data = getter_method()
+                    wx.PostEvent(self, UpdateGridEvent(data=data, target=grid_type, caller=f"{self.__class__.__name__}.refresh_grids"))
+                except Exception as e:
+                    logger.error(f"Failed updating {grid_type} grid: {e}")
 
         # Proposals, Rewards, and Verification grids (available in PFT_STATES)
         if current_state in PFT_STATES:
@@ -1566,6 +1817,7 @@ class WalletApp(wx.Frame):
             'verification': PFT_STATES,
             'proposals': PFT_STATES,
             'memos': TRUSTLINED_STATES,
+            'payments': TRUSTLINED_STATES,  # XRP requires FUNDED_STATES, but PFT requires TRUSTLINED_STATES
             'summary': []
         }
 
@@ -1585,6 +1837,8 @@ class WalletApp(wx.Frame):
                 self.populate_grid_generic(self.verification_grid, event.data, 'verification')
             case "proposals":
                 self.populate_grid_generic(self.proposals_grid, event.data, 'proposals')
+            case "payments":
+                self.populate_grid_generic(self.payments_grid, event.data, 'payments')
             case "memos":
                 self.populate_grid_generic(self.memos_grid, event.data, 'memos')
             case "summary":
@@ -1738,6 +1992,8 @@ class WalletApp(wx.Frame):
                         grid_name = "verification"
                     case self.summary_grid:
                         grid_name = "summary"
+                    case self.payments_grid:
+                        grid_name = "payments"
                     case self.memos_grid:
                         grid_name = "memos"
                     case _:
@@ -1775,14 +2031,15 @@ class WalletApp(wx.Frame):
         dialog = CustomDialog("Request Task", ["Task Request"])
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
-            response = self.task_manager.request_post_fiat(request_message=request_message)
             try:
-                if response:
-                    message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                    wx.MessageBox(message, 'Task Request Result', wx.OK | wx.ICON_INFORMATION)
+                response = self.task_manager.request_post_fiat(request_message=request_message)
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Request Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
             except Exception as e:
-                logger.error(f"Error converting response to status message: {e}")
-            wx.CallLater(30000, self.refresh_grids, None)
+                logger.error(f"Error requesting task: {e}")
+                wx.MessageBox(f"Error requesting task: {e}", 'Task Request Error', wx.OK | wx.ICON_ERROR)
         dialog.Destroy()
 
         self.btn_request_task.SetLabel("Request Task")
@@ -1804,6 +2061,10 @@ class WalletApp(wx.Frame):
                     task_id=task_id,
                     acceptance_string=acceptance_string
                 )
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Acceptance Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
             except NoMatchingTaskException as e:
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
@@ -1814,13 +2075,7 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
             else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Task Acceptance Result', wx.OK | wx.ICON_INFORMATION)
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.refresh_grids, None)
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -1842,21 +2097,24 @@ class WalletApp(wx.Frame):
                     task_id=task_id,
                     refusal_reason=refusal_reason
                 )
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Refusal Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+            except NoMatchingTaskException as e:
+                logger.error(f"Error refusing task: {e}")
+                wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
+            except WrongTaskStateException as e:
+                logger.error(f"Error refusing task: {e}")
+                wx.MessageBox(f"Task ID {task_id} is not in the correct state to be refused. Current status: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
             except Exception as e:
-                logger.error(f"Error sending refusal for task: {e}")
-                wx.MessageBox(f"Error sending refusal for task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
+                logger.error(f"Error refusing task: {e}")
+                wx.MessageBox(f"Error refusing task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
             else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Task Refusal Result', wx.OK | wx.ICON_INFORMATION)
-                    else:
-                        logger.error("No response from send_refusal_for_task")
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.refresh_grids, None)
-        dialog.Destroy()
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
+
+        dialog.Destroy()
         self.btn_refuse_task.SetLabel("Refuse Task")
         self.btn_refuse_task.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -1876,6 +2134,11 @@ class WalletApp(wx.Frame):
                     completion_string=completion_string,
                     task_id=task_id
                 )
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Task Submission Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
             except NoMatchingTaskException as e:
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
@@ -1886,16 +2149,7 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
             else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Task Submission Result', wx.OK | wx.ICON_INFORMATION)
-                    else:
-                        logger.error("No response from submit_initial_completion")
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
-                wx.CallLater(5000, self.refresh_grids, None)
-            
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
@@ -1907,8 +2161,8 @@ class WalletApp(wx.Frame):
         self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
         self.btn_submit_verification_details.Update()
 
-        task_id = self.txt_task_id.GetValue()
-        response_string = self.txt_verification_details.GetValue()
+        task_id = self.verification_txt_task_id.GetValue()
+        response_string = self.verification_txt_details.GetValue()
 
         if not task_id or not response_string:
             wx.MessageBox("Please enter a task ID and verification details", "Error", wx.OK | wx.ICON_ERROR)
@@ -1918,21 +2172,23 @@ class WalletApp(wx.Frame):
                     response_string=response_string,
                     task_id=task_id
                 )
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Verification Submission Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+            except NoMatchingTaskException as e:
+                logger.error(f"Error sending verification response: {e}")
+                wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
+            except WrongTaskStateException as e:
+                logger.error(f"Error sending verification response: {e}")
+                wx.MessageBox(f"Task ID {task_id} is not in the correct state for verification. Current status: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
             except Exception as e:
                 logger.error(f"Error sending verification response: {e}")
                 wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
             else:
-                try:
-                    if response:
-                        message = self.task_manager.ux__convert_response_object_to_status_message(response)
-                        wx.MessageBox(message, 'Verification Submission Result', wx.OK | wx.ICON_INFORMATION)
-                    else:
-                            logger.error("No response from send_verification_response")
-                except Exception as e:
-                    logger.error(f"Error converting response to status message: {e}")
-                else:
-                    self.txt_verification_details.SetValue("")
-                    self.txt_task_id.SetValue("")
+                self.verification_txt_details.SetValue("")
+                self.verification_txt_task_id.SetValue("")
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
@@ -1943,142 +2199,154 @@ class WalletApp(wx.Frame):
         self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
         self.btn_log_pomodoro.Update()
 
-        task_id = self.txt_task_id.GetValue()
-        pomodoro_text = self.txt_verification_details.GetValue()
+        task_id = self.verification_txt_task_id.GetValue()
+        pomodoro_text = self.verification_txt_details.GetValue()
 
         if not task_id or not pomodoro_text:
             wx.MessageBox("Please enter a task ID and pomodoro text", "Error", wx.OK | wx.ICON_ERROR)
         else:
-            response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
-            message = self.task_manager.ux__convert_response_object_to_status_message(response)
-            wx.MessageBox(message, 'Pomodoro Log Result', wx.OK | wx.ICON_INFORMATION)
+            try:
+                response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Pomodoro Log Result", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+            except Exception as e:
+                logger.error(f"Error logging pomodoro: {e}")
+                wx.MessageBox(f"Error logging pomodoro: {e}", 'Pomodoro Log Error', wx.OK | wx.ICON_ERROR)
+            else:
+                self.verification_txt_details.SetValue("")
 
-        self.txt_verification_details.SetValue("")
         self.btn_log_pomodoro.SetLabel("Log Pomodoro")
         self.btn_log_pomodoro.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_memo(self, event):
-        """Submits a memo to the remembrancer."""
+        """Submits a memo."""
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Memo...")
         self.btn_submit_memo.SetLabel("Submitting...")
         self.btn_submit_memo.Update()
-
         logger.info("Submitting Memo")
 
         memo_text = self.txt_memo_input.GetValue()
 
-        if not memo_text:
-            wx.MessageBox("Please enter a memo", "Error", wx.OK | wx.ICON_ERROR)
+        # Get selected recipient data
+        recipient_idx = self.memo_recipient.GetSelection()
+        if recipient_idx != wx.NOT_FOUND:
+            recipient = self.memo_recipient.GetClientData(recipient_idx)
         else:
-            logger.info(f"Memo Text: {memo_text}")
+            recipient = self.memo_recipient.GetValue()
 
-            # Estimate chunks needed with compression
-            compressed_text = compress_string(memo_text)
+        logger.debug(f"Selected recipient address: {recipient}")
+
+        encrypt = self.memo_chk_encrypt.IsChecked()
+
+        if not memo_text or not recipient:
+            wx.MessageBox("Please enter a memo and recipient", "Error", wx.OK | wx.ICON_ERROR)
+            self.btn_submit_memo.SetLabel("Submit Memo")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
+            return
+        
+        logger.debug(f"Preparing memo (encrypt={encrypt})")
+
+        try:
+            # First check if encryption is possible if requested
+            if encrypt:
+                logger.debug(f"Checking handshake for {recipient}")
+                handshake_sent, received_key = self.task_manager.get_handshake_for_address(recipient)
+                logger.debug(f"Handshake sent: {handshake_sent}, received key: {received_key}")
+                if not received_key:
+                    logger.debug(f"No received key for {recipient}")
+                    if not handshake_sent:
+                        logger.debug(f"Handshake not sent for {recipient}")
+                        if wx.YES == wx.MessageBox(
+                            "Encryption requires a handshake exchange. Would you like to send a handshake now?",
+                            "Handshake Required",
+                            wx.YES_NO | wx.ICON_QUESTION
+                        ):
+                            logger.debug(f"Sending handshake to {recipient}")
+                            response = self.task_manager.send_handshake(recipient)
+                            formatted_response = self.format_response(response)
+                            dialog = SelectableMessageDialog(self, "Handshake Submission Result", formatted_response)
+                            dialog.ShowModal()
+                            dialog.Destroy()
+                            wx.MessageBox(
+                                "Handshake sent. You'll need to wait for the recipient to send their handshake "
+                                "before you can send encrypted messages.\n\nWould you like to send this message "
+                                "unencrypted instead?",
+                                "Handshake Sent",
+                                wx.YES_NO | wx.ICON_INFORMATION
+                            )
+                            self._sync_and_refresh()
+                        self.btn_submit_memo.SetLabel("Submit Memo")
+                        self.set_wallet_ui_state(WalletUIState.IDLE)
+                        return
+                    else:
+                        if wx.NO == wx.MessageBox(
+                            "Still waiting for recipient's handshake. Would you like to send "
+                            "this message unencrypted instead?",
+                            "Handshake Pending",
+                            wx.YES_NO | wx.ICON_QUESTION
+                        ):
+                            self.btn_submit_memo.SetLabel("Submit Memo")
+                            self.set_wallet_ui_state(WalletUIState.IDLE)
+                            return
+                        encrypt = False
+
+            # Estimate chunks needed
+            test_memo = memo_text 
+            if encrypt:
+                # Add encryption overhead to size estimate
+                test_memo = self.task_manager.encrypt_memo(test_memo, received_key)
+
+            # Estimate compressed size
+            compressed_text = compress_string(test_memo)
             compressed_bytes = compressed_text.encode('utf-8')
             num_chunks = len(compressed_bytes) // MAX_CHUNK_SIZE
             if len(compressed_bytes) % MAX_CHUNK_SIZE != 0:
                 num_chunks += 1
 
             # Calculate uncompressed chunks for comparison
-            uncompressed_bytes = memo_text.encode('utf-8')
+            uncompressed_bytes = test_memo.encode('utf-8')
             uncompressed_chunks = len(uncompressed_bytes) // MAX_CHUNK_SIZE
             if len(uncompressed_bytes) % MAX_CHUNK_SIZE != 0:
-                uncompressed_chunks += 1
+                uncompressed_chunks += 1        
 
             if num_chunks > 1:
                 message = (
-                    f"Memo will be compressed and sent over {num_chunks} transactions "
-                    f"(reduced from {uncompressed_chunks} without compression) and "
+                    f"Memo will be encrypted, compressed and sent over {num_chunks} transactions "
+                    f"(compared to {uncompressed_chunks} without compression) and "
                     f"cost 1 PFT per chunk ({num_chunks} PFT total). Continue?"
                 )
                 if wx.NO == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
                     self.btn_submit_memo.SetLabel("Submit Memo")
                     return
-                    
-            logger.info("User confirmed, submitting memo")
-
-            try:
-                responses = self.task_manager.send_memo(REMEMBRANCER_ADDRESS, memo_text)
-                formatted_responses = [self.format_response(response) for response in responses]
-                logger.info(f"Memo Submission Result: {formatted_responses}")
-
-                for idx, formatted_response in enumerate(formatted_responses):
-                    if idx == 0:
-                        dialog = SelectableMessageDialog(self, f"Memo Submission Result", formatted_response)
-                    else:
-                        dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
-                    dialog.ShowModal()
-                    dialog.Destroy()
-
-            except Exception as e:
-                logger.error(f"Error submitting memo: {e}")
-                wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
+                
+            # Send the memo
+            responses = self.task_manager.send_memo(recipient, memo_text, encrypt=encrypt)
             
-        self.btn_submit_memo.SetLabel("Submit Memo")
-        self.txt_memo_input.SetValue("")
-        self.set_wallet_ui_state(WalletUIState.IDLE)
+            formatted_responses = [self.format_response(response) for response in responses]
+            logger.info(f"Memo Submission Result: {formatted_responses}")
 
-    def on_submit_xrp_payment(self, event):
-        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting XRP Payment...")
-        self.btn_submit_xrp_payment.SetLabel("Submitting...")
-        self.btn_submit_xrp_payment.Update()
-
-        # Check that Amount and Destination are valid
-        if not self.txt_xrp_amount.GetValue() or not self.txt_xrp_address_payment.GetValue():
-            wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
-        else:
-            response = self.task_manager.send_xrp(amount=self.txt_xrp_amount.GetValue(), 
-                                                            destination=self.txt_xrp_address_payment.GetValue(), 
-                                                            memo=self.txt_xrp_memo.GetValue(),
-                                                            destination_tag=self.txt_xrp_destination_tag.GetValue()
-            )
-            logger.debug(f"response: {response}")
-            formatted_response = self.format_response(response)
-
-            logger.info(f"XRP Payment Result: {formatted_response}")
-
-            dialog = SelectableMessageDialog(self, "XRP Payment Result", formatted_response)
-            dialog.ShowModal()
-            dialog.Destroy()
-
-        self.btn_submit_xrp_payment.SetLabel("Submit Payment")
-        self.btn_submit_xrp_payment.Update()
-        self.set_wallet_ui_state(WalletUIState.IDLE)
-
-    def on_submit_pft_payment(self, event):
-        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting PFT Payment...")
-        self.btn_submit_pft_payment.SetLabel("Submitting...")
-        self.btn_submit_pft_payment.Update()
-
-        # Check that Amount and Destination are valid
-        if not self.txt_pft_amount.GetValue() or not self.txt_pft_address_payment.GetValue():
-            wx.MessageBox("Please enter a valid amount and destination", "Error", wx.OK | wx.ICON_ERROR)
-        else:
-            if is_over_1kb(self.txt_pft_memo.GetValue()):
-                memo_chunks = self.task_manager._get_memo_chunks(self.txt_pft_memo.GetValue())
-                message = f"Memo is over 1 KB, transaction will be batch-sent over {len(memo_chunks)} transactions. Continue?"
-                if wx.YES == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
-                    pass
+            for idx, formatted_response in enumerate(formatted_responses):
+                if idx == 0:
+                    dialog = SelectableMessageDialog(self, f"Memo Submission Result", formatted_response)
                 else:
-                    self.btn_submit_pft_payment.SetLabel("Submit Payment")
-                    return
+                    dialog = SelectableMessageDialog(self, f"Memo Submission Result {idx + 1}", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
 
-            response = self.task_manager.send_pft(amount=self.txt_pft_amount.GetValue(), 
-                                                    destination=self.txt_pft_address_payment.GetValue(), 
-                                                    memo=self.txt_pft_memo.GetValue()
-            )
-            formatted_response = self.format_response(response)
+        except Exception as e:
+            logger.error(f"Error submitting memo: {e}")
+            wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
+        else:
+            self.txt_memo_input.SetValue("")
+            wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
-            logger.info(f"PFT Payment Result: {formatted_response}")
 
-            dialog = SelectableMessageDialog(self, "PFT Payment Result", formatted_response)
-            dialog.ShowModal()
-            dialog.Destroy()
-
-        self.btn_submit_pft_payment.SetLabel("Submit Payment")
-        self.btn_submit_pft_payment.Update()
+        self.btn_submit_memo.SetLabel("Submit Memo")
         self.set_wallet_ui_state(WalletUIState.IDLE)
+
     def on_show_secret(self, event):
         dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your secret.")
 
@@ -2105,12 +2373,6 @@ class WalletApp(wx.Frame):
         else:
             dialog.Destroy()
 
-    def validate_password(self, password):
-        """Validate password requirements"""
-        if len(password) < 8:
-            return False, "Password must be at least 8 characters long"
-        return True, ""
-
     def on_change_password(self, event):
         """Handle password change request"""
         dialog = ChangePasswordDialog(self)
@@ -2126,18 +2388,15 @@ class WalletApp(wx.Frame):
                         raise ValueError("Incorrect password")
 
                     # Validate new password
-                    is_valid, error_message = self.validate_password(new_password)
-                    if not is_valid:
-                        raise ValueError(error_message)
+                    if not CredentialManager.is_valid_password(new_password):
+                        raise ValueError("Invalid password. Must be at least 8 characters long and contain only letters, numbers, or basic symbols")
                         
                     # Check if passwords match
                     if new_password != confirm_password:
                         raise ValueError("New passwords do not match")
                         
                     # Attempt password change
-                    success = self.task_manager.credential_manager.change_password(
-                        current_password, new_password
-                    )
+                    success = self.task_manager.change_password(new_password)
                     
                     if success:
                         wx.MessageBox(
@@ -2206,7 +2465,8 @@ class WalletApp(wx.Frame):
         if hasattr(response, 'status') and response.status == "success":
             tx_json = response.result.get('tx_json', {})
             meta = response.result.get('meta', {})
-            livenet_link = f"https://livenet.xrpl.org/transactions/{response.result.get('hash', 'N/A')}"
+            hash = response.result.get('hash', 'N/A')
+            livenet_link = self.task_manager.get_explorer_transaction_url(hash)
 
             # Determine the currency and amount
             deliver_max = tx_json.get('DeliverMax', '0')
@@ -2245,7 +2505,7 @@ class WalletApp(wx.Frame):
             return formatted_response
         
         elif hasattr(self, 'wallet.classic_address'):
-            livenet_link = f"https://livenet.xrpl.org/accounts/{self.wallet.classic_address}"
+            livenet_link = self.task_manager.get_explorer_account_url(self.wallet.address)
 
             formatted_response = (
                 f"Transaction Failed\n"
@@ -2267,6 +2527,10 @@ class WalletApp(wx.Frame):
             int(color.Blue() * factor),
             color.Alpha()
         )
+    
+    def on_migrate_credentials(self, event):
+        """Handle migration of old credentials"""
+        check_and_show_migration_dialog(parent=self, force=True)
     
     def launch_perf_monitor(self, event=None):
         """Toggle the performance monitor on and off"""
@@ -2298,12 +2562,13 @@ class WalletApp(wx.Frame):
                     self.perf_monitor.shutdown_event.set()
         dialog.Destroy()
 
-    def set_wallet_ui_state(self, state: WalletUIState, message: str = ""):
+    def set_wallet_ui_state(self, state: WalletUIState=None, message: str = ""):
         """Update the status bar with current wallet state"""
-        self.current_ui_state = state
-        status_text = message or f"Wallet state: {state.name.lower()}"
+        if state:
+            self.current_ui_state = state
+        status_text = message or f"Wallet state: {self.current_ui_state.name.lower()}"
         self.status_bar.SetStatusText(status_text, 0)
-        self.status_bar.SetStatusText(state.name, 1)
+        self.status_bar.SetStatusText(self.current_ui_state.name, 1)
 
     def is_wallet_busy(self):
         """Check if wallet is in a busy state"""
@@ -2366,6 +2631,17 @@ class WalletApp(wx.Frame):
                 logger.debug("Clearing wallet")
                 self.wallet = None
 
+            # Clear grids
+            logger.debug("Clearing grids")
+            for grid_name in self.GRID_CONFIGS:
+                grid = getattr(self, f"{grid_name}_grid", None)
+                if grid and grid.GetNumberRows() > 0:
+                    grid.DeleteRows(0, grid.GetNumberRows())
+
+            # Clear miscellaneous text fields
+            self.txt_memo_input.SetValue("")
+            self.verification_txt_details.SetValue("")
+
             self.tabs.Hide()
 
             # Reset menu state
@@ -2386,6 +2662,59 @@ class WalletApp(wx.Frame):
         except Exception as e:
             logger.error(f"Error during logout: {e}")
             wx.MessageBox(f"Error during logout: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_manage_contacts(self, event):
+        """Handle manage contacts request"""
+        dialog = ContactsDialog(self)
+        if dialog.ShowModal() == wx.ID_OK:
+            self.refresh_grids()
+            self.update_all_destination_comboboxes()
+        dialog.Destroy()
+
+    def show_payment_confirmation(self, amount, destination, token_type):
+        """Show payment confirmation dialog"""
+        dialog = ConfirmPaymentDialog(self, amount, destination, token_type)
+        result = dialog.ShowModal()
+
+        if result == wx.ID_OK:
+            # Save contact if requested
+            contact_name = dialog.get_contact_info()
+            if contact_name:
+                self.task_manager.save_contact(destination, contact_name)
+                self.update_all_destination_comboboxes()
+        dialog.Destroy()
+        return result == wx.ID_OK
+    
+    def on_encryption_requests(self, event):
+        """Show the encryption requests dialog"""
+        dialog = EncryptionRequestsDialog(self)
+        dialog.ShowModal()
+        dialog.Destroy()
+
+    def try_connect_endpoint(self, endpoint: str) -> bool:
+        """
+        Attempt to connect to a new RPC endpoint with timeout.
+        
+        Args:
+            endpoint: The RPC endpoint URL to test
+            timeout: Maximum time to wait for connection in seconds
+            
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
+        try:
+            # Create a JsonRpcClient for the endpoint
+            client = xrpl.clients.JsonRpcClient(endpoint)
+            
+            # Try to get server info as a connection test
+            response = client.request(xrpl.models.requests.ServerInfo())
+            
+            # If we got a response without error, connection was successful
+            return response.is_successful()
+
+        except Exception as e:
+            logger.error(f"Connection test failed for {endpoint}: {e}")
+            return False
 
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
@@ -2483,11 +2812,10 @@ class DeleteCredentialsDialog(wx.Dialog):
 
         warning_text = (
             "WARNING: This action cannot be undone!\n\n"
-            "• All local credentials will be deleted for this account.\n"
-            "• Your XRP wallet will remain on the XRPL but you will lose access\n"
-            "• Any PFT tokens in your wallet will become inaccessible\n\n"
-            "MAKE SURE YOU HAVE BACKED UP YOUR XRP SECRET KEY\n"
-            "BEFORE PROCEEDING!\n\n"
+            "• All local credentials and saved contacts will be deleted for this account.\n"
+            "• Your XRP wallet will remain on the XRPL but you will lose access.\n"
+            "• Any PFT tokens in your wallet will become inaccessible.\n\n"
+            "MAKE SURE YOU HAVE BACKED UP YOUR XRP SECRET KEY BEFORE PROCEEDING!\n\n"
         )
 
         warning_label = wx.StaticText(self, label=warning_text)
@@ -2541,45 +2869,189 @@ class DeleteCredentialsDialog(wx.Dialog):
     def on_cancel(self, event):
         self.EndModal(wx.ID_CANCEL)
 
+class EncryptionRequestsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Encryption Requests", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.parent: WalletApp = parent
+        self.task_manager: PostFiatTaskManager = parent.task_manager
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        help_text = (
+            "This dialog shows the status of encryption setup with other users.\n\n"
+            "• When you receive a handshake request, it appears in the 'Received' column\n"
+            "• After you send a handshake, the time appears in the 'Sent' column\n"
+            "• Encryption is ready when both handshakes are exchanged\n\n"
+            "Select a received request and click 'Accept' to enable encrypted messaging with that user."
+        )
+        text = wx.StaticText(self, label=help_text)
+        text.Wrap(450)
+        sizer.Add(text, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Create list control
+        self.list_ctrl = wx.ListCtrl(self, style=wx.LC_REPORT | wx.BORDER_SUNKEN | wx.LC_SINGLE_SEL)
+        self.list_ctrl.InsertColumn(0, "From", width=300)
+        self.list_ctrl.InsertColumn(1, "Received", width=150)
+        self.list_ctrl.InsertColumn(2, "Sent", width=150)
+        self.list_ctrl.InsertColumn(3, "Encryption Ready", width=110)
+        sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Add buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.accept_btn = wx.Button(self, label="Accept")
+        self.accept_btn.Bind(wx.EVT_BUTTON, self.on_accept)
+        btn_sizer.Add(self.accept_btn, 0, wx.RIGHT, 5)
+        
+        self.close_btn = wx.Button(self, label="Close")
+        self.close_btn.Bind(wx.EVT_BUTTON, self.on_close)
+        btn_sizer.Add(self.close_btn)
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        self.SetSizer(sizer)
+        self.load_requests()
+
+        # Enable/disable accept button based on selection
+        self.accept_btn.Enable(False)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_selection_changed)
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_selection_changed)
+
+        start_size = (800, 400)
+        self.SetSize(start_size)
+        self.SetMinSize(start_size)
+
+    def on_selection_changed(self, event):
+        """Enable accept button if an item is selected and not already accepted"""
+        idx = self.list_ctrl.GetFirstSelected()
+        if idx != -1:
+            handshakes = self.task_manager.get_handshakes()
+            selected_handshake = handshakes.iloc[self.list_ctrl.GetItemData(idx)]
+            # Only enable Accept if we received a handshake but haven't sent one
+            can_accept = (pd.notna(selected_handshake['received_at']) and pd.isna(selected_handshake['sent_at']))
+            self.accept_btn.Enable(can_accept)
+        else:
+            self.accept_btn.Enable(False)
+
+    def load_requests(self):
+        """Load pending encryption requests into the list control"""
+        self.list_ctrl.DeleteAllItems()
+        handshakes = self.task_manager.get_handshakes()
+
+        for idx, handshake in handshakes.iterrows():
+            index = self.list_ctrl.GetItemCount()
+            display_name = handshake['contact_name'] if pd.notna(handshake['contact_name']) else handshake['address']
+            self.list_ctrl.InsertItem(index, display_name)
+
+            # Show received time or "Not received" if we haven't received a handshake
+            received_at = handshake['received_at']
+            if pd.notna(received_at):  # check if timestamp is not NaT/None
+                self.list_ctrl.SetItem(index, 1, received_at.strftime('%Y-%m-%d %H:%M:%S'))
+            else:
+                self.list_ctrl.SetItem(index, 1, "")
+
+            # Show accepted time or "Not sent" if we haven't sent a handshake
+            sent_at = handshake['sent_at']
+            if pd.notna(sent_at):  # check if timestamp is not NaT/None
+                self.list_ctrl.SetItem(index, 2, sent_at.strftime('%Y-%m-%d %H:%M:%S'))
+            else:
+                self.list_ctrl.SetItem(index, 2, "")
+
+            # Show encryption ready status
+            encryption_ready = handshake['encryption_ready']
+            self.list_ctrl.SetItem(index, 3, "Yes" if encryption_ready else "No")
+
+            self.list_ctrl.SetItemData(index, idx)
+
+    def on_accept(self, event):
+        idx = self.list_ctrl.GetFirstSelected()
+        if idx == -1:
+            return
+        
+        address = self.task_manager.get_handshakes().iloc[self.list_ctrl.GetItemData(idx)]['address']
+        
+        try:
+            response = self.task_manager.send_handshake(address)
+            formatted_response = self.parent.format_response(response)
+            handshake_dialog = SelectableMessageDialog(self, "Handshake Sent", formatted_response)
+            handshake_dialog.ShowModal()
+            handshake_dialog.Destroy()
+            self.parent._sync_and_refresh()
+            self.load_requests()
+        except Exception as e:
+            wx.MessageBox(f"Failed to send handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_close(self, event):
+        self.Close()
 
 class PreferencesDialog(wx.Dialog):
     def __init__(self, parent):
         super().__init__(parent, title="Preferences")
-        self.config = parent.config
-        self.InitUI()
+        self.config: ConfigurationManager = parent.config
+        self.parent: WalletApp = parent
 
-    def InitUI(self):
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
 
-        # Create a static box for grouping preferences
-        sb = wx.StaticBox(panel, label="Application Settings")
-        sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
+        # Application Settings Box
+        app_sb = wx.StaticBox(panel, label="Application Settings")
+        app_sbs = wx.StaticBoxSizer(app_sb, wx.VERTICAL)
+
+        # Require password for payment checkbox
+        self.require_password_for_payment = wx.CheckBox(panel, label="Require password for payment")
+        self.require_password_for_payment.SetValue(self.config.get_global_config('require_password_for_payment'))
+        app_sbs.Add(self.require_password_for_payment, 0, wx.ALL | wx.EXPAND, 5)
 
         # Performance Monitor checkbox
         self.perf_monitor = wx.CheckBox(panel, label="Enable Performance Monitor")
         self.perf_monitor.SetValue(self.config.get_global_config('performance_monitor'))
-        sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
+        app_sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
 
         # Cache Format radio buttons
         cache_box = wx.StaticBox(panel, label="Transaction Cache Format")
-        cache_sbs = wx.StaticBoxSizer(cache_box, wx.VERTICAL)
-
+        cache_sbs = wx.StaticBoxSizer(cache_box, wx.HORIZONTAL)
         self.cache_csv = wx.RadioButton(panel, label="CSV", style=wx.RB_GROUP)
         self.cache_pickle = wx.RadioButton(panel, label="Pickle")
-
         current_format = self.config.get_global_config("transaction_cache_format")
-        if current_format == "csv":
-            self.cache_csv.SetValue(True)
-        else:
-            self.cache_pickle.SetValue(True)
+        self.cache_csv.SetValue(current_format == "csv")
+        self.cache_pickle.SetValue(current_format != "csv")
+        cache_sbs.Add(self.cache_csv, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        cache_sbs.Add(self.cache_pickle, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        app_sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
 
-        cache_sbs.Add(self.cache_csv, 0, wx.ALL, 5)
-        cache_sbs.Add(self.cache_pickle, 0, wx.ALL, 5)
-        sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
+        vbox.Add(app_sbs, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Network Settings Box
+        net_sb = wx.StaticBox(panel, label="Network Settings")
+        net_sbs = wx.StaticBoxSizer(net_sb, wx.VERTICAL)
+
+        # Network selection radio buttons
+        network_box = wx.StaticBox(panel, label="XRPL Network")
+        network_sbs = wx.StaticBoxSizer(network_box, wx.HORIZONTAL)
+        self.mainnet_radio = wx.RadioButton(panel, label="Mainnet", style=wx.RB_GROUP)
+        self.testnet_radio = wx.RadioButton(panel, label="Testnet")
+        use_testnet = self.config.get_global_config('use_testnet')
+        self.testnet_radio.SetValue(use_testnet)
+        self.mainnet_radio.SetValue(not use_testnet)
+        network_sbs.Add(self.mainnet_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        network_sbs.Add(self.testnet_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        net_sbs.Add(network_sbs, 0, wx.ALL | wx.EXPAND, 5)
+
+        # RPC Endpoint selection
+        endpoint_box = wx.BoxSizer(wx.HORIZONTAL)
+        endpoint_box.Add(wx.StaticText(panel, label="RPC Endpoint:"), 0, wx.CENTER | wx.ALL, 5)
+        self.endpoint_combo = wx.ComboBox(panel, style=wx.CB_DROPDOWN | wx.TE_PROCESS_ENTER)
+        self.update_endpoint_combo()
+        endpoint_box.Add(self.endpoint_combo, 1, wx.EXPAND | wx.ALL, 5)
+        net_sbs.Add(endpoint_box, 0, wx.EXPAND | wx.ALL, 5)
 
         # Add the static box to the main vertical box
-        vbox.Add(sbs, 0, wx.ALL | wx.EXPAND, 10)
+        vbox.Add(net_sbs, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Bind events
+        self.mainnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
+        self.testnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
+        self.endpoint_combo.Bind(wx.EVT_COMBOBOX, self.on_endpoint_selected)
+        self.endpoint_combo.Bind(wx.EVT_TEXT_ENTER, self.on_endpoint_text_enter)
 
         # Add OK and Cancel buttons
         button_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -2594,13 +3066,271 @@ class PreferencesDialog(wx.Dialog):
 
         panel.SetSizer(vbox)
         vbox.Fit(panel)
+
+        self.SetMinSize((500, -1))
+        self.SetSize(self.GetBestSize())
         self.Center()
+
+    # def on_endpoint_text_changed(self, event):
+    #     """Handle endpoint text changes"""
+    #     event.Skip()
+
+    def update_endpoint_combo(self):
+        """Update endpoint combobox based on selected network"""
+        current = self.config.get_current_endpoint()
+        recent = self.config.get_network_endpoints()
+
+        # Get the desired list of items (current first, then others)
+        desired_items = [current] + [ep for ep in recent if ep != current]
+        
+        # Remove any items that shouldn't be there
+        count = self.endpoint_combo.GetCount()
+        for i in range(count-1, -1, -1):  # Iterate backwards to safely remove items
+            if self.endpoint_combo.GetString(i) not in desired_items:
+                self.endpoint_combo.Delete(i)
+        
+        # Add any missing items
+        existing_items = [self.endpoint_combo.GetString(i) for i in range(self.endpoint_combo.GetCount())]
+        for item in desired_items:
+            if item not in existing_items:
+                self.endpoint_combo.Append(item)
+    
+        # Set the value without clearing first
+        self.endpoint_combo.SetValue(current)
+        self.endpoint_combo.Refresh()
+        self.endpoint_combo.Update()
+
+    def on_network_changed(self, event):
+        """Handle network selection change"""
+        self.update_endpoint_combo()
+
+    def on_endpoint_selected(self, event):
+        """Handle endpoint selection from dropdown"""
+        selected_endpoint = self.endpoint_combo.GetValue()
+        
+        # Ensure the selected value is displayed in the combobox
+        self.endpoint_combo.SetValue(selected_endpoint)
+        
+        # Process the endpoint change
+        self.handle_endpoint_change(selected_endpoint)
+
+    def on_endpoint_text_enter(self, event):
+        """Handle endpoint text entry"""
+        self.handle_endpoint_change(self.endpoint_combo.GetValue())
+
+    def handle_endpoint_change(self, new_endpoint: str):
+        """Handle endpoint selection/entry"""
+        new_endpoint = new_endpoint.strip()
+
+        if not new_endpoint:
+            return
+        
+        try:
+            # Store current endpoint for fallback
+            current_endpoint = self.config.get_current_endpoint()
+
+            # Attempt to connect with timeout
+            success = self.parent.try_connect_endpoint(new_endpoint)
+
+            if success:
+                self.config.set_current_endpoint(new_endpoint)
+                self.update_endpoint_combo()
+
+                # Update the main WalletApp's network_url
+                self.parent.network_url = new_endpoint
+                self.parent.update_network_display()
+                logger.debug(f"Updated WalletApp network_url to: {self.parent.network_url}")
+            else:
+                wx.MessageBox(
+                    "Failed to connect to endpoint. Reverting to previous endpoint.",
+                    "Connection Failed",
+                    wx.OK | wx.ICON_ERROR
+                )
+                # Revert to previous endpoint
+                self.config.set_current_endpoint(current_endpoint)
+                self.update_endpoint_combo()
+        except Exception as e:
+            wx.MessageBox(
+                f"Error connecting to endpoint: {e}",
+                "Connection Error",
+                wx.OK | wx.ICON_ERROR
+            )
+            self.update_endpoint_combo()
 
     def on_ok(self, event):
         """Save config when OK is clicked"""
+        # Check if network setting changed
+        old_network = self.config.get_global_config('use_testnet')
+        new_network = self.testnet_radio.GetValue()
+
+        if old_network != new_network:
+            wx.MessageBox("Network change requires a restart to take effect", "Restart Required", wx.OK | wx.ICON_WARNING)
+            
+        self.config.set_global_config('use_testnet', new_network)
+        self.config.set_global_config('require_password_for_payment', self.require_password_for_payment.GetValue())
         self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
         self.config.set_global_config('transaction_cache_format', 'csv' if self.cache_csv.GetValue() else 'pickle')
         self.EndModal(wx.ID_OK)
+
+class ContactsDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Manage Contacts", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.task_manager: PostFiatTaskManager = parent.task_manager
+        self.changes_made = False
+
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Contacts list 
+        self.contacts_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.BORDER_SUNKEN)
+        self.contacts_list.InsertColumn(0, "Name", width=150)
+        self.contacts_list.InsertColumn(1, "Address", width=300)
+        sizer.Add(self.contacts_list, 1, wx.EXPAND | wx.ALL, 5)
+
+        # Add contact section
+        add_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.name_ctrl = wx.TextCtrl(panel)
+        self.address_ctrl = wx.TextCtrl(panel)
+
+        add_sizer.Add(wx.StaticText(panel, label="Name:"), 0, wx.CENTER | wx.ALL, 5)
+        add_sizer.Add(self.name_ctrl, 1, wx.EXPAND | wx.ALL, 5)
+        add_sizer.Add(wx.StaticText(panel, label="Address:"), 0, wx.CENTER | wx.ALL, 5)
+        add_sizer.Add(self.address_ctrl, 1, wx.EXPAND | wx.ALL, 5)
+        
+        sizer.Add(add_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        add_btn = wx.Button(panel, label="Add Contact")
+        del_btn = wx.Button(panel, label="Delete Contact")
+        close_btn = wx.Button(panel, label="Close")
+        btn_sizer.Add(add_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(del_btn, 0, wx.ALL, 5)
+        btn_sizer.Add(close_btn, 0, wx.ALL, 5)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 5)
+        
+        panel.SetSizer(sizer)
+
+        start_size = (600, 400)
+        self.SetSize(start_size)
+        self.SetMinSize(start_size)
+        
+        # Bind events
+        add_btn.Bind(wx.EVT_BUTTON, self.on_add)
+        del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
+        close_btn.Bind(wx.EVT_BUTTON, self.on_close)
+        
+        self.load_contacts()
+
+    def load_contacts(self):
+        """Reload contacts list from storage"""
+        self.contacts_list.DeleteAllItems()
+        contacts = self.task_manager.get_contacts()
+        for address, name in contacts.items():
+            index = self.contacts_list.GetItemCount()
+            self.contacts_list.InsertItem(index, name)
+            self.contacts_list.SetItem(index, 1, address)
+        self.contacts_list.Layout()
+        self.Layout()
+
+    def on_add(self, event):
+        name = self.name_ctrl.GetValue().strip()
+        address = self.address_ctrl.GetValue().strip()
+        if name and address:
+            logger.debug(f"Saving contact: {name} - {address}")
+            try:
+                self.task_manager.save_contact(address, name)
+            except ValueError as e:
+                wx.MessageBox(f"Error saving contact: {e}", 'Error', wx.OK | wx.ICON_ERROR)
+                return
+            else:
+                self.load_contacts()
+                self.name_ctrl.SetValue("")
+                self.address_ctrl.SetValue("")
+                self.changes_made = True
+
+    def on_delete(self, event):
+        index = self.contacts_list.GetFirstSelected()
+        if index >= 0:
+            name = self.contacts_list.GetItem(index, 0).GetText()
+            address = self.contacts_list.GetItem(index, 1).GetText()
+            logger.debug(f"Deleting contact: {name} - {address}")
+            self.task_manager.delete_contact(address)
+            self.load_contacts()
+            self.changes_made = True
+
+    def on_close(self, event):
+        """Handle dialog close"""
+        if self.changes_made:
+            self.EndModal(wx.ID_OK)
+        else:
+            self.EndModal(wx.ID_CANCEL)
+
+class ConfirmPaymentDialog(wx.Dialog):
+    def __init__(self, parent, amount, destination, token_type):
+        super().__init__(parent, title="Confirm Payment", style=wx.DEFAULT_DIALOG_STYLE)
+        self.task_manager = parent.task_manager
+        self.destination = destination
+    
+        # Check if destination is a known contact
+        contacts = self.task_manager.get_contacts()
+        contact_name = contacts.get(destination)
+
+        self.InitUI(amount, destination, token_type, contact_name)
+        self.Fit()
+        self.Center()
+
+    def InitUI(self, amount, destination, token_type, contact_name):
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Create messge with contact name if it exists
+        if contact_name:
+            message = f"Send {amount} {token_type} to {contact_name} ({destination})?"
+        else:
+            message = f"Send {amount} {token_type} to {destination}?"
+
+        msg_text = wx.StaticText(self, label=message)
+        msg_text.Wrap(400)
+        sizer.Add(msg_text, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Only show contact controls if this isn't already a contact
+        if not contact_name:
+            # Add save contact checkbox and name input
+            self.save_contact = wx.CheckBox(self, label="Save as contact")
+            self.contact_name = wx.TextCtrl(self)
+            self.contact_name.Hide()
+
+            sizer.Add(self.save_contact, 0, wx.ALL, 5)
+            sizer.Add(self.contact_name, 0, wx.EXPAND | wx.ALL, 5)
+
+            self.save_contact.Bind(wx.EVT_CHECKBOX, self.on_checkbox)
+
+        # Button sizer
+        btn_sizer = wx.StdDialogButtonSizer()
+
+        self.ok_btn = wx.Button(self, wx.ID_OK, "Send")
+        self.ok_btn.SetDefault()
+        btn_sizer.AddButton(self.ok_btn)
+
+        cancel_btn = wx.Button(self, wx.ID_CANCEL, "Cancel")
+        btn_sizer.AddButton(cancel_btn)
+
+        btn_sizer.Realize()
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+
+        self.SetSizer(sizer)
+
+    def on_checkbox(self, event):
+        """Handle checkbox toggle"""
+        self.contact_name.Show(self.save_contact.GetValue())
+        self.Fit() # Resize dialog to fit new size
+
+    def get_contact_info(self):
+        """Return contact info if saving was requested"""
+        if not hasattr(self, 'save_contact') or not self.save_contact.GetValue():
+            return None
+        name = self.contact_name.GetValue().strip()
+        return name if name else None
 
 def main():
     logger.info("Starting Post Fiat Wallet")

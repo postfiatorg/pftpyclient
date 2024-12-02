@@ -1,11 +1,9 @@
-from pftpyclient.user_login.credential_input import CredentialManager, cache_credentials
+from pftpyclient.user_login.credentials import CredentialManager
 import xrpl
-from xrpl.wallet import Wallet
 from xrpl.models.requests import AccountTx
-from xrpl.models.transactions import Payment, Memo
+from xrpl.models.transactions import Memo
 from xrpl.utils import str_to_hex
 from pftpyclient.basic_utilities.settings import *
-import asyncio
 import nest_asyncio
 import pandas as pd
 import numpy as np
@@ -14,9 +12,6 @@ import binascii
 import re
 import random 
 import string
-import re
-from browser_history import get_history
-from sec_cik_mapper import StockMapper
 import datetime
 import os 
 from pftpyclient.basic_utilities.settings import DATADUMP_DIRECTORY_PATH
@@ -38,119 +33,49 @@ from pftpyclient.task_manager.wallet_state import (
     PFT_STATES
 )
 from pftpyclient.performance.monitor import PerformanceMonitor
-from pftpyclient.configuration.configuration import ConfigurationManager
+from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
 nest_asyncio.apply()
-
+from pftpyclient.configuration.constants import *
+from cryptography.fernet import Fernet
+import pftpyclient.configuration.constants as constants
 MAX_CHUNK_SIZE = 760
 
-SAVE_MEMOS = False
-SAVE_TASKS = False
-
-AUTO_INITIALIZE = False
-
-class WalletInitiationFunctions:
-    def __init__(self, input_map, network_url, user_commitment=""):
-        """
-        input_map = {
-            'Username_Input': Username,
-            'Password_Input': Password,
-            'Google Doc Share Link_Input': Google Doc Share Link,
-            'XRP Address_Input': XRP Address,
-            'XRP Secret_Input': XRP Secret,
-        }
-        """
-        self.network_url = network_url
-        self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
-        self.username = input_map['Username_Input']
-        self.google_doc_share_link = input_map.get('Google Doc Share Link_Input', None)
-        self.xrp_address = input_map['XRP Address_Input']
-        self.wallet = xrpl.wallet.Wallet.from_seed(input_map['XRP Secret_Input'])
-        self.user_commitment = user_commitment
-        self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
-
-    def get_xrp_balance(self):
-        return get_xrp_balance(self.network_url, self.wallet.classic_address)
-
-    def handle_trust_line(self):
-        return handle_trust_line(self.network_url, self.pft_issuer, self.wallet)
-    
-    def get_google_doc_text(self, share_link):
-        return get_google_doc_text(share_link)
-
-    @requires_wallet_state(TRUSTLINED_STATES)
-    @PerformanceMonitor.measure('send_initiation_rite')
-    def send_initiation_rite(self):
-        memo = construct_initiation_rite_memo(user=self.username, commitment=self.user_commitment)
-        return send_xrp(network_url=self.network_url,
-                        wallet=self.wallet, 
-                        amount=1, 
-                        destination=self.default_node, 
-                        memo=memo)
-
-    def get_account_info(self, accountId):
-        """get_account_info"""
-        client = xrpl.clients.JsonRpcClient(self.network_url)
-        acct_info = xrpl.models.requests.account_info.AccountInfo(
-            account=accountId,
-            ledger_index="validated"
-        )
-        response = client.request(acct_info)
-        return response.result['account_data']
-    
-    def check_if_google_doc_is_valid(self):
-        """ Checks if the google doc is valid by """
-
-        # Check 1: google doc is a valid url
-        if not self.google_doc_share_link.startswith('https://docs.google.com/document/d/'):
-            raise InvalidGoogleDocException(self.google_doc_share_link)
-        
-        google_doc_text = self.get_google_doc_text(self.google_doc_share_link)
-
-        # Check 2: google doc exists
-        if google_doc_text == "Failed to retrieve the document. Status code: 404":
-            raise GoogleDocNotFoundException(self.google_doc_share_link)
-
-        # Check 3: google doc is shared
-        if google_doc_text == "Failed to retrieve the document. Status code: 401":
-            raise GoogleDocIsNotSharedException(self.google_doc_share_link)
-        
-        # Check 4: google doc contains the correct XRP address at the top
-        if retrieve_xrp_address_from_google_doc(google_doc_text) != self.xrp_address:
-            raise GoogleDocDoesNotContainXrpAddressException(self.xrp_address)
-        
-        # Check 5: XRP address has a balance
-        if self.get_xrp_balance() == 0:
-            raise GoogleDocIsNotFundedException(self.google_doc_share_link)
-    
-    @staticmethod
-    def cache_credentials(input_map):
-        """ Caches the user's credentials """
-        return cache_credentials(input_map)
+SAVE_MEMO_TRANSACTIONS = True
+SAVE_TASKS = True
+SAVE_MEMOS = True
+SAVE_SYSTEM_MEMOS = True
 
 class PostFiatTaskManager:
     
     def __init__(self, username, password, network_url, config: ConfigurationManager):
         self.credential_manager=CredentialManager(username,password)
-        self.pw_map = self.credential_manager.decrypt_creds(self.credential_manager.pw_initiator)
-        self.network_url= network_url
-        self.treasury_wallet_address = 'r46SUhCzyGE4KwBnKQ6LmDmJcECCqdKy4q'
-        self.pft_issuer = 'rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW'
-        self.trust_line_default = '100000000'
-        self.default_node = 'r4yc85M1hwsegVGZ1pawpZPwj65SVs8PzD'
-        self.user_wallet = self.spawn_user_wallet()
-        self.google_doc_link = self.pw_map.get(self.credential_manager.google_doc_name, None)
-
         self.config = config
+        self.network_config = get_network_config()
+        self.network_url = self.config.get_current_endpoint()
+        self.default_node = self.network_config.node_address
+        self.pft_issuer = self.network_config.issuer_address
 
+        self.user_wallet = self.spawn_user_wallet()
+        self.google_doc_link = self.credential_manager.get_credential('googledoc')
+
+        # initialize dataframe filepaths for caching
+        use_testnet = self.config.get_global_config('use_testnet')
+        network_suffix = '_TESTNET' if use_testnet else ''
         file_extension = 'pkl' if self.config.get_global_config('transaction_cache_format') == 'pickle' else 'csv'
-
-        # initialize dataframes
-        self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_transaction_history.{file_extension}")
-        self.memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_memos.{file_extension}")  # only used for debugging
-        self.tasks_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.classic_address}_tasks.{file_extension}")  # only used for debugging
+        self.tx_history_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_transaction_history.{file_extension}")
+        self.memo_tx_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_memo_transactions.{file_extension}")
+        self.memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_memos.{file_extension}")  # only used for debugging
+        self.tasks_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_tasks.{file_extension}")  # only used for debugging
+        self.system_memos_filepath = os.path.join(DATADUMP_DIRECTORY_PATH, f"{self.user_wallet.address}{network_suffix}_system_memos.{file_extension}")  # only used for debugging
+        
+        # initialize dataframes for caching
         self.transactions = pd.DataFrame()
-        self.memos = pd.DataFrame()
+        self.memo_transactions = pd.DataFrame()
         self.tasks = pd.DataFrame()
+        self.memos = pd.DataFrame()
+        self.system_memos = pd.DataFrame()
+
+        self.handshake_cache = {}  # Address -> (handshake_sent, received_key)
 
         # Initialize client for blockchain queries
         self.client = xrpl.clients.JsonRpcClient(self.network_url)
@@ -160,11 +85,6 @@ class PostFiatTaskManager:
 
         # Initialize wallet state based on account status
         self.wallet_state = self.determine_wallet_state()
-        
-        if AUTO_INITIALIZE:
-            self.handle_trust_line()
-            self.handle_google_doc()
-            self.handle_genesis()
 
     def get_xrp_balance(self):
         return get_xrp_balance(self.network_url, self.user_wallet.classic_address)
@@ -221,11 +141,6 @@ class PostFiatTaskManager:
                 return "No action required, Wallet is fully initialized"
             case _:
                 return "Unknown wallet state"
-
-    def has_trust_line(self):
-        """Checks if the user has a trust line"""
-        logger.debug(f"Checking if user has a trust line")
-        return has_trust_line(self.network_url, self.pft_issuer, self.user_wallet)
         
     @requires_wallet_state(TRUSTLINED_STATES)
     def send_initiation_rite(self, commitment):
@@ -279,13 +194,21 @@ class PostFiatTaskManager:
     def save_transactions(self):
         self.save_dataframe(self.transactions, self.tx_history_filepath, "transactions")
 
-    @PerformanceMonitor.measure('save_memos')
-    def save_memos(self):
-        self.save_dataframe(self.memos, self.memos_filepath, "memos")
+    @PerformanceMonitor.measure('save_memo_transactions')
+    def save_memo_transactions(self):
+        self.save_dataframe(self.memo_transactions, self.memo_tx_filepath, "memo_transactions")
 
     @PerformanceMonitor.measure('save_tasks')
     def save_tasks(self):
         self.save_dataframe(self.tasks, self.tasks_filepath, "tasks")
+
+    @PerformanceMonitor.measure('save_memos')
+    def save_memos(self):
+        self.save_dataframe(self.memos, self.memos_filepath, "memos")
+
+    @PerformanceMonitor.measure('save_system_memos')
+    def save_system_memos(self):
+        self.save_dataframe(self.system_memos, self.system_memos_filepath, "system_memos")
 
     @PerformanceMonitor.measure('load_transactions')
     def load_transactions(self):
@@ -360,111 +283,248 @@ class PostFiatTaskManager:
             logger.error(f"Error checking account status: {e}")
             return
 
-        # Attempt to load transactions from local csv
-        if self.transactions.empty: 
-            loaded_tx_df = self.load_transactions()
-            if not loaded_tx_df.empty:
-                logger.debug(f"Loaded {len(loaded_tx_df)} transactions from {self.tx_history_filepath}")
-                self.transactions = loaded_tx_df
-                self.sync_memos(loaded_tx_df)
+        try:
+            # Attempt to load transactions from local csv
+            if self.transactions.empty: 
+                loaded_tx_df = self.load_transactions()
+                if not loaded_tx_df.empty:
+                    logger.debug(f"Loaded {len(loaded_tx_df)} transactions from {self.tx_history_filepath}")
+                    self.transactions = loaded_tx_df
+                    self.sync_memo_transactions(loaded_tx_df)
 
-        # Choose ledger index to start sync from
-        if self.transactions.empty:
-            next_ledger_index = -1
-        else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
-            next_ledger_index = self.transactions['ledger_index'].max() + 1
-            logger.debug(f"Next ledger index: {next_ledger_index}")
+            # Choose ledger index to start sync from
+            if self.transactions.empty:
+                next_ledger_index = -1
+            else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
+                next_ledger_index = self.transactions['ledger_index'].max() + 1
+                logger.debug(f"Next ledger index: {next_ledger_index}")
 
-        # fetch new transactions from the node
-        new_tx_list = self.get_new_transactions(next_ledger_index)
+            # fetch new transactions from the node
+            new_tx_list = self.get_new_transactions(next_ledger_index)
 
-        # Add new transactions to the dataframe
-        if new_tx_list:
-            logger.debug(f"Adding {len(new_tx_list)} new transactions...")
-            new_tx_df = pd.DataFrame(new_tx_list)
-            self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
-            self.save_transactions()
-            self.sync_memos(new_tx_df)
-            return True
-        else:
-            logger.debug("No new transactions found. Finished updating local tx history")
-            return False
+            # Add new transactions to the dataframe
+            if new_tx_list:
+                logger.debug(f"Adding {len(new_tx_list)} new transactions...")
+                new_tx_df = pd.DataFrame(new_tx_list)
+                self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
+                self.save_transactions()
+                self.sync_memo_transactions(new_tx_df)
+                return True
+            else:
+                logger.debug("No new transactions found. Finished updating local tx history")
+                return False
+            
+        except (TypeError, AttributeError) as e:
+            logger.error(f"Error processing transaction history: {e}")
+            logger.warning("Corrupted transaction history file detected. Deleting and starting fresh.")
 
-    @PerformanceMonitor.measure('sync_memos')
-    def sync_memos(self, new_tx_df):
-        """ Updates the memos dataframe with new memos from the new transactions. Memos are serialized into dicts"""
+            try:
+                if os.path.exists(self.tx_history_filepath):
+                    os.remove(self.tx_history_filepath)
+                    logger.debug(f"Deleted corrupted cache file: {self.tx_history_filepath}")
+            except Exception as delete_error:
+                logger.error(f"Error deleting corrupted cache file: {delete_error}")
+
+            # Reset dataframes
+            self.transactions = pd.DataFrame()
+            self.memo_transactions = pd.DataFrame()
+            self.tasks = pd.DataFrame()
+            self.memos = pd.DataFrame()
+            self.system_memos = pd.DataFrame()
+
+            # Try syncing transactions again with fresh state
+            return self.sync_transactions()
+
+    @PerformanceMonitor.measure('sync_memo_transactions')
+    def sync_memo_transactions(self, new_tx_df):
+        """Enriches transactions that contain memos with additional columns for easier processing"""
+        logger.debug(f"Syncing transactions with memos")
         # flag rows with memos
         new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x)
 
         # filter for rows with memos and convert to dataframe
-        new_memo_df = new_tx_df[new_tx_df['has_memos']== True].copy()
+        memo_tx_df = new_tx_df[new_tx_df['has_memos']== True].copy()
 
         # Extract first memo into a new column, serialize to dict
         # Any additional memos are ignored
-        new_memo_df['memo_data']=new_memo_df['tx_json'].apply(lambda x: self.convert_memo_dict(x['Memos'][0]['Memo']))
+        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.convert_memo_dict(x['Memos'][0]['Memo']))
         
         # Extract account and destination from tx_json into new columns
-        new_memo_df['account']= new_memo_df['tx_json'].apply(lambda x: x['Account'])
-        new_memo_df['destination']=new_memo_df['tx_json'].apply(lambda x: x['Destination'])
+        memo_tx_df['account']= memo_tx_df['tx_json'].apply(lambda x: x['Account'])
+        memo_tx_df['destination']=memo_tx_df['tx_json'].apply(lambda x: x['Destination'])
         
-        # Determine message type
-        new_memo_df['message_type']=np.where(new_memo_df['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
+        # Determine direction
+        memo_tx_df['direction']=np.where(memo_tx_df['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
         
-        # Derive node account
-        new_memo_df['node_account']= new_memo_df[['destination','account']].sum(1).apply(lambda x: 
-                                                         str(x).replace(self.user_wallet.classic_address,''))
+        # Derive counterparty address
+        memo_tx_df['counterparty_address']= memo_tx_df[['destination','account']].sum(1).apply(
+            lambda x: str(x).replace(self.user_wallet.classic_address,'')
+        )
         
         # Convert ripple timestamp to datetime
-        new_memo_df['datetime']= new_memo_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
+        memo_tx_df['datetime']= memo_tx_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
         
         # Extract ledger index
-        new_memo_df['ledger_index'] = new_memo_df['tx_json'].apply(lambda x: x['ledger_index'])
+        memo_tx_df['ledger_index'] = memo_tx_df['tx_json'].apply(lambda x: x['ledger_index'])
 
         # Flag rows with PFT
-        new_memo_df['is_pft'] = new_memo_df['tx_json'].apply(is_pft_transaction)
+        memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
 
         # Concatenate new memos to existing memos and drop duplicates
-        self.memos = pd.concat([self.memos, new_memo_df], ignore_index=True).drop_duplicates(subset=['hash'])
+        self.memo_transactions = pd.concat([self.memo_transactions, memo_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
 
-        logger.debug(f"Added {len(new_memo_df)} memos to local memos dataframe")
+        logger.debug(f"Added {len(memo_tx_df)} memos to local memos dataframe")
 
         # for debugging purposes only
+        if SAVE_MEMO_TRANSACTIONS:
+            self.save_memo_transactions()
+
+        self.sync_tasks(memo_tx_df)
+        self.sync_memos(memo_tx_df)
+        self.sync_system_memos(memo_tx_df)
+
+    @PerformanceMonitor.measure('sync_tasks')
+    def sync_tasks(self, new_memo_tx_df):
+        """ Updates the tasks dataframe with new tasks from the new memos.
+        Task dataframe contains columns: user,task_id,full_output,hash,counterparty_address,datetime,task_type"""
+        logger.debug(f"Syncing tasks")
+        if new_memo_tx_df.empty:
+            logger.debug("No new memos to process for tasks")
+            return
+
+        # Filter for memos that have a valid ID pattern 
+        valid_id_df = new_memo_tx_df[
+            new_memo_tx_df['memo_data'].apply(is_valid_id)
+        ].copy()
+
+        if valid_id_df.empty:
+            logger.debug("No memos with valid IDs found")
+            return
+
+        # Filter for task-specific content
+        task_df = valid_id_df[
+            valid_id_df['memo_data'].apply(lambda x: any(
+                task_indicator in str(x['full_output'])
+                for task_indicator in TASK_INDICATORS
+            ))
+        ].copy()
+
+        if task_df.empty:
+            logger.debug("No task-related memos found")
+            return
+
+        # Enrich memo_data with transaction metadata
+        fields_to_add = ['hash','counterparty_address','datetime']
+        task_df['memo_data'] = task_df.apply(
+            lambda row: {
+                **row['memo_data'], 
+                **{field: row[field] for field in fields_to_add if field in row}
+            } # ** is used to unpack the dictionaries
+            , axis=1
+        ).copy()
+
+        # Convert the memo_data to a dataframe and add the task type
+        task_df = pd.DataFrame(task_df['memo_data'].tolist())
+        task_df['task_type'] = task_df['full_output'].apply(classify_task_string)
+
+        # Concatenate new tasks to existing tasks and drop duplicates
+        self.tasks = pd.concat([self.tasks, task_df], ignore_index=True).drop_duplicates(subset=['hash'])
+
+        # for debugging purposes only
+        if SAVE_TASKS:
+            self.save_tasks()
+
+    @PerformanceMonitor.measure('sync_memos')
+    def sync_memos(self, new_memo_tx_df):
+        """Updates messages dataframe with P2P message data"""
+        logger.debug(f"Syncing memos")
+        if new_memo_tx_df.empty:
+            logger.debug("No new memos to process for messages")
+            return
+        
+        # Filter for valid IDs first
+        valid_id_df = new_memo_tx_df[
+            new_memo_tx_df['memo_data'].apply(is_valid_id)
+        ].copy()
+
+        if valid_id_df.empty:
+            logger.debug("No memos with valid IDs found")
+            return
+
+        # Filter for message-specific content
+        memo_df = valid_id_df[
+            valid_id_df['memo_data'].apply(lambda x: any(
+                message_indicator in str(x['full_output'])
+                for message_indicator in MESSAGE_INDICATORS
+            ))
+        ].copy()
+
+        if memo_df.empty:
+            logger.debug("No message-related memos found")
+            return
+        
+        # Enrich memo_data with transaction metadata
+        fields_to_add = ['hash','counterparty_address','datetime', 'direction']
+        memo_df['memo_data'] = memo_df.apply(
+            lambda row: {
+                **row['memo_data'], 
+                **{field: row[field] for field in fields_to_add if field in row}
+            }, 
+            axis=1
+        ).copy()
+
+        # Convert memo_data to new dataframe with all fields
+        memo_df = pd.DataFrame(memo_df['memo_data'].tolist())
+
+        # Process chunked messages, etc.
+        self.memos = pd.concat([self.memos, memo_df], ignore_index=True)
+
         if SAVE_MEMOS:
             self.save_memos()
 
-        self.sync_tasks(new_memo_df)
-
-    @PerformanceMonitor.measure('sync_tasks')
-    def sync_tasks(self, new_memo_df):
-        """ Updates the tasks dataframe with new tasks from the new memos.
-        Task dataframe contains columns: user,task_id,full_output,hash,node_account,datetime,task_type"""
-
-        # Filter for memos that are task IDs and PFT transactions
-        new_task_df = new_memo_df[
-            new_memo_df['memo_data'].apply(is_task_id) & 
-            new_memo_df['tx_json'].apply(is_pft_transaction)
+    @PerformanceMonitor.measure('sync_system_memos')
+    def sync_system_memos(self, new_memo_tx_df):
+        """Updates system_memos dataframe with special system messages"""
+        logger.debug(f"Syncing system memos")
+        if new_memo_tx_df.empty:
+            logger.debug("No new memos to process for system messages")
+            return
+        
+        # Filter for system message types
+        system_df = new_memo_tx_df[
+            new_memo_tx_df['memo_data'].apply(lambda x: any(
+                indicator in str(x['task_id'])
+                for indicator in SYSTEM_MEMO_TYPES
+            ))
         ].copy()
 
-        if not new_task_df.empty:
-            # Add the transaction hash, node account, and datetime to the dataframe
-            fields_to_add = ['hash','node_account','datetime']
-            new_task_df['memo_data'] = new_task_df.apply(
-            lambda row: {**row['memo_data'], **{field: row[field] for field in fields_to_add if field in row}} # ** is used to unpack the dictionaries
-                , axis=1
-            )
+        if system_df.empty:
+            logger.debug("No system messages found")
+            return
 
-            # Convert the memo_data to a dataframe and add the task type
-            new_task_df = pd.DataFrame(new_task_df['memo_data'].tolist())
-            new_task_df['task_type'] = new_task_df['full_output'].apply(classify_task_string)
+        # Enrich memo_data with transaction metadata
+        fields_to_add = ['hash', 'counterparty_address', 'datetime', 'direction']
+        system_df['memo_data'] = system_df.apply(
+            lambda row: {
+                **row['memo_data'],
+                **{field: row[field] for field in fields_to_add if field in row}
+            },
+            axis=1
+        ).copy()
 
-            # Concatenate new tasks to existing tasks and drop duplicates
-            self.tasks = pd.concat([self.tasks, new_task_df], ignore_index=True).drop_duplicates(subset=['hash'])
+        # Convert memo_data to new dataframe with all fields
+        system_df = pd.DataFrame(system_df['memo_data'].tolist())
 
-            # for debugging purposes only
-            if SAVE_TASKS:
-                self.save_tasks()
-        else:
-            logger.debug("No new tasks to sync")
+        # Update system_memos dataframe with deduplication
+        self.system_memos = pd.concat(
+            [self.system_memos, system_df], 
+            ignore_index=True
+        ).drop_duplicates(subset=['hash'])
+
+        logger.debug(f"Added {len(system_df)} new system messages")
+
+        if SAVE_SYSTEM_MEMOS: 
+            self.save_system_memos()
 
     def get_task(self, task_id):
         """ Returns the task dataframe for a given task ID """
@@ -472,6 +532,13 @@ class PostFiatTaskManager:
         if task_df.empty:
             raise NoMatchingTaskException(f"No task found with task_id {task_id}")
         return task_df
+    
+    def get_memo(self, memo_id):
+        """Returns the memo dataframe for a given memo ID """
+        memo_df = self.memos[self.memos['memo_id'] == memo_id]
+        if memo_df.empty:
+            raise NoMatchingMemoException(f"No memo found with memo_id {memo_id}")
+        return memo_df
     
     def get_task_state(self, task_df):
         """ Returns the latest state of a task given a task dataframe containing a single task_id """
@@ -514,10 +581,18 @@ class PostFiatTaskManager:
     
     @PerformanceMonitor.measure('send_xrp')
     def send_xrp(self, amount, destination, memo="", destination_tag=None):
-        return send_xrp(self.network_url, self.user_wallet, amount, destination, memo, destination_tag)
+        return send_xrp(self.network_url, self.user_wallet, amount, destination, memo, destination_tag=destination_tag)
 
     def convert_memo_dict(self, memo_dict):
-        """Constructs a memo object with user, task_id, and full_output from hex-encoded values."""
+        """Constructs a memo object from hex-encoded XRP memo fields.
+        
+        The mapping from XRP memo fields to our internal format:
+        - MemoFormat -> user: The username that sent the memo
+        - MemoType -> task_id: Either:
+            a) For task messages: A datetime-based ID (e.g., "2024-01-01_12:00")
+            b) For system messages: The system message type (e.g., "HANDSHAKE", "INITIATION_RITE")
+        - MemoData -> full_output: The actual content/payload of the memo
+        """
         fields = {
             'user': 'MemoFormat',
             'task_id': 'MemoType',
@@ -532,13 +607,9 @@ class PostFiatTaskManager:
     def spawn_user_wallet(self):
         """ This takes the credential manager and loads the wallet from the
         stored seed associated with the user name"""
-        seed = self.pw_map[self.credential_manager.wallet_secret_name]
+        seed = self.credential_manager.get_credential('v1xrpsecret')
         live_wallet = xrpl.wallet.Wallet.from_seed(seed)
         return live_wallet
-
-    @requires_wallet_state(FUNDED_STATES)
-    def handle_trust_line(self):
-        handle_trust_line(self.network_url, self.pft_issuer, self.user_wallet)
 
     @PerformanceMonitor.measure('send_pft')
     def send_pft(self, amount, destination, memo=""):
@@ -610,11 +681,166 @@ class PostFiatTaskManager:
 
         return response
     
-    @PerformanceMonitor.measure('send_memo')
-    def send_memo(self, destination, memo: str, compress=True):
-        """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE"""
+    @PerformanceMonitor.measure('get_handshakes')
+    def get_handshakes(self):
+        """ Returns a DataFrame of all handshake interactions with their current status"""
+        if self.system_memos.empty:
+            return pd.DataFrame()
+        
+        # Get all handshakes (both incoming and outgoing)
+        handshakes = self.system_memos[
+            self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
+        ]
 
+        if handshakes.empty:
+            return pd.DataFrame()
+        
+        # Process each unique counterparty address
+        results = []
+        unique_addresses = handshakes['counterparty_address'].unique()
+
+        for address in unique_addresses:
+            # Get the earliest incoming handshake from this address (if any)
+            incoming = handshakes[
+                (handshakes['counterparty_address'] == address) &
+                (handshakes['direction'] == 'INCOMING')
+            ].sort_values('datetime')
+
+            # Get the outgoing handshake to this address (if any)
+            outgoing = handshakes[
+                (handshakes['counterparty_address'] == address) &
+                (handshakes['direction'] == 'OUTGOING')
+            ].sort_values('datetime')
+
+            result = {
+                'address': address,
+                'received_at': incoming.iloc[0]['datetime'] if not incoming.empty else None,
+                'sent_at': outgoing.iloc[0]['datetime'] if not outgoing.empty else None,
+                'encryption_ready': not incoming.empty and not outgoing.empty
+            }
+
+            results.append(result)
+
+        # Create DataFrame and add contact information if available
+        df = pd.DataFrame(results)
+        contacts = self.credential_manager.get_contacts()
+        df['contact_name'] = df['address'].map(contacts)
+        df['display_address'] = df.apply(
+            lambda x: x['contact_name'] + ' (' + x['address'] + ')' 
+                if pd.notna(x['contact_name']) else x['address'],
+            axis=1
+        )
+
+        return df
+
+    @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('get_handshake_for_address')
+    def get_handshake_for_address(self, address: str) -> tuple[bool, str]:
+        """Returns (handshake_sent, their_public_key) tuple where:
+        - handshake_sent: Whether we've already sent our public key
+        - received_key: Their ECDH public key if they've sent it, None otherwise
+        """
+        if self.handshake_cache.get(address):
+            return self.handshake_cache[address]
+
+        if self.system_memos.empty:
+            logger.debug("No system memos found")
+            return False, None
+        
+        # Filter for handshakes
+        handshakes = self.system_memos[
+            self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
+        ]
+
+        if handshakes.empty:
+            logger.debug("No handshakes found")
+            return False, None
+
+        # Get handshakes sent FROM the user TO this address
+        sent_handshakes = handshakes[
+            (handshakes['counterparty_address'] == address) & 
+            (handshakes['direction'] == 'OUTGOING')
+        ]
+        handshake_sent = not sent_handshakes.empty
+
+        # Get handshakes received FROM this address TO the user
+        received_handshakes = handshakes[
+            (handshakes['counterparty_address'] == address) &
+            (handshakes['direction'] == 'INCOMING')
+        ]
+   
+        received_key = None
+        if not received_handshakes.empty:
+            logger.debug(f"Found {len(received_handshakes)} received handshakes from {address}")
+            latest_received_handshake = received_handshakes.sort_values('datetime').iloc[-1]
+            received_key = latest_received_handshake['full_output']
+            logger.debug(f"Most recent received handshake: {received_key[:8]}...")
+
+        result = (handshake_sent, received_key)
+        self.handshake_cache[address] = result
+        return result
+    
+    @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('send_handshake')
+    def send_handshake(self, destination):
+        """Sends a handshake memo to establish encrypted communication"""
+        logger.debug(f"Sending handshake to {destination}...")
+        ecdh_public_key = self.credential_manager.get_ecdh_public_key()
+        logger.debug(f"ECDH public key: {ecdh_public_key}, username: {self.credential_manager.postfiat_username}")
+        handshake = construct_handshake_memo(
+            user=self.credential_manager.postfiat_username,
+            ecdh_public_key=ecdh_public_key
+        )
+        return self._send_memo_single(destination, handshake)
+
+    @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('encrypt_memo')
+    def encrypt_memo(self, memo: str, shared_secret: str) -> str:
+        """ Encrypts a memo using a shared secret """
+        # Convert shared_secret to bytes if it isn't already
+        if isinstance(shared_secret, str):
+            shared_secret = shared_secret.encode()
+
+        # Generate the Fernet key from shared secret
+        key = base64.urlsafe_b64encode(hashlib.sha256(shared_secret).digest())
+        fernet = Fernet(key)
+
+        # Ensure memo is str before encoding to bytes
+        if isinstance(memo, str):
+            memo = memo.encode()
+        elif isinstance(memo, bytes):
+            pass
+        else:
+            raise ValueError(f"Memo must be string or bytes, not {type(memo)}")
+        
+        # Encrypt and return as string
+        encrypted_bytes = fernet.encrypt(memo)
+        return encrypted_bytes.decode()
+
+    @requires_wallet_state(FUNDED_STATES)
+    @PerformanceMonitor.measure('send_memo')
+    def send_memo(self, destination, memo: str, compress=True, encrypt=False):
+        """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE, with optional compression and encryption"""
+        
         message_id = self.generate_custom_id()
+
+        # Handle encryption if requested
+        if encrypt:
+            # Check handshake status
+            _, received_key = self.get_handshake_for_address(destination)
+
+            if not received_key:
+                raise HandshakeRequiredError(destination)
+            
+            # Derive the shared secret
+            shared_secret = self.credential_manager.get_shared_secret(received_key)
+            logger.debug(f"Shared secret: {shared_secret[:8]}...")
+
+            # Encrypt the memo using the shared secret
+            logger.debug(f"Encrypting memo: {memo[:8]}...")
+            encrypted_memo = self.encrypt_memo(memo, shared_secret)
+            logger.debug(f"Encrypted memo: {encrypted_memo[:8]}...")
+            memo = "WHISPER__" + encrypted_memo
 
         if compress:
             logger.debug(f"Compressing memo of length {len(memo)}")
@@ -645,7 +871,7 @@ class PostFiatTaskManager:
 
         return response
     
-    def _send_memo_single(self, destination, memo):
+    def _send_memo_single(self, destination, memo, pft_amount=0):
         """ Sends a memo to a destination. """
         client = xrpl.clients.JsonRpcClient(self.network_url)
 
@@ -657,19 +883,27 @@ class PostFiatTaskManager:
         else:
             logger.error("Memo is not a string or a Memo object, raising ValueError")
             raise ValueError("Memo must be either a string or a Memo object")
-        
-        amount_to_send = xrpl.models.amounts.IssuedCurrencyAmount(
-            currency="PFT",
-            issuer=self.pft_issuer,
-            value=str(1)
-        )
 
-        payment = xrpl.models.transactions.Payment(
-            account=self.user_wallet.address,
-            amount=amount_to_send,
-            destination=destination,
-            memos=memos,
-        )
+        # Get PFT requirement for destination
+        pft_value = self.network_config.get_pft_requirement(destination)
+
+        payment_args = {
+            "account": self.user_wallet.address,
+            "destination": destination,
+            "memos": memos
+        }
+        
+        if pft_value > 0:
+            payment_args["amount"] = xrpl.models.amounts.IssuedCurrencyAmount(
+                currency="PFT",
+                issuer=self.pft_issuer,
+                value=str(pft_value)
+            )
+        else:
+            # Send minimum XRP amount for memo-only transactions
+            payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(0.00001))  # Minimum XRP amount
+
+        payment = xrpl.models.transactions.Payment(**payment_args)
 
         try:
             logger.debug("Submitting and waiting for transaction")
@@ -875,11 +1109,11 @@ class PostFiatTaskManager:
         logger.debug("Getting latest outgoing context doc link...")
 
         # Filter for memos that are PFT-related, sent to the default node, outgoing, and are google doc context links
-        redux_tx_list = self.memos[
-            self.memos['is_pft'] & 
-            (self.memos['destination']==self.default_node) &
-            (self.memos['message_type']=='OUTGOING') & 
-            (self.memos['memo_data'].apply(lambda x: x['task_id']) == 'google_doc_context_link')
+        redux_tx_list = self.memo_transactions[
+            self.memo_transactions['is_pft'] & 
+            (self.memo_transactions['destination']==self.default_node) &
+            (self.memo_transactions['direction']=='OUTGOING') & 
+            (self.memo_transactions['memo_data'].apply(lambda x: x['task_id']) == SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value)
             ]
         
         logger.debug(f"Found {len(redux_tx_list)} outgoing context doc links")
@@ -900,36 +1134,41 @@ class PostFiatTaskManager:
     def output_account_address_node_association(self):
         """this takes the account info frame and figures out what nodes
          the account is associating with and returns them in a dataframe """
-        self.memos['valid_task_id']=self.memos['memo_data'].apply(is_task_id)
-        node_output_df = self.memos[self.memos['message_type']=='INCOMING'][['valid_task_id','account']].groupby('account').sum()
+        self.memo_transactions['valid_task_id']=self.memo_transactions['memo_data'].apply(is_valid_id)
+        node_output_df = self.memo_transactions[self.memo_transactions['direction']=='INCOMING'][['valid_task_id','account']].groupby('account').sum()
    
         return node_output_df[node_output_df['valid_task_id']>0]
     
     def get_user_initiation_rites_destinations(self):
         """Returns all the addresses that have received a user initiation rite"""
-        all_user_initiation_rites = self.memos[self.memos['memo_data'].apply(lambda x: x.get('task_id') == 'INITIATION_RITE')]
+        all_user_initiation_rites = self.memo_transactions[
+            self.memo_transactions['memo_data'].apply(lambda x: x.get('task_id') == SystemMemoType.INITIATION_RITE.value)
+        ]
         return list(all_user_initiation_rites['destination'])
     
     def initiation_rite_sent(self):
         logger.debug("Checking if user has sent initiation rite...")
 
         # Check if memos dataframe is empty or missing required columns
-        if self.memos.empty or not all(col in self.memos.columns for col in ['destination', 'memo_data']):
+        if self.memo_transactions.empty or not all(col in self.memo_transactions.columns for col in ['destination', 'memo_data']):
             logger.debug("Memos dataframe is empty or missing required columns, returning False")
             return False
 
         user_initiation_rites_destinations = self.get_user_initiation_rites_destinations()
         return self.default_node in user_initiation_rites_destinations
 
+    # TODO: Deprecate this method
     def get_user_genesis_destinations(self):
         """ Returns all the addresses that have received a user genesis transaction"""
-        all_user_genesis = self.memos[self.memos['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
+        all_user_genesis = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
         return list(all_user_genesis['destination'])
 
+    # TODO: Deprecate this method
     def genesis_sent(self):
         user_genesis_destinations = self.get_user_genesis_destinations()
         return self.default_node in user_genesis_destinations
     
+    # TODO: Deprecate this method
     @requires_wallet_state(INITIATED_STATES)
     def handle_genesis(self):
         """ Checks if the user has sent a genesis to the node, and sends one if not """
@@ -939,6 +1178,7 @@ class PostFiatTaskManager:
         else:
             logger.debug("User has already sent genesis, skipping...")
     
+    # TODO: Deprecate this method
     def send_genesis(self):
         """ Sends a user genesis transaction to the default node 
         Currently requires 7 PFT
@@ -1020,23 +1260,37 @@ class PostFiatTaskManager:
         """ Sends the Google Doc context link to the node """
         logger.debug(f"Sending Google Doc context link to the node: {self.google_doc_link}")
         google_doc_memo = construct_google_doc_context_memo(user=self.credential_manager.postfiat_username,
-                                                                    google_doc_link=self.google_doc_link)
+                                                            google_doc_link=self.google_doc_link)
         self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
         logger.debug("Google Doc context link sent.")
 
     @requires_wallet_state(WalletState.ACTIVE)
     @PerformanceMonitor.measure('get_proposals_df')
-    def get_proposals_df(self):
+    def get_proposals_df(self, include_refused=False):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
         # Filter tasks with task_type in ['PROPOSAL','ACCEPTANCE']
-        filtered_tasks = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','ACCEPTANCE'])]
+        filtered_tasks = self.tasks[self.tasks['task_type'].isin([
+            TaskType.PROPOSAL.name, 
+            TaskType.ACCEPTANCE.name,
+            TaskType.REFUSAL.name
+        ])]
 
-        # Get task_ids where the latest state is 'PROPOSAL' or 'ACCEPTANCE'
-        proposal_task_ids = [
-            task_id for task_id in filtered_tasks['task_id'].unique()
-            if self.get_task_state_using_task_id(task_id) in ['PROPOSAL','ACCEPTANCE']
-        ]
+        # Get task_ids where:
+        # 1. The latest state is 'PROPOSAL' or 'ACCEPTANCE' (or REFUSAL if include_refused=True) AND
+        # 2. if include_refused=False, exclude tasks that have ever been refused
+        proposal_task_ids = []
+        valid_states = [TaskType.PROPOSAL.name, TaskType.ACCEPTANCE.name]
+        if include_refused:
+            valid_states.append(TaskType.REFUSAL.name)
+
+        for task_id in filtered_tasks['task_id'].unique():
+            task_df = self.get_task(task_id)
+            latest_state = self.get_task_state(task_df)
+            
+            if latest_state in valid_states:
+                if include_refused or TaskType.REFUSAL.name not in task_df['task_type'].values:
+                    proposal_task_ids.append(task_id)
 
         # Filter for these tasks
         filtered_df = self.tasks[(self.tasks['task_id'].isin(proposal_task_ids))].copy()
@@ -1045,7 +1299,9 @@ class PostFiatTaskManager:
             return pd.DataFrame()
 
         # Create new 'RESPONSE' column to combine acceptance and refusal
-        filtered_df['response_type'] = filtered_df['task_type'].apply(lambda x: 'RESPONSE' if x in ['ACCEPTANCE','REFUSAL'] else x)
+        filtered_df['response_type'] = filtered_df['task_type'].apply(
+            lambda x: 'RESPONSE' if x in [TaskType.ACCEPTANCE.name, TaskType.REFUSAL.name] else x
+        )
 
         # Pivot the dataframe to get proposals and responses side by side and reset index to make task_id a column
         pivoted_df = filtered_df.pivot_table(index='task_id', columns='response_type', values='full_output', aggfunc='first').reset_index().copy()
@@ -1054,15 +1310,15 @@ class PostFiatTaskManager:
         pivoted_df.rename(columns={'REQUEST_POST_FIAT':'request', 'PROPOSAL':'proposal', 'RESPONSE':'response'}, inplace=True)
 
         # Clean up the proposal column
-        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace(TaskType.PROPOSAL.value,'').replace('nan',''))
 
         # Clean up the request column
-        pivoted_df['request'] = pivoted_df['request'].apply(lambda x: str(x).replace('REQUEST_POST_FIAT ___ ','').replace('nan',''))
+        pivoted_df['request'] = pivoted_df['request'].apply(lambda x: str(x).replace(TaskType.REQUEST_POST_FIAT.value,'').replace('nan',''))
         
         # Clean up the response column, if it exists (does not exist for the first proposal)
         if 'response' in pivoted_df.columns:
-            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('ACCEPTANCE REASON ___ ','ACCEPTED: ').replace('nan',''))
-            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace('REFUSAL REASON ___ ','REFUSED: ').replace('nan',''))
+            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace(TaskType.ACCEPTANCE.value,'ACCEPTED: ').replace('nan',''))
+            pivoted_df['response'] = pivoted_df['response'].apply(lambda x: str(x).replace(TaskType.REFUSAL.value,'REFUSED: ').replace('nan',''))
         else:
             pivoted_df['response'] = ''
         
@@ -1077,12 +1333,12 @@ class PostFiatTaskManager:
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
         # Filter tasks with task_type in ['PROPOSAL','VERIFICATION_PROMPT']
-        filtered_tasks = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','VERIFICATION_PROMPT'])]
+        filtered_tasks = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.VERIFICATION_PROMPT.name])]
 
         # Get task_ids where the latest state is 'VERIFICATION_PROMPT'
         verification_task_ids = [
             task_id for task_id in filtered_tasks['task_id'].unique()
-            if self.get_task_state_using_task_id(task_id) == 'VERIFICATION_PROMPT'
+            if self.get_task_state_using_task_id(task_id) == TaskType.VERIFICATION_PROMPT.name
         ]
 
         # Filter for these tasks
@@ -1098,8 +1354,8 @@ class PostFiatTaskManager:
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'VERIFICATION_PROMPT':'verification'}, inplace=True)
 
         # clean up the proposal and verification columns
-        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___',''))
-        pivoted_df['verification'] = pivoted_df['verification'].apply(lambda x: str(x).replace('VERIFICATION PROMPT ___',''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace(TaskType.PROPOSAL.value,''))
+        pivoted_df['verification'] = pivoted_df['verification'].apply(lambda x: str(x).replace(TaskType.VERIFICATION_PROMPT.value,''))
 
         # Reverse order to get the most recent proposals first
         result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
@@ -1112,12 +1368,12 @@ class PostFiatTaskManager:
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
 
         # Filter for only PROPOSAL and REWARD rows
-        filtered_df = self.tasks[self.tasks['task_type'].isin(['PROPOSAL','REWARD'])]
+        filtered_df = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.REWARD.name])]
 
         # Get task_ids where the latest state is 'REWARD'
         reward_task_ids = [
             task_id for task_id in filtered_df['task_id'].unique()
-            if self.get_task_state_using_task_id(task_id) == 'REWARD'
+            if self.get_task_state_using_task_id(task_id) == TaskType.REWARD.name
         ]
 
         # Filter for these tasks
@@ -1129,22 +1385,24 @@ class PostFiatTaskManager:
         # Pivot the dataframe to get proposals and rewards side by side and reset index to make task_id a column
         pivoted_df = filtered_df.pivot_table(index='task_id', columns='task_type', values='full_output', aggfunc='first').reset_index().copy()
 
-        # Rename the columns for clarity
+        # Rename the columns for clarity # TODO: this seems pointless
         pivoted_df.rename(columns={'PROPOSAL':'proposal', 'REWARD':'reward'}, inplace=True)
 
         # Clean up the proposal and reward columns
-        pivoted_df['reward'] = pivoted_df['reward'].apply(lambda x: str(x).replace('REWARD RESPONSE __ ',''))
-        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace('PROPOSED PF ___ ','').replace('nan',''))
+        pivoted_df['reward'] = pivoted_df['reward'].apply(lambda x: str(x).replace(TaskType.REWARD.value,''))
+        pivoted_df['proposal'] = pivoted_df['proposal'].apply(lambda x: str(x).replace(TaskType.PROPOSAL.value,'').replace('nan',''))
 
         # Reverse order to get the most recent proposals first
         result_df = pivoted_df.iloc[::-1].reset_index(drop=True).copy()
 
         # Add PFT value information
-        pft_only = self.memos[self.memos['tx_json'].apply(is_pft_transaction)].copy()
-        pft_only['pft_value'] = pft_only['tx_json'].apply(lambda x: x['DeliverMax']['value']).astype(float) * pft_only['message_type'].map({'INCOMING':1,'OUTGOING':-1})
+        pft_only = self.memo_transactions[self.memo_transactions['tx_json'].apply(is_pft_transaction)].copy()
+        pft_only['pft_value'] = pft_only['tx_json'].apply(
+            lambda x: x['DeliverMax']['value']).astype(float) * pft_only['direction'].map({'INCOMING':1,'OUTGOING':-1}
+        )
         pft_only['task_id'] = pft_only['memo_data'].apply(lambda x: x['task_id'])
         
-        pft_rewards_only = pft_only[pft_only['memo_data'].apply(lambda x: 'REWARD RESPONSE __' in x['full_output'])].copy()
+        pft_rewards_only = pft_only[pft_only['memo_data'].apply(lambda x: TaskType.REWARD.value in x['full_output'])].copy()
         task_id_to_payout = pft_rewards_only.groupby('task_id').last()['pft_value']
         
         result_df['payout'] = result_df['task_id'].map(task_id_to_payout)
@@ -1155,20 +1413,84 @@ class PostFiatTaskManager:
         return result_df
     
     @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('get_payments_df')
+    def get_payments_df(self):
+        """ Returns a dataframe containing payment transaction details"""
+        if self.memo_transactions.empty:
+            return pd.DataFrame()
+        
+        df = self.memo_transactions.copy()
+
+        # Extract delivered amoutn and determine token type
+        def get_payment_details(row):
+            meta = row['meta']  # meta is already deserialized in memory
+            delivered = meta.get('delivered_amount', None)
+
+            if isinstance(delivered, dict):  # PFT payment
+                # Convert to float and format to prevent scientific notation
+                amount = float(delivered['value'])
+                amount_str = f"{amount:f}".rstrip('0').rstrip('.')  # Remove trailing zeros and decimal point if whole number
+                return {
+                    'amount': amount_str,
+                    'token': delivered['currency']
+                }
+            elif delivered:  # XRP payment
+                amount = float(delivered) / 1000000
+                amount_str = f"{amount:f}".rstrip('0').rstrip('.') 
+                return {
+                    'amount': amount_str,
+                    'token': 'XRP'
+                }
+            return {'amount': None, 'token': None}
+
+        # Extract payment details
+        payment_details = df.apply(get_payment_details, axis=1)
+        df['amount'] = payment_details.apply(lambda x: x['amount'])
+        df['token'] = payment_details.apply(lambda x: x['token'])
+
+        # Replace direction with to/from
+        df['direction'] = df['direction'].map({'INCOMING': 'From', 'OUTGOING': 'To'})
+        
+        # Add contact names where available
+        contacts = self.credential_manager.get_contacts()
+        df['contact_name'] = df['counterparty_address'].map(contacts)
+        df['display_address'] = df.apply(
+            lambda x: x['contact_name'] + ' (' + x['counterparty_address'] + ')' 
+                if pd.notna(x['contact_name']) else x['counterparty_address'],
+            axis=1
+        )
+
+        df['tx_hash'] = df['hash']
+
+        # Select and rename columns
+        result_df = df[['datetime', 'amount', 'token', 'direction', 'display_address', 'tx_hash']]
+
+        # Sort by datetime descending
+        result_df = result_df.sort_values(by='datetime', ascending=False).reset_index(drop=True)
+
+        return result_df
+    
+    @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_memos_df')
     def get_memos_df(self):
+        """Returns a dataframe containing only P2P messages (excluding handshakes)"""
+        if self.memos.empty:
+            logger.debug("No memos or handshakes found")
+            return pd.DataFrame()
 
         def remove_chunks(text):
             # Use regular expression to remove all occurrences of chunk_1__, chunk_2__, etc.
             cleaned_text = re.sub(r'chunk_\d+__', '', text)
             return cleaned_text
-        
-        if self.tasks is None or self.tasks.empty or "task_type" not in self.tasks.columns:
-            logger.debug("No self.tasks found to get memos from, returning empty dataframe")
-            return pd.DataFrame()
 
-        # Filter tasks with task_type in ['MEMO']
-        chunked_memos = self.tasks[self.tasks['task_type'].isin(['MEMO'])].copy()
+        # Filter for only MEMO type messages (excluding handshakes)
+        chunked_memos = self.memos[
+            self.memos['full_output'].str.contains(MessageType.MEMO.value, na=False)
+        ].copy()
+
+        if chunked_memos.empty:
+            logger.debug("No memos found")
+            return pd.DataFrame()
 
         # Remove "chunk_[index]_" prefix from the 'full_output' column
         chunked_memos['full_output'] = chunked_memos['full_output'].apply(remove_chunks)
@@ -1176,34 +1498,82 @@ class PostFiatTaskManager:
         # Rename full_output to memos, and task_id to message_id
         chunked_memos.rename(columns={'task_id' : 'memo_id', 'full_output': 'memo'}, inplace=True)
 
-        # Unchunk the memos
-        memos = chunked_memos.groupby('memo_id')['memo'].apply(''.join).reset_index()
+        # Replace direction with to/from
+        chunked_memos['direction'] = chunked_memos['direction'].map({'INCOMING': 'From', 'OUTGOING': 'To'})
 
-        def decompress_memo(memo):
+        # Group by memo_id to combine chunks and get sender info
+        grouped = chunked_memos.groupby('memo_id').agg({
+            'memo': ''.join,
+            'counterparty_address': 'first',  # Get sender address
+            'datetime': 'first',  # Get latest datetime
+            'direction': 'first'  # Get direction (INCOMING/OUTGOING)
+        }).reset_index()
+
+        def process_memo(row):
+            memo = row['memo']
+            sender = row['counterparty_address']
+
+            # First handle compression
             if memo.startswith("COMPRESSED__"):
                 try:
-                    return decompress_string(memo.replace("COMPRESSED__", ""))
+                    memo = decompress_string(memo.replace("COMPRESSED__", ""))
                 except ValueError as e:
                     logger.error(f"Error decompressing memo: {e}")
                     return f"[Decompression failed: {memo[:100]}...]"
+        
+            # Then handle encryption
+            if memo.startswith("WHISPER__"):
+                try:
+                    encrypted_content = memo.replace("WHISPER__", "")
+
+                    # Get their handshake
+                    _, received_key = self.get_handshake_for_address(sender)
+                    if not received_key:
+                        return "[Encrypted message - handshake not found]"
+                    
+                    # Derive shared secret
+                    shared_secret = self.credential_manager.get_shared_secret(received_key)
+
+                    # Decrypt
+                    key = base64.urlsafe_b64encode(hashlib.sha256(shared_secret).digest())
+                    fernet = Fernet(key)
+                    decrypted_bytes = fernet.decrypt(encrypted_content.encode())
+                    decrypted_memo = "[Decrypted] " + decrypted_bytes.decode()
+                    return decrypted_memo
+
+                except Exception as e:
+                    logger.error(f"Error decrypting memo: {e}")
+                    return "[Decryption failed]"
+                
             return memo
         
-        memos['memo'] = memos['memo'].apply(decompress_memo)
+        # Apply processing to each row
+        grouped['memo'] = grouped.apply(process_memo, axis=1)
 
-        # Reverse order to get the most recent memos first
-        memos = memos.iloc[::-1].reset_index(drop=True).copy()
-        
-        return memos
+        # Sort by datetime descending
+        result = grouped.sort_values(by='datetime', ascending=False).reset_index(drop=True)
+
+        # Add contact names where available
+        contacts = self.credential_manager.get_contacts()
+        result['contact_name'] = result['counterparty_address'].map(contacts)
+        result['display_address'] = result.apply(
+            lambda x: x['contact_name'] + ' (' + x['counterparty_address'] + ')' 
+                if pd.notna(x['contact_name']) else x['counterparty_address'],
+            axis=1
+        )
+
+        return result[['memo_id', 'memo', 'direction', 'display_address']]
 
     @PerformanceMonitor.measure('send_acceptance_for_task_id')
     def send_acceptance_for_task_id(self, task_id, acceptance_string):
+        """This function accepts a task. It requires the most recent task status to be PROPOSAL"""
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
 
         if most_recent_status != 'PROPOSAL':
             raise WrongTaskStateException('PROPOSAL', most_recent_status)
 
-        proposal_source = task_df.iloc[0]['node_account']
+        proposal_source = task_df.iloc[0]['counterparty_address']
         if 'ACCEPTANCE REASON ___' not in acceptance_string:
             classified_string='ACCEPTANCE REASON ___ '+acceptance_string
         else:
@@ -1216,38 +1586,22 @@ class PostFiatTaskManager:
 
     @PerformanceMonitor.measure('send_refusal_for_task')
     def send_refusal_for_task(self, task_id, refusal_reason):
-        # TODO - rewrite this to use the get_task and get_task_state methods
-        """ 
-        This function refuses a task. The function will not work if the task has already 
-        been accepted, refused, or completed. 
-
-        EXAMPLE PARAMETERS
-        task_id='2024-05-14_19:10__ME26'
-        refusal_reason = 'I cannot accept this task because ...'
-        """
-        task_df = self.tasks
-        task_statuses = task_df[task_df['task_id'] 
-        == task_id]['task_type'].unique()
-
-        if any(status in task_statuses for status in ['REFUSAL', 'ACCEPTANCE', 
-            'VERIFICATION_RESPONSE', 'USER_GENESIS', 'REWARD']):
-            print('Task is not valid for refusal. Its statuses include:')
-            print(task_statuses)
-            return
-
-        if 'PROPOSAL' not in task_statuses:
-            print('Task must have a proposal to be refused. Current statuses include:')
-            print(task_statuses)
-            return
-
-        print('Proceeding to refuse task')
-        node_account = list(task_df[task_df['task_id'] 
-            == task_id].tail(1)['node_account'])[0]
-        if 'REFUSAL REASON ___' not in refusal_reason:
-            refusal_reason = 'REFUSAL REASON ___ ' + refusal_reason
+        """This function refuses a task. It requires the most recent task status to be PROPOSAL"""
+        # Check if the task ID exists
+        task_df = self.get_task(task_id)
+        most_recent_status = self.get_task_state(task_df)
+        
+        # Only prevent refusal if the task has already been rewarded
+        if most_recent_status == TaskType.REWARD.name:
+            raise WrongTaskStateException(TaskType.REWARD.name, most_recent_status, restricted_flag=True)
+        
+        proposal_source = task_df.iloc[0]['counterparty_address']
+        if TaskType.REFUSAL.value not in refusal_reason:
+            refusal_reason = TaskType.REFUSAL.value + refusal_reason
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                               task_id=task_id, full_output=refusal_reason)
-        response = self.send_pft(amount=1, destination=node_account, memo=constructed_memo)
+                                                        task_id=task_id, 
+                                                        full_output=refusal_reason)
+        response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_refusal_for_task response: {response}")
         return response
 
@@ -1266,17 +1620,25 @@ class PostFiatTaskManager:
         """
         
         # Generate a custom task ID for this request
-        task_id = self.generate_custom_id()
-        
+        while True:
+            task_id = self.generate_custom_id()
+            try:
+                task_df = self.tasks[self.tasks['task_id'] == task_id]
+                if task_df.empty:
+                    break
+                logger.debug(f"Task ID {task_id} already exists, generating new ID")
+            except Exception as e:
+                logger.debug(f"Error checking task ID {task_id}: {e}")
+                break
+
         # Construct the memo with the request message
-        if 'REQUEST_POST_FIAT ___' not in request_message:
-            classified_request_msg = 'REQUEST_POST_FIAT ___ ' + request_message
+        if TaskType.REQUEST_POST_FIAT.value not in request_message:
+            classified_request_msg = TaskType.REQUEST_POST_FIAT.value + request_message
         else:
             classified_request_msg = request_message
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                               task_id=task_id, 
-                                                               full_output=classified_request_msg)
-        # Send the memo to the default node
+                                                        task_id=task_id, 
+                                                        full_output=classified_request_msg)
         response = self.send_pft(amount=1, destination=self.default_node, memo=constructed_memo)
         logger.debug(f"request_post_fiat response: {response}")
         return response
@@ -1295,17 +1657,17 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
 
-        if most_recent_status != 'ACCEPTANCE':
-            raise WrongTaskStateException('ACCEPTANCE', most_recent_status)
+        if most_recent_status != TaskType.ACCEPTANCE.name:
+            raise WrongTaskStateException(TaskType.ACCEPTANCE.name, most_recent_status)
         
-        proposal_source = task_df.iloc[0]['node_account']
-        if 'COMPLETION JUSTIFICATION ___' not in completion_string:
-            classified_completion_str = 'COMPLETION JUSTIFICATION ___ ' + completion_string
+        proposal_source = task_df.iloc[0]['counterparty_address']
+        if TaskType.TASK_OUTPUT.value not in completion_string:
+            classified_completion_str = TaskType.TASK_OUTPUT.value + completion_string
         else:
             classified_completion_str = completion_string
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                              task_id=task_id, 
-                                                              full_output=classified_completion_str)
+                                                        task_id=task_id, 
+                                                        full_output=classified_completion_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"submit_initial_completion Response: {response}")
         return response
@@ -1324,17 +1686,17 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
         
-        if most_recent_status != 'VERIFICATION_PROMPT':
-            raise WrongTaskStateException('VERIFICATION_PROMPT', most_recent_status)
+        if most_recent_status != TaskType.VERIFICATION_PROMPT.name:
+            raise WrongTaskStateException(TaskType.VERIFICATION_PROMPT.name, most_recent_status)
         
-        proposal_source = task_df.iloc[0]['node_account']
-        if 'VERIFICATION RESPONSE ___' not in response_string:
-            classified_response_str = 'VERIFICATION RESPONSE ___ ' + response_string
+        proposal_source = task_df.iloc[0]['counterparty_address']
+        if TaskType.VERIFICATION_RESPONSE.value not in response_string:
+            classified_response_str = TaskType.VERIFICATION_RESPONSE.value + response_string
         else:
             classified_response_str = response_string
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                              task_id=task_id, 
-                                                              full_output=classified_response_str)
+                                                        task_id=task_id, 
+                                                        full_output=classified_response_str)
         response = self.send_pft(amount=1, destination=proposal_source, memo=constructed_memo)
         logger.debug(f"send_verification_response Response: {response}")
         return response
@@ -1360,11 +1722,14 @@ class PostFiatTaskManager:
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
         # Slicing data based on conditions
-        google_doc_slice = self.memos[self.memos['memo_data'].apply(lambda x: 
-                                                                   'google_doc_context_link' in str(x))].copy()
+        google_doc_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(
+            lambda x: SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value in str(x)
+        )].copy()
 
-        genesis_slice = self.memos[self.memos['memo_data'].apply(lambda x: 
-                                                                   'USER GENESIS __' in str(x))].copy()
+        # TODO: Remove User Genesis
+        genesis_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(
+            lambda x: TaskType.USER_GENESIS.value in str(x)
+        )].copy()
         
         # Extract genesis username
         genesis_username = "Unknown"
@@ -1377,20 +1742,20 @@ class PostFiatTaskManager:
             key_google_doc = list(google_doc_slice['memo_data'])[0]['full_output']
 
         # Sorting account info by datetime
-        sorted_account_info = self.memos.sort_values('datetime', ascending=True).copy()
+        sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
 
-        def extract_latest_message(message_type, node, is_outgoing):
+        def extract_latest_message(direction, node, is_outgoing):
             """
             Extract the latest message of a given type for a specific node.
             """
             if is_outgoing:
                 latest_message = sorted_account_info[
-                    (sorted_account_info['message_type'] == message_type) &
+                    (sorted_account_info['direction'] == direction) &
                     (sorted_account_info['destination'] == node)
                 ].tail(1)
             else:
                 latest_message = sorted_account_info[
-                    (sorted_account_info['message_type'] == message_type) &
+                    (sorted_account_info['direction'] == direction) &
                     (sorted_account_info['account'] == node)
                 ].tail(1)
             
@@ -1401,7 +1766,7 @@ class PostFiatTaskManager:
 
         def format_dict(data):
             if data:
-                standard_format = f"https://livenet.xrpl.org/transactions/{data.get('hash', '')}/detailed"
+                standard_format = self.get_explorer_transaction_url(data.get('hash', ''))
                 full_output = data.get('memo_data', {}).get('full_output', 'N/A')
                 task_id = data.get('memo_data', {}).get('task_id', 'N/A')
                 formatted_string = (
@@ -1434,19 +1799,6 @@ class PostFiatTaskManager:
         
         return key_display_info
 
-    def ux__convert_response_object_to_status_message(self, response):
-        """ Takes a response object from an XRP transaction and converts it into legible transaction text""" 
-        status_constructor = 'unsuccessfully'
-        logger.debug(f"Response: {response}")
-        if 'success' in response.status:
-            status_constructor = 'successfully'
-        non_hex_memo = self.convert_memo_dict(response.result['tx_json']['Memos'][0]['Memo'])
-        user_string = non_hex_memo['full_output']
-        amount_of_pft_sent = response.result['tx_json']['DeliverMax']['value']
-        node_name = response.result['tx_json']['Destination']
-        output_string = f"""User {status_constructor} sent {amount_of_pft_sent} PFT with request '{user_string}' to Node {node_name}"""
-        return output_string
-
     @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
         pomodoro_id = task_id.replace('__','==')
@@ -1456,29 +1808,102 @@ class PostFiatTaskManager:
         return response
 
     def get_all_pomodoros(self):
-        task_id_only = self.memos[self.memos['memo_data'].apply(lambda x: 'task_id' in str(x))].copy()
+        task_id_only = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 'task_id' in str(x))].copy()
         pomodoros_only = task_id_only[task_id_only['memo_data'].apply(lambda x: '==' in x['task_id'])].copy()
         pomodoros_only['parent_task_id']=pomodoros_only['memo_data'].apply(lambda x: x['task_id'].replace('==','__'))
         return pomodoros_only
     
     def verify_password(self, password):
-        """
-        Verify if the provided password is correct by attempting to decrypt credentials
-
-        Args: 
-            password (str): The password to verify
-
-        Returns:
-            bool: True if the password is correct, False otherwise
-        """
-        try: 
-            # Attempt to decrypt credentials with provided password
-            self.credential_manager.decrypt_creds(password)
-            return True
-        except Exception as e:
-            logger.error(f"Password verification failed: {e}")
-            return False
+        """Verifies password for current user"""
+        return self.credential_manager.verify_password(password)
     
+    def change_password(self, new_password):
+        """Changes password for current user"""
+        return self.credential_manager.change_password(new_password)
+        
+    def get_contacts(self):
+        return self.credential_manager.get_contacts()
+    
+    def save_contact(self, address, name):
+        return self.credential_manager.save_contact(address, name)
+    
+    def delete_contact(self, address):
+        return self.credential_manager.delete_contact(address)
+    
+    def get_explorer_transaction_url(self, tx_hash: str) -> str:
+        """Returns the appropriate explorer URL for a transaction based on network configuration"""
+        template = self.network_config.explorer_tx_url_mask
+        return template.format(hash=tx_hash)
+    
+    def get_explorer_account_url(self, address: str) -> str:
+        """Returns the appropriate explorer URL for an account based on network configuration"""
+        template = self.network_config.explorer_account_url_mask
+        return template.format(address=address)
+    
+    def has_trust_line(self):
+        """ Checks if the user has a trust line to the PFT token"""
+        try:
+            pft_holders = self.get_pft_holder_df()
+            existing_pft_accounts = list(pft_holders['account'])
+            user_is_in_pft_accounts = self.user_wallet.address in existing_pft_accounts
+            return user_is_in_pft_accounts
+        except Exception as e:
+            logger.error(f"Error checking if user has a trust line: {e}")
+            return False
+
+    @requires_wallet_state(FUNDED_STATES)
+    def handle_trust_line(self):
+        """ Handles the creation of a trust line to the PFT token if it doesn't exist"""
+        logger.debug("Checking if trust line exists...")
+        if not self.has_trust_line():
+            _ = self.generate_trust_line_to_pft_token()
+            logger.debug("Trust line created")
+        else:
+            logger.debug("Trust line already exists")
+
+    def generate_trust_line_to_pft_token(self):
+        """ Note this transaction consumes XRP to create a trust
+        line for the PFT Token so the holder DF should be checked 
+        before this is run
+        """ 
+        client = xrpl.clients.JsonRpcClient(self.network_url)
+        trust_set_tx = xrpl.models.transactions.TrustSet(
+            account=self.user_wallet.address,
+            limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
+                currency="PFT",
+                issuer=self.pft_issuer,
+                value=constants.DEFAULT_PFT_LIMIT,
+            )
+        )
+        logger.debug(f"Creating trust line from {self.user_wallet.address} to issuer...")
+        try:
+            response = xrpl.transaction.submit_and_wait(trust_set_tx, client, self.user_wallet)
+        except xrpl.transaction.XRPLReliableSubmissionException as e:
+            response = f"Submit failed: {e}"
+            logger.error(f"Trust line creation failed: {response}")
+        return response
+    
+    def get_pft_holder_df(self):
+        """ This function outputs a detail of all accounts holding PFT tokens
+        with a float of their balances as pft_holdings. note this is from
+        the view of the issuer account so balances appear negative so the pft_holdings 
+        are reverse signed.
+        """
+        client = xrpl.clients.JsonRpcClient(self.network_url)
+        logger.debug("Getting dataframe of all accounts holding PFT tokens...")
+        response = client.request(xrpl.models.requests.AccountLines(
+            account=self.pft_issuer,
+            ledger_index="validated",
+            peer=None,
+            limit=None))
+        if not response.is_successful():
+            raise Exception(f"Error fetching PFT holders: {response.result.get('error')}")
+        full_post_fiat_holder_df = pd.DataFrame(response.result)
+        for xfield in ['account','balance','currency','limit_peer']:
+            full_post_fiat_holder_df[xfield] = full_post_fiat_holder_df['lines'].apply(lambda x: x[xfield])
+        full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
+        return full_post_fiat_holder_df
+
 def is_over_1kb(string):
     # 1KB = 1024 bytes
     return len(string.encode('utf-8')) > 1024
@@ -1486,14 +1911,17 @@ def is_over_1kb(string):
 def to_hex(string):
     return binascii.hexlify(string.encode()).decode()
 
+def construct_handshake_memo(user, ecdh_public_key) -> str:
+    return construct_memo(user=user, memo_type=SystemMemoType.HANDSHAKE.value, memo_data=ecdh_public_key)
+
 def construct_basic_postfiat_memo(user, task_id, full_output):
     return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
 
 def construct_initiation_rite_memo(user='goodalexander', commitment='I commit to generating massive trading profits using AI and investing them to grow the Post Fiat Network'):
-    return construct_memo(user=user, memo_type='INITIATION_RITE', memo_data=commitment)
+    return construct_memo(user=user, memo_type=SystemMemoType.INITIATION_RITE.value, memo_data=commitment)
 
 def construct_google_doc_context_memo(user, google_doc_link):                  
-    return construct_memo(user=user, memo_type='google_doc_context_link', memo_data=google_doc_link) 
+    return construct_memo(user=user, memo_type=SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, memo_data=google_doc_link) 
 
 def construct_genesis_memo(user, task_id, full_output):
     return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
@@ -1555,7 +1983,7 @@ def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
     # Add destination_tag if provided, converting to int
     if destination_tag:
         payment_args['destination_tag'] = int(destination_tag)
-
+    
     # Sign the transaction to get the hash
     # We need to derive the hash because the submit_and_wait function doesn't return a hash if transaction fails
     # TODO: tx_hash currently not used because it doesn't match the hash produced by xrpl.transaction.submit_and_wait
@@ -1567,118 +1995,39 @@ def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
     try:    
         response = xrpl.transaction.submit_and_wait(payment, client, wallet)    
     except xrpl.transaction.XRPLReliableSubmissionException as e:
-        response = f"Transaction submission failed: {e}"
-        logger.error(response)
+        logger.error(f"Transaction submission failed: {e}")
+        raise
     except Exception as e:
-        response = f"Unexpected error: {e}"
-        logger.error(response)
+        logger.error(f"Unexpected error: {e}")
+        raise
 
     return response
 
-def is_task_id(memo_dict) -> bool:
-    """ This function checks if a memo dictionary contains a task ID or the required fields
-    for a task ID """
+def is_valid_id(memo_dict: dict) -> bool:
+    """ This function checks if a memo dictionary contains a valid ID pattern (used for both tasks and messages)"""
     memo_string = str(memo_dict)
 
     # Check for task ID pattern
-    task_id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
-    if re.search(task_id_pattern, memo_string):
-        return True
-    
-    # Check for required fields
-    required_fields = ['user:', 'full_output:']
-    return all(field in memo_string for field in required_fields)
+    id_pattern = re.compile(r'(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(?:__[A-Z0-9]{4})?)')
+    has_valid_pattern = bool(re.search(id_pattern, memo_string))
 
-def classify_task_string(string):
-    """ These are the canonical classifications for task strings 
-    on a Post Fiat Node
+    return has_valid_pattern
+
+def classify_task_string(string: str) -> str:
     """ 
-    categories = {
-            'ACCEPTANCE': ['ACCEPTANCE REASON ___'],
-            'PROPOSAL': [' .. ','PROPOSED PF ___'],
-            'REFUSAL': ['REFUSAL REASON ___'],
-            'VERIFICATION_PROMPT': ['VERIFICATION PROMPT ___'],
-            'VERIFICATION_RESPONSE': ['VERIFICATION RESPONSE ___'],
-            'REWARD': ['REWARD RESPONSE __'],
-            'TASK_OUTPUT': ['COMPLETION JUSTIFICATION ___'],
-            'USER_GENESIS': ['USER GENESIS __'],
-            'REQUEST_POST_FIAT':['REQUEST_POST_FIAT ___'],
-            'MEMO': ['chunk_'],
-        }
+    Classifies a task string using TaskType enum patterns.
+    Returns the string name of the task type
+    """ 
 
-    for category, keywords in categories.items():
-        if any(keyword in string for keyword in keywords):
-            return category
+    for task_type, patterns in TASK_PATTERNS.items():
+        if any(pattern in string for pattern in patterns):
+            return task_type.name
 
     return 'UNKNOWN'
 
 def is_pft_transaction(tx) -> bool:
     deliver_max = tx.get('DeliverMax', {})
     return isinstance(deliver_max, dict) and deliver_max.get('currency') == 'PFT'
-
-def get_pft_holder_df(network_url, pft_issuer):
-    """ This function outputs a detail of all accounts holding PFT tokens
-    with a float of their balances as pft_holdings. note this is from
-    the view of the issuer account so balances appear negative so the pft_holdings 
-    are reverse signed.
-    """
-    client = xrpl.clients.JsonRpcClient(network_url)
-    logger.debug("Getting dataframe of all accounts holding PFT tokens...")
-    response = client.request(xrpl.models.requests.AccountLines(
-        account=pft_issuer,
-        ledger_index="validated",
-        peer=None,
-        limit=None))
-    if not response.is_successful():
-        raise Exception(f"Error fetching PFT holders: {response.result.get('error')}")
-    full_post_fiat_holder_df = pd.DataFrame(response.result)
-    for xfield in ['account','balance','currency','limit_peer']:
-        full_post_fiat_holder_df[xfield] = full_post_fiat_holder_df['lines'].apply(lambda x: x[xfield])
-    full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
-    return full_post_fiat_holder_df
-    
-def has_trust_line(network_url, pft_issuer, wallet):
-    """ This function checks if the user has a trust line to the PFT token"""
-    try:
-        pft_holders = get_pft_holder_df(network_url, pft_issuer)
-        existing_pft_accounts = list(pft_holders['account'])
-        user_is_in_pft_accounts = wallet.address in existing_pft_accounts
-        return user_is_in_pft_accounts
-    except Exception as e:
-        logger.error(f"Error checking if user has a trust line: {e}")
-        return False
-
-def handle_trust_line(network_url, pft_issuer, wallet):
-    """ This function checks if the user has a trust line to the PFT token
-    and if not establishes one"""
-    logger.debug("Checking if trust line exists...")
-    if not has_trust_line(network_url, pft_issuer, wallet):
-        _ = generate_trust_line_to_pft_token(network_url, wallet)
-        logger.debug("Trust line created")
-    else:
-        logger.debug("Trust line already exists")
-
-def generate_trust_line_to_pft_token(network_url, wallet: xrpl.wallet.Wallet):
-    """ Note this transaction consumes XRP to create a trust
-    line for the PFT Token so the holder DF should be checked 
-    before this is run
-    """ 
-    client = xrpl.clients.JsonRpcClient(network_url)
-    trust_set_tx = xrpl.models.transactions.TrustSet(
-        account=wallet.address,
-        limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
-            currency="PFT",
-            issuer='rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW',
-            value='100000000',  # Large limit, arbitrarily chosen
-        )
-    )
-    logger.debug(f"Creating trust line from {wallet.address} to issuer...")
-    try:
-        response = xrpl.transaction.submit_and_wait(trust_set_tx, client, wallet)
-    except xrpl.transaction.XRPLReliableSubmissionException as e:
-        response = f"Submit failed: {e}"
-        logger.error(f"Trust line creation failed: {response}")
-    return response
 
 def generate_random_utf8_friendly_hash(length=6):
     # Generate a random sequence of bytes
@@ -1780,12 +2129,22 @@ class NoMatchingTaskException(Exception):
         self.task_id = task_id
         super().__init__(f"No matching task found for task ID: {task_id}")
 
+class NoMatchingMemoException(Exception):
+    """ This exception is raised when no matching memo is found """
+    def __init__(self, memo_id):
+        self.memo_id = memo_id
+        super().__init__(f"No matching memo found for memo ID: {memo_id}")
+
 class WrongTaskStateException(Exception):
-    """ This exception is raised when the most recent task status is not the expected status """
-    def __init__(self, expected_status, actual_status):
+    # TODO: restricted_flag is a hack and is confusing
+    """ This exception is raised when the most recent task status is not the expected status 
+    Alternatively, it can be raised when the task status is restricted 
+    """
+    def __init__(self, expected_status, actual_status, restricted_flag=False):
         self.expected_status = expected_status
         self.actual_status = actual_status
-        super().__init__(f"Expected status: {expected_status}, actual status: {actual_status}")
+        prefix = "Restricted" if restricted_flag else "Expected"
+        super().__init__(f"{prefix} status: {expected_status}, actual status: {actual_status}")
 
 class InvalidGoogleDocException(Exception):
     """ This exception is raised when the google doc is not valid """
@@ -1811,78 +2170,8 @@ class GoogleDocIsNotSharedException(Exception):
         self.google_url = google_url
         super().__init__(f"Google Doc is not shared: {google_url}")
 
-# class ProcessUserWebData:
-#     def __init__(self):
-#         print('kick off web history')
-#         self.ticker_regex = re.compile(r'\b[A-Z]{1,5}\b')
-#         #self.cik_regex = re.compile(r'CIK=(\d{10})|data/(\d{10})')
-#         self.cik_regex = re.compile(r'CIK=(\d+)|data/(\d+)')
-#         # THIS DOES NOT WORK FOR 'https://www.sec.gov/edgar/browse/?CIK=1409375&owner=exclude'
-#         mapper = StockMapper()
-#         self.cik_to_ticker_map = mapper.cik_to_tickers
-#     def get_user_web_history_df(self):
-#         outputs = get_history()
-#         historical_info = pd.DataFrame(outputs.histories)
-#         historical_info.columns=['date','url','content']
-#         return historical_info
-#     def get_primary_ticker_for_cik(self, cik):
-#         ret = ''
-#         try:
-#             ret = list(self.cik_to_ticker_map[cik])[0]
-#         except:
-#             pass
-#         return ret
-
-#     def extract_cik_to_ticker(self, input_string):
-#         # Define a regex pattern to match CIKs
-#         cik_regex = self.cik_regex
-        
-#         # Find all matches in the input string
-#         matches = cik_regex.findall(input_string)
-        
-#         # Extract CIKs from the matches and zfill to 10 characters
-#         ciks = [match[0] or match[1] for match in matches]
-#         padded_ciks = [cik.zfill(10) for cik in ciks]
-#         output = ''
-#         if len(padded_ciks) > 0:
-#             output = self.get_primary_ticker_for_cik(padded_ciks[0])
-        
-#         return output
-    
-
-#     def extract_tickers(self, stringer):
-#         tickers = list(set(self.ticker_regex.findall(stringer)))
-#         return tickers
-
-#     def create_basic_web_history_frame(self):
-#         all_web_history_df = self.get_user_web_history_df()
-#         all_web_history_df['cik_ticker_extraction']= all_web_history_df['url'].apply(lambda x: [self.extract_cik_to_ticker(x)])
-#         all_web_history_df['content_tickers']=all_web_history_df['content'].apply(lambda x: self.extract_tickers(x))#.tail(20)
-#         all_web_history_df['url_tickers']=all_web_history_df['url'].apply(lambda x: self.extract_tickers(x))#.tail(20)
-#         all_web_history_df['all_tickers']=all_web_history_df['content_tickers']+all_web_history_df['url_tickers']+all_web_history_df['cik_ticker_extraction']
-#         all_web_history_df['date_str']=all_web_history_df['date'].apply(lambda x: x.strftime('%Y-%m-%d'))
-#         str_map = pd.DataFrame(all_web_history_df['date_str'].unique())
-#         str_map.columns=['date_str']
-#         str_map['date']=pd.to_datetime(str_map['date_str'])
-#         all_web_history_df['simplified_date']=all_web_history_df['date_str'].map(str_map.groupby('date_str').last()['date'])
-#         all_web_history_df['all_tickers']=all_web_history_df['all_tickers'].apply(lambda x: list(set(x)))
-#         return all_web_history_df
-
-#     def convert_all_web_history_to_simple_web_data_json(self,all_web_history):
-#         recent_slice = all_web_history[all_web_history['simplified_date']>=datetime.datetime.now()-datetime.timedelta(7)].copy()
-#         recent_slice['explode_block']=recent_slice.apply(lambda x: pd.DataFrame(([[i,x['simplified_date']] for i in x['all_tickers']])),axis=1)
-        
-#         full_ticker_history  =pd.concat(list(recent_slice['explode_block']))
-#         full_ticker_history.columns=['ticker','date']
-#         full_ticker_history['included']=1
-#         stop_tickers=['EDGAR','CIK','ETF','FORM','API','HOME','GAAP','EPS','NYSE','XBRL','AI','SBF','I','US','USD','SEO','','A','X','SEC','PC','EX','UTF','SIC']
-#         multidex = full_ticker_history.groupby(['ticker','date']).last().sort_index()
-#         financial_attention_df = multidex[~multidex.index.get_level_values(0).isin(stop_tickers)]['included'].unstack(0).sort_values('date').resample('D').last()
-#         last_day = financial_attention_df[-1:].sum()
-#         last_week = financial_attention_df[-7:].sum()
-        
-#         ld_lw = pd.concat([last_day, last_week],axis=1)
-#         ld_lw.columns=['last_day','last_week']
-#         ld_lw=ld_lw.astype(int)
-#         ld_lw[ld_lw.sum(1)>0].to_json()
-#         return ld_lw
+class HandshakeRequiredError(Exception):
+    """ This exception is raised when a handshake is required """
+    def __init__(self, destination):
+        self.destination = destination
+        super().__init__(f"Cannot encrypt message: no handshake received from {destination}")
