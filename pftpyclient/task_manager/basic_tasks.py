@@ -1972,25 +1972,25 @@ def send_xrp(network_url, wallet: xrpl.wallet.Wallet, amount, destination, memo=
         logger.error("Memo is not a string or a Memo object, raising ValueError")
         raise ValueError("Memo must be either a string or a Memo object")
     
-    # Create payment transaction with optional destination tag
+    # Create payment transaction args
     payment_args = {
-        "account": wallet.address,
-        "amount": xrpl.utils.xrp_to_drops(Decimal(amount)),
-        "destination": destination,
-        "memos": memos
+        'account': wallet.address,
+        'amount': xrpl.utils.xrp_to_drops(Decimal(amount)),
+        'destination': destination,
+        'memos': memos,
     }
 
-    # Add destination tag if provided
+    # Add destination_tag if provided, converting to int
     if destination_tag:
-        payment_args["destination_tag"] = destination_tag
-
-    payment = xrpl.models.transactions.Payment(**payment_args)
-
+        payment_args['destination_tag'] = int(destination_tag)
+    
     # Sign the transaction to get the hash
     # We need to derive the hash because the submit_and_wait function doesn't return a hash if transaction fails
     # TODO: tx_hash currently not used because it doesn't match the hash produced by xrpl.transaction.submit_and_wait
     # signed_tx = xrpl.transaction.sign(payment, wallet)
     # tx_hash = signed_tx.get_hash()
+
+    payment = xrpl.models.transactions.Payment(**payment_args)
 
     try:    
         response = xrpl.transaction.submit_and_wait(payment, client, wallet)    

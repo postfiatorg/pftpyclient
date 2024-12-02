@@ -2343,6 +2343,7 @@ class WalletApp(wx.Frame):
             self.txt_memo_input.SetValue("")
             wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
 
+
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
