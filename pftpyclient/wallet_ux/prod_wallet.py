@@ -36,8 +36,7 @@ from pathlib import Path
 from cryptography.fernet import InvalidToken
 import pandas as pd
 from enum import Enum, auto
-
-
+from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
 
 # Configure the logger at module level
 wx_sink = configure_logger(
@@ -409,6 +408,9 @@ class WalletApp(wx.Frame):
 
         self.username = None
 
+        # Check for migration
+        check_and_show_migration_dialog(parent=self)
+
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""
         columns = self.GRID_CONFIGS[grid_name]['columns']
@@ -448,7 +450,9 @@ class WalletApp(wx.Frame):
 
         # Extras menu
         extras_menu = wx.Menu()
+        self.migrate_item = extras_menu.Append(wx.ID_ANY, "Migrate Old Credentials", "Migrate credentials from old format")
         self.perf_monitor_item = extras_menu.Append(wx.ID_ANY, "Performance Monitor", "Monitor client's performance")
+        self.Bind(wx.EVT_MENU, self.on_migrate_credentials, self.migrate_item)
         self.Bind(wx.EVT_MENU, self.launch_perf_monitor, self.perf_monitor_item)
         self.menubar.Append(extras_menu, "Extras")
 
@@ -2522,6 +2526,10 @@ class WalletApp(wx.Frame):
             int(color.Blue() * factor),
             color.Alpha()
         )
+    
+    def on_migrate_credentials(self, event):
+        """Handle migration of old credentials"""
+        check_and_show_migration_dialog(parent=self, force=True)
     
     def launch_perf_monitor(self, event=None):
         """Toggle the performance monitor on and off"""
