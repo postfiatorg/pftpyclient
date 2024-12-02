@@ -1,7 +1,7 @@
 from typing import Union
 import binascii
 from dataclasses import dataclass
-from pftpyclient.wallet_ux.constants import SystemMemoType, TaskType, MessageType
+from pftpyclient.configuration.constants import SystemMemoType, TaskType, MessageType
 from xrpl.models.amounts import Memo
 from loguru import logger
 import random

@@ -30,12 +30,15 @@ import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from pftpyclient.performance.monitor import PerformanceMonitor
-from pftpyclient.configuration.configuration import ConfigurationManager
+from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
 from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
 import pandas as pd
 from enum import Enum, auto
+
+
+
 # Configure the logger at module level
 wx_sink = configure_logger(
     log_to_file=True,
@@ -43,7 +46,7 @@ wx_sink = configure_logger(
     log_filename="prod_wallet.log",
     level="DEBUG"
 )
-from pftpyclient.wallet_ux.constants import *
+from pftpyclient.configuration.constants import *
 
 UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
 REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 10  # 10 seconds
@@ -377,7 +380,7 @@ class WalletApp(wx.Frame):
 
         self.config = ConfigurationManager()
         self.network_config = get_network_config()
-        self.network_url = self.network_config.public_rpc_url
+        self.network_url = self.config.get_current_endpoint()
         self.pft_issuer = self.network_config.issuer_address
         
         self.perf_monitor = None
@@ -489,12 +492,14 @@ class WalletApp(wx.Frame):
         # Create Summary tab elements
         username_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.summary_lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
+        self.summary_lbl_endpoint = wx.StaticText(self.summary_tab, label=f"Endpoint: {self.network_url}")
         network_text = "Testnet" if self.config.get_global_config('use_testnet') else "Mainnet"
         self.summary_lbl_network = wx.StaticText(self.summary_tab, label=f"Network: {network_text}")
         self.summary_lbl_wallet_state = wx.StaticText(self.summary_tab, label="Wallet State: ")
 
         username_row_sizer.Add(self.summary_lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         username_row_sizer.AddStretchSpacer()
+        username_row_sizer.Add(self.summary_lbl_endpoint, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         username_row_sizer.Add(self.summary_lbl_network, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         username_row_sizer.Add(self.summary_lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         self.summary_sizer.Add(username_row_sizer, 0, wx.EXPAND)
@@ -548,6 +553,7 @@ class WalletApp(wx.Frame):
         self.proposals_tab = wx.Panel(self.tabs)
         self.tabs.AddPage(self.proposals_tab, "Proposals")
         self.proposals_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.proposals_sizer.AddSpacer(10)
         self.proposals_tab.SetSizer(self.proposals_sizer)
 
         # Add the task management buttons in the Accepted tab
@@ -572,6 +578,14 @@ class WalletApp(wx.Frame):
         self.btn_submit_for_verification.Bind(wx.EVT_BUTTON, self.on_submit_for_verification)
 
         self.proposals_sizer.Add(self.proposals_button_sizer_2, 0, wx.EXPAND)
+
+        # Add checkbox for showing refused tasks
+        bottom_controls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        bottom_controls_sizer.AddStretchSpacer()
+        self.chk_show_refused = wx.CheckBox(self.proposals_tab, label="Show Refused Tasks")
+        self.chk_show_refused.Bind(wx.EVT_CHECKBOX, self.on_toggle_refused_tasks)
+        bottom_controls_sizer.Add(self.chk_show_refused, 0, wx.ALL, 2)
+        self.proposals_sizer.Add(bottom_controls_sizer, 0, wx.EXPAND | wx.ALL, 2)
 
         # Add grid to Proposals tab
         self.proposals_grid = self.setup_grid(gridlib.Grid(self.proposals_tab), 'proposals')
@@ -674,8 +688,13 @@ class WalletApp(wx.Frame):
         self.memo_recipient.Bind(wx.EVT_TEXT, self.on_destination_text)
         recipient_sizer.Add(self.memo_recipient, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
+        # Temporary encryption handling while NodeTools is being updated
+        self.memo_recipient.Bind(wx.EVT_COMBOBOX, self.on_memo_recipient_changed)
+        self.memo_recipient.Bind(wx.EVT_TEXT, self.on_memo_recipient_changed)
+
         # Add checkboxes
         self.memo_chk_encrypt = wx.CheckBox(self.memos_tab, label="Encrypt")
+
         recipient_sizer.Add(self.memo_chk_encrypt, flag=wx.ALIGN_CENTER_VERTICAL, border=5)
 
         self.memos_sizer.Add(recipient_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -906,10 +925,53 @@ class WalletApp(wx.Frame):
         """Handle manual text entry - allow any text"""
         event.Skip()
 
+    def on_memo_recipient_changed(self, event=None):
+        """
+        TEMPORARY METHOD WHILE NODETOOLS IS BEING UPDATED
+        Handle memo recipient changes to update encryption checkbox state
+        """
+        if event is not None:
+            event.Skip()  # Allow other event handlers to process
+        
+        # Get the actual address from client data if it's a selection, otherwise use the raw value
+        selection = self.memo_recipient.GetSelection()
+        if selection != wx.NOT_FOUND:
+            address = self.memo_recipient.GetClientData(selection)
+        else:
+            address = self.memo_recipient.GetValue()
+
+        network_config = get_network_config()        
+        is_system_address = (
+            address == network_config.remembrancer_address or 
+            address == network_config.node_address
+        )
+        
+        # Disable encryption for system addresses
+        self.memo_chk_encrypt.Enable(not is_system_address)
+        
+        # Uncheck if disabled
+        if is_system_address and self.memo_chk_encrypt.GetValue():
+            self.memo_chk_encrypt.SetValue(False)
+
+    def on_toggle_refused_tasks(self, event):
+        """Handle toggling of the refused tasks checkbox"""
+        try:
+            include_refused = self.chk_show_refused.IsChecked()
+            # Get proposals data with the new include_refused setting
+            proposals_df = self.task_manager.get_proposals_df(include_refused=include_refused)
+            # Update only the proposals grid
+            wx.PostEvent(self, UpdateGridEvent(data=proposals_df, target="proposals", caller=f"{self.__class__.__name__}.on_toggle_refused_tasks"))
+        except Exception as e:
+            logger.error(f"Error updating proposals grid: {e}")
+            wx.MessageBox(f"Error updating proposals grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
     def update_all_destination_comboboxes(self):
         """Update all destination comboboxes"""
-        self._populate_destination_combobox(self.txt_payment_destination)
-        self._populate_destination_combobox(self.memo_recipient, self.network_config.remembrancer_address)
+        self._populate_destination_combobox(combobox=self.txt_payment_destination)
+        self._populate_destination_combobox(
+            combobox=self.memo_recipient, 
+            default_destination=self.network_config.remembrancer_address
+        )
 
     def _populate_destination_combobox(self, combobox, default_destination=None):
         """
@@ -1290,6 +1352,15 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
         self.update_all_destination_comboboxes()
+
+        # TEMPORARY METHOD WHILE NODETOOLS IS BEING UPDATED
+        self.on_memo_recipient_changed(None)
+
+    def update_network_display(self):
+        """Update UI elements that display network information"""
+        self.summary_lbl_endpoint.SetLabel(f"Endpoint: {self.network_url}")
+        self.summary_sizer.Layout()
+        self.summary_tab.Layout()
 
     @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
@@ -2611,6 +2682,31 @@ class WalletApp(wx.Frame):
         dialog.ShowModal()
         dialog.Destroy()
 
+    def try_connect_endpoint(self, endpoint: str) -> bool:
+        """
+        Attempt to connect to a new RPC endpoint with timeout.
+        
+        Args:
+            endpoint: The RPC endpoint URL to test
+            timeout: Maximum time to wait for connection in seconds
+            
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
+        try:
+            # Create a JsonRpcClient for the endpoint
+            client = xrpl.clients.JsonRpcClient(endpoint)
+            
+            # Try to get server info as a connection test
+            response = client.request(xrpl.models.requests.ServerInfo())
+            
+            # If we got a response without error, connection was successful
+            return response.is_successful()
+
+        except Exception as e:
+            logger.error(f"Connection test failed for {endpoint}: {e}")
+            return False
+
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
     def OnLinkClicked(self, link):
         url = link.GetHref()
@@ -2881,59 +2977,72 @@ class EncryptionRequestsDialog(wx.Dialog):
 class PreferencesDialog(wx.Dialog):
     def __init__(self, parent):
         super().__init__(parent, title="Preferences")
-        self.config = parent.config
+        self.config: ConfigurationManager = parent.config
+        self.parent: WalletApp = parent
 
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
 
-        # Create a static box for grouping preferences
-        sb = wx.StaticBox(panel, label="Application Settings")
-        sbs = wx.StaticBoxSizer(sb, wx.VERTICAL)
+        # Application Settings Box
+        app_sb = wx.StaticBox(panel, label="Application Settings")
+        app_sbs = wx.StaticBoxSizer(app_sb, wx.VERTICAL)
 
         # Require password for payment checkbox
         self.require_password_for_payment = wx.CheckBox(panel, label="Require password for payment")
         self.require_password_for_payment.SetValue(self.config.get_global_config('require_password_for_payment'))
-        sbs.Add(self.require_password_for_payment, 0, wx.ALL | wx.EXPAND, 5)
+        app_sbs.Add(self.require_password_for_payment, 0, wx.ALL | wx.EXPAND, 5)
 
         # Performance Monitor checkbox
         self.perf_monitor = wx.CheckBox(panel, label="Enable Performance Monitor")
         self.perf_monitor.SetValue(self.config.get_global_config('performance_monitor'))
-        sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
+        app_sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
 
         # Cache Format radio buttons
         cache_box = wx.StaticBox(panel, label="Transaction Cache Format")
-        cache_sbs = wx.StaticBoxSizer(cache_box, wx.VERTICAL)
-
+        cache_sbs = wx.StaticBoxSizer(cache_box, wx.HORIZONTAL)
         self.cache_csv = wx.RadioButton(panel, label="CSV", style=wx.RB_GROUP)
         self.cache_pickle = wx.RadioButton(panel, label="Pickle")
-
         current_format = self.config.get_global_config("transaction_cache_format")
-        if current_format == "csv":
-            self.cache_csv.SetValue(True)
-        else:
-            self.cache_pickle.SetValue(True)
+        self.cache_csv.SetValue(current_format == "csv")
+        self.cache_pickle.SetValue(current_format != "csv")
+        cache_sbs.Add(self.cache_csv, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        cache_sbs.Add(self.cache_pickle, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        app_sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
 
-        cache_sbs.Add(self.cache_csv, 0, wx.ALL, 5)
-        cache_sbs.Add(self.cache_pickle, 0, wx.ALL, 5)
-        sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
+        vbox.Add(app_sbs, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Network Settings Box
+        net_sb = wx.StaticBox(panel, label="Network Settings")
+        net_sbs = wx.StaticBoxSizer(net_sb, wx.VERTICAL)
 
         # Network selection radio buttons
         network_box = wx.StaticBox(panel, label="XRPL Network")
-        network_sbs = wx.StaticBoxSizer(network_box, wx.VERTICAL)
-
+        network_sbs = wx.StaticBoxSizer(network_box, wx.HORIZONTAL)
         self.mainnet_radio = wx.RadioButton(panel, label="Mainnet", style=wx.RB_GROUP)
         self.testnet_radio = wx.RadioButton(panel, label="Testnet")
-
         use_testnet = self.config.get_global_config('use_testnet')
         self.testnet_radio.SetValue(use_testnet)
         self.mainnet_radio.SetValue(not use_testnet)
+        network_sbs.Add(self.mainnet_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        network_sbs.Add(self.testnet_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        net_sbs.Add(network_sbs, 0, wx.ALL | wx.EXPAND, 5)
 
-        network_sbs.Add(self.mainnet_radio, 0, wx.ALL, 5)
-        network_sbs.Add(self.testnet_radio, 0, wx.ALL, 5)
-        sbs.Add(network_sbs, 0, wx.ALL | wx.EXPAND, 5)
+        # RPC Endpoint selection
+        endpoint_box = wx.BoxSizer(wx.HORIZONTAL)
+        endpoint_box.Add(wx.StaticText(panel, label="RPC Endpoint:"), 0, wx.CENTER | wx.ALL, 5)
+        self.endpoint_combo = wx.ComboBox(panel, style=wx.CB_DROPDOWN | wx.TE_PROCESS_ENTER)
+        self.update_endpoint_combo()
+        endpoint_box.Add(self.endpoint_combo, 1, wx.EXPAND | wx.ALL, 5)
+        net_sbs.Add(endpoint_box, 0, wx.EXPAND | wx.ALL, 5)
 
         # Add the static box to the main vertical box
-        vbox.Add(sbs, 0, wx.ALL | wx.EXPAND, 10)
+        vbox.Add(net_sbs, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Bind events
+        self.mainnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
+        self.testnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
+        self.endpoint_combo.Bind(wx.EVT_COMBOBOX, self.on_endpoint_selected)
+        self.endpoint_combo.Bind(wx.EVT_TEXT_ENTER, self.on_endpoint_text_enter)
 
         # Add OK and Cancel buttons
         button_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -2951,6 +3060,92 @@ class PreferencesDialog(wx.Dialog):
 
         self.SetSize(self.GetBestSize())
         self.Center()
+
+    # def on_endpoint_text_changed(self, event):
+    #     """Handle endpoint text changes"""
+    #     event.Skip()
+
+    def update_endpoint_combo(self):
+        """Update endpoint combobox based on selected network"""
+        current = self.config.get_current_endpoint()
+        recent = self.config.get_network_endpoints()
+
+        # Get the desired list of items (current first, then others)
+        desired_items = [current] + [ep for ep in recent if ep != current]
+        
+        # Remove any items that shouldn't be there
+        count = self.endpoint_combo.GetCount()
+        for i in range(count-1, -1, -1):  # Iterate backwards to safely remove items
+            if self.endpoint_combo.GetString(i) not in desired_items:
+                self.endpoint_combo.Delete(i)
+        
+        # Add any missing items
+        existing_items = [self.endpoint_combo.GetString(i) for i in range(self.endpoint_combo.GetCount())]
+        for item in desired_items:
+            if item not in existing_items:
+                self.endpoint_combo.Append(item)
+    
+        # Set the value without clearing first
+        self.endpoint_combo.SetValue(current)
+        self.endpoint_combo.Refresh()
+        self.endpoint_combo.Update()
+
+    def on_network_changed(self, event):
+        """Handle network selection change"""
+        self.update_endpoint_combo()
+
+    def on_endpoint_selected(self, event):
+        """Handle endpoint selection from dropdown"""
+        selected_endpoint = self.endpoint_combo.GetValue()
+        
+        # Ensure the selected value is displayed in the combobox
+        self.endpoint_combo.SetValue(selected_endpoint)
+        
+        # Process the endpoint change
+        self.handle_endpoint_change(selected_endpoint)
+
+    def on_endpoint_text_enter(self, event):
+        """Handle endpoint text entry"""
+        self.handle_endpoint_change(self.endpoint_combo.GetValue())
+
+    def handle_endpoint_change(self, new_endpoint: str):
+        """Handle endpoint selection/entry"""
+        new_endpoint = new_endpoint.strip()
+
+        if not new_endpoint:
+            return
+        
+        try:
+            # Store current endpoint for fallback
+            current_endpoint = self.config.get_current_endpoint()
+
+            # Attempt to connect with timeout
+            success = self.parent.try_connect_endpoint(new_endpoint)
+
+            if success:
+                self.config.set_current_endpoint(new_endpoint)
+                self.update_endpoint_combo()
+
+                # Update the main WalletApp's network_url
+                self.parent.network_url = new_endpoint
+                self.parent.update_network_display()
+                logger.debug(f"Updated WalletApp network_url to: {self.parent.network_url}")
+            else:
+                wx.MessageBox(
+                    "Failed to connect to endpoint. Reverting to previous endpoint.",
+                    "Connection Failed",
+                    wx.OK | wx.ICON_ERROR
+                )
+                # Revert to previous endpoint
+                self.config.set_current_endpoint(current_endpoint)
+                self.update_endpoint_combo()
+        except Exception as e:
+            wx.MessageBox(
+                f"Error connecting to endpoint: {e}",
+                "Connection Error",
+                wx.OK | wx.ICON_ERROR
+            )
+            self.update_endpoint_combo()
 
     def on_ok(self, event):
         """Save config when OK is clicked"""

@@ -33,11 +33,11 @@ from pftpyclient.task_manager.wallet_state import (
     PFT_STATES
 )
 from pftpyclient.performance.monitor import PerformanceMonitor
-from pftpyclient.configuration.configuration import ConfigurationManager
+from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
 nest_asyncio.apply()
-from pftpyclient.wallet_ux.constants import *
+from pftpyclient.configuration.constants import *
 from cryptography.fernet import Fernet
-import pftpyclient.wallet_ux.constants as constants
+import pftpyclient.configuration.constants as constants
 MAX_CHUNK_SIZE = 760
 
 SAVE_MEMO_TRANSACTIONS = True
@@ -74,6 +74,8 @@ class PostFiatTaskManager:
         self.tasks = pd.DataFrame()
         self.memos = pd.DataFrame()
         self.system_memos = pd.DataFrame()
+
+        self.handshake_cache = {}  # Address -> (handshake_sent, received_key)
 
         # Initialize client for blockchain queries
         self.client = xrpl.clients.JsonRpcClient(self.network_url)
@@ -738,6 +740,9 @@ class PostFiatTaskManager:
         - handshake_sent: Whether we've already sent our public key
         - received_key: Their ECDH public key if they've sent it, None otherwise
         """
+        if self.handshake_cache.get(address):
+            return self.handshake_cache[address]
+
         if self.system_memos.empty:
             logger.debug("No system memos found")
             return False, None
@@ -771,7 +776,9 @@ class PostFiatTaskManager:
             received_key = latest_received_handshake['full_output']
             logger.debug(f"Most recent received handshake: {received_key[:8]}...")
 
-        return handshake_sent, received_key
+        result = (handshake_sent, received_key)
+        self.handshake_cache[address] = result
+        return result
     
     @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('send_handshake')
@@ -1259,17 +1266,31 @@ class PostFiatTaskManager:
 
     @requires_wallet_state(WalletState.ACTIVE)
     @PerformanceMonitor.measure('get_proposals_df')
-    def get_proposals_df(self):
+    def get_proposals_df(self, include_refused=False):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
         # Filter tasks with task_type in ['PROPOSAL','ACCEPTANCE']
-        filtered_tasks = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.ACCEPTANCE.name])]
+        filtered_tasks = self.tasks[self.tasks['task_type'].isin([
+            TaskType.PROPOSAL.name, 
+            TaskType.ACCEPTANCE.name,
+            TaskType.REFUSAL.name
+        ])]
 
-        # Get task_ids where the latest state is 'PROPOSAL' or 'ACCEPTANCE'
-        proposal_task_ids = [
-            task_id for task_id in filtered_tasks['task_id'].unique()
-            if self.get_task_state_using_task_id(task_id) in [TaskType.PROPOSAL.name, TaskType.ACCEPTANCE.name]
-        ]
+        # Get task_ids where:
+        # 1. The latest state is 'PROPOSAL' or 'ACCEPTANCE' (or REFUSAL if include_refused=True) AND
+        # 2. if include_refused=False, exclude tasks that have ever been refused
+        proposal_task_ids = []
+        valid_states = [TaskType.PROPOSAL.name, TaskType.ACCEPTANCE.name]
+        if include_refused:
+            valid_states.append(TaskType.REFUSAL.name)
+
+        for task_id in filtered_tasks['task_id'].unique():
+            task_df = self.get_task(task_id)
+            latest_state = self.get_task_state(task_df)
+            
+            if latest_state in valid_states:
+                if include_refused or TaskType.REFUSAL.name not in task_df['task_type'].values:
+                    proposal_task_ids.append(task_id)
 
         # Filter for these tasks
         filtered_df = self.tasks[(self.tasks['task_id'].isin(proposal_task_ids))].copy()
@@ -1599,8 +1620,17 @@ class PostFiatTaskManager:
         """
         
         # Generate a custom task ID for this request
-        task_id = self.generate_custom_id()
-        
+        while True:
+            task_id = self.generate_custom_id()
+            try:
+                task_df = self.tasks[self.tasks['task_id'] == task_id]
+                if task_df.empty:
+                    break
+                logger.debug(f"Task ID {task_id} already exists, generating new ID")
+            except Exception as e:
+                logger.debug(f"Error checking task ID {task_id}: {e}")
+                break
+
         # Construct the memo with the request message
         if TaskType.REQUEST_POST_FIAT.value not in request_message:
             classified_request_msg = TaskType.REQUEST_POST_FIAT.value + request_message
