@@ -223,30 +223,29 @@ class CredentialManager:
         return base64.urlsafe_b64encode(kdf.derive(password.encode()))
     
     def _initialize_database(self):
-        """Initialize the SQLite database if it doesn't exist"""
-        if not self.db_path.exists():
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                # Create credentials table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS credentials (
-                        username TEXT NOT NULL,
-                        key TEXT NOT NULL,
-                        encrypted_value TEXT NOT NULL,
-                        PRIMARY KEY (username, key)
-                    );
-                """)
-                # Create contacts table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS contacts (
-                        username TEXT NOT NULL,
-                        address TEXT NOT NULL,
-                        name TEXT NOT NULL,  -- encrypted
-                        PRIMARY KEY (username, address)
-                    );
-                """)
-                conn.commit()
-            logger.info(f"Initialized database at {self.db_path}")
+        """Initialize the SQLite database"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # Create credentials table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS credentials (
+                    username TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    encrypted_value TEXT NOT NULL,
+                    PRIMARY KEY (username, key)
+                );
+            """)
+            # Create contacts table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS contacts (
+                    username TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    name TEXT NOT NULL,  -- encrypted
+                    PRIMARY KEY (username, address)
+                );
+            """)
+            conn.commit()
+        logger.debug(f"Initialized database at {self.db_path}")
 
     def _encrypt_value(self, value):
         """Encrypt a value using the derived encryption key"""
