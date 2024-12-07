@@ -9,16 +9,16 @@ import asyncio
 from threading import Thread, Event
 import wx.lib.newevent
 import nest_asyncio
-from pftpyclient.task_manager.wallet_state import (
+from pftpyclient.utilities.wallet_state import (
     WalletState, 
     requires_wallet_state,
     FUNDED_STATES,
     TRUSTLINED_STATES,
     INITIATED_STATES,
-    GOOGLE_DOC_SENT_STATES,
-    PFT_STATES
+    HANDSHAKED_STATES,
+    ACTIVATED_STATES
 )
-from pftpyclient.task_manager.basic_tasks import (
+from pftpyclient.utilities.task_manager import (
     PostFiatTaskManager, 
     NoMatchingTaskException, 
     WrongTaskStateException, 
@@ -26,7 +26,6 @@ from pftpyclient.task_manager.basic_tasks import (
     compress_string
 )
 from pftpyclient.user_login.credentials import CredentialManager
-import webbrowser
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from pftpyclient.performance.monitor import PerformanceMonitor
@@ -37,6 +36,10 @@ from cryptography.fernet import InvalidToken
 import pandas as pd
 from enum import Enum, auto
 from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
+import traceback
+
+from pftpyclient.wallet_ux.dialogs import *
+from pftpyclient.wallet_ux.dialogs import CustomDialog
 
 # Configure the logger at module level
 wx_sink = configure_logger(
@@ -229,67 +232,6 @@ class XRPLMonitorThread(Thread):
             logger.error(f"Error in on_connected: {response.result}")
             raise Exception(str(response.result))
 
-class CustomDialog(wx.Dialog):
-    def __init__(self, title, fields, message=None):
-        super(CustomDialog, self).__init__(None, title=title, size=(500, 200))
-        self.fields = fields
-        self.message = message
-        self.InitUI()
-
-        # For layout update before getting best size
-        self.GetSizer().Fit(self)
-        self.Layout()
-
-        best_size = self.GetBestSize()
-        min_height = best_size.height
-        self.SetSize((500, min_height))
-
-    def InitUI(self):
-        pnl = wx.Panel(self)
-        vbox = wx.BoxSizer(wx.VERTICAL)
-
-        if self.message:
-            message_label = wx.StaticText(pnl, label=self.message, style=wx.ST_NO_AUTORESIZE)
-            message_label.Wrap(480)  # wrap text at slightly less than width of dialog
-            vbox.Add(message_label, flag=wx.EXPAND | wx.ALL, border=10)
-
-        self.text_controls = {}
-        for field in self.fields:
-            hbox = wx.BoxSizer(wx.HORIZONTAL)
-            label = wx.StaticText(pnl, label=field)
-            hbox.Add(label, flag=wx.RIGHT, border=8)
-            text_ctrl = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 100))
-            hbox.Add(text_ctrl, proportion=1)
-            self.text_controls[field] = text_ctrl
-            vbox.Add(hbox, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, border=10)
-
-        vbox.Add((-1, 25))
-
-        hbox_buttons = wx.BoxSizer(wx.HORIZONTAL)
-        self.submit_button = wx.Button(pnl, label="Submit")
-        self.close_button = wx.Button(pnl, label="Close")
-        hbox_buttons.Add(self.submit_button)
-        hbox_buttons.Add(self.close_button, flag=wx.LEFT | wx.BOTTOM, border=5)
-        vbox.Add(hbox_buttons, flag=wx.ALIGN_RIGHT | wx.RIGHT, border=10)
-
-        pnl.SetSizer(vbox)
-
-        dialog_sizer = wx.BoxSizer(wx.VERTICAL)
-        dialog_sizer.Add(pnl, 1, wx.EXPAND)
-        self.SetSizer(dialog_sizer)
-
-        self.submit_button.Bind(wx.EVT_BUTTON, self.OnSubmit)
-        self.close_button.Bind(wx.EVT_BUTTON, self.OnClose)
-
-    def OnSubmit(self, e):
-        self.EndModal(wx.ID_OK)
-
-    def OnClose(self, e):
-        self.EndModal(wx.ID_CANCEL)
-
-    def GetValues(self):
-        return {field: text_ctrl.GetValue() for field, text_ctrl in self.text_controls.items()}
-
 class WalletApp(wx.Frame):
 
     STATE_AVAILABLE_TABS = {
@@ -297,7 +239,7 @@ class WalletApp(wx.Frame):
         WalletState.FUNDED: ["Summary", "Payments", "Log"],
         WalletState.TRUSTLINED: ["Summary", "Payments", "Memos", "Log"],
         WalletState.INITIATED: ["Summary", "Payments", "Memos", "Log"],
-        WalletState.GOOGLE_DOC_SENT: ["Summary", "Payments", "Memos", "Log"],
+        WalletState.HANDSHAKE_SENT: ["Summary", "Payments", "Memos", "Log"],
         WalletState.ACTIVE: ["Summary", "Proposals", "Verification", "Rewards", "Payments", "Memos", "Log"]
     }
 
@@ -437,6 +379,7 @@ class WalletApp(wx.Frame):
         # Create Account menu
         self.account_menu = wx.Menu()
         self.contacts_item = self.account_menu.Append(wx.ID_ANY, "Manage Contacts")
+        self.update_gdoc_item = self.account_menu.Append(wx.ID_ANY, "Update Google Doc")  # New item
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
         self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
@@ -444,6 +387,7 @@ class WalletApp(wx.Frame):
 
         # Bind menu events
         self.Bind(wx.EVT_MENU, self.on_manage_contacts, self.contacts_item)
+        self.Bind(wx.EVT_MENU, self.on_update_google_doc, self.update_gdoc_item)
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
         self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
@@ -692,10 +636,6 @@ class WalletApp(wx.Frame):
         self.memo_recipient.Bind(wx.EVT_TEXT, self.on_destination_text)
         recipient_sizer.Add(self.memo_recipient, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
-        # Temporary encryption handling while NodeTools is being updated
-        self.memo_recipient.Bind(wx.EVT_COMBOBOX, self.on_memo_recipient_changed)
-        self.memo_recipient.Bind(wx.EVT_TEXT, self.on_memo_recipient_changed)
-
         # Add checkboxes
         self.memo_chk_encrypt = wx.CheckBox(self.memos_tab, label="Encrypt")
 
@@ -929,34 +869,6 @@ class WalletApp(wx.Frame):
         """Handle manual text entry - allow any text"""
         event.Skip()
 
-    def on_memo_recipient_changed(self, event=None):
-        """
-        TEMPORARY METHOD WHILE NODETOOLS IS BEING UPDATED
-        Handle memo recipient changes to update encryption checkbox state
-        """
-        if event is not None:
-            event.Skip()  # Allow other event handlers to process
-        
-        # Get the actual address from client data if it's a selection, otherwise use the raw value
-        selection = self.memo_recipient.GetSelection()
-        if selection != wx.NOT_FOUND:
-            address = self.memo_recipient.GetClientData(selection)
-        else:
-            address = self.memo_recipient.GetValue()
-
-        network_config = get_network_config()        
-        is_system_address = (
-            address == network_config.remembrancer_address or 
-            address == network_config.node_address
-        )
-        
-        # Disable encryption for system addresses
-        self.memo_chk_encrypt.Enable(not is_system_address)
-        
-        # Uncheck if disabled
-        if is_system_address and self.memo_chk_encrypt.GetValue():
-            self.memo_chk_encrypt.SetValue(False)
-
     def on_toggle_refused_tasks(self, event):
         """Handle toggling of the refused tasks checkbox"""
         try:
@@ -984,6 +896,8 @@ class WalletApp(wx.Frame):
             combobox: wx.ComboBox to populate
             default_destination: Optional default address to select
         """
+        current_value = combobox.GetValue()
+
         combobox.Clear()
         contacts = self.task_manager.get_contacts()
 
@@ -992,8 +906,13 @@ class WalletApp(wx.Frame):
             display_text = f"{name} ({address})"
             combobox.Append(display_text, address)
 
+        # If there was a custom value, add it back
+        if current_value and current_value not in [combobox.GetString(i) for i in range(combobox.GetCount())]:
+            combobox.Append(current_value)
+            combobox.SetValue(current_value)
+
         # Set default selection
-        if default_destination:
+        elif default_destination:
             # First try to find it in existing contacts
             found = False
             for i in range(combobox.GetCount()):
@@ -1037,7 +956,16 @@ class WalletApp(wx.Frame):
     
         token_type = self.token_selector.GetValue()
         amount = self.payment_txt_amount.GetValue()
-        destination = self.txt_payment_destination.GetValue()
+
+        # Get destination - check if it's a saved contact first
+        destination_idx = self.txt_payment_destination.GetSelection()
+        if destination_idx != wx.NOT_FOUND:
+            # Get the stored address from client data
+            destination = self.txt_payment_destination.GetClientData(destination_idx)
+        else:
+            # Manual entry - use raw text value
+            destination = self.txt_payment_destination.GetValue()
+
         memo = self.txt_payment_memo.GetValue()
         destination_tag = self.txt_destination_tag.GetValue()
 
@@ -1118,88 +1046,115 @@ class WalletApp(wx.Frame):
     
     def create_user_details_panel(self):
         panel = wx.Panel(self.panel)
-        sizer = wx.BoxSizer(wx.VERTICAL)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Return to Login button
         return_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_return_to_login = wx.Button(panel, label="Return to Login")
         return_btn_sizer.Add(self.btn_return_to_login, 0, wx.ALL | wx.ALIGN_CENTER, 5)
         self.btn_return_to_login.Bind(wx.EVT_BUTTON, self.on_return_to_login)
-        sizer.Add(return_btn_sizer, 0, wx.ALIGN_CENTER | wx.TOP, 10)
-        sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.TOP, 5)
+        main_sizer.Add(return_btn_sizer, 0, wx.ALIGN_CENTER | wx.TOP, 10)
+        main_sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.TOP, 5)
         
-        user_details_sizer = wx.BoxSizer(wx.VERTICAL)
+        # Create a centered box for the content
+        content_panel = wx.Panel(panel)
+        if os.name == "posix":  # macOS
+            sys_color = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+            darkened_color = self.darken_color(sys_color, 0.95)  # 5% darker
+        else:
+            darkened_color = wx.Colour(220, 220, 220)
+        content_panel.SetBackgroundColour(darkened_color)
 
+        content_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Fixed width for all text controls
+        text_ctrl_width = 400
+
+        # Fixed width for all text controls
+        text_ctrl_width = 400
+        
         # XRP Address
-        self.create_lbl_xrp_address = wx.StaticText(panel, label="XRP Address:")
-        user_details_sizer.Add(self.create_lbl_xrp_address, flag=wx.ALL, border=5)
-        self.create_txt_xrp_address = wx.TextCtrl(panel)
-        user_details_sizer.Add(self.create_txt_xrp_address, flag=wx.EXPAND | wx.ALL, border=5)
+        address_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.create_lbl_xrp_address = wx.StaticText(content_panel, label="XRP Address:")
+        address_sizer.Add(self.create_lbl_xrp_address, 0, wx.BOTTOM, 5)
+        self.create_txt_xrp_address = wx.TextCtrl(content_panel, size=(text_ctrl_width, -1))
+        address_sizer.Add(self.create_txt_xrp_address, 1, wx.EXPAND)
+        content_sizer.Add(address_sizer, 0, wx.ALL | wx.EXPAND, 10)
 
         # XRP Secret
-        secret_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.create_lbl_xrp_secret = wx.StaticText(panel, label="XRP Secret:")
-        user_details_sizer.Add(self.create_lbl_xrp_secret, flag=wx.ALL, border=5)
-        self.create_txt_xrp_secret = wx.TextCtrl(panel, style=wx.TE_PASSWORD)  # TODO: make a checkbox to show/hide the secret
-        secret_sizer.Add(self.create_txt_xrp_secret, proportion=1, flag=wx.EXPAND | wx.ALL, border=5)
-        self.chk_show_secret = wx.CheckBox(panel, label="Show Secret")
-        secret_sizer.Add(self.chk_show_secret, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
-        user_details_sizer.Add(secret_sizer, flag=wx.EXPAND)
-
-        self.chk_show_secret.Bind(wx.EVT_CHECKBOX, self.on_toggle_secret_visibility_user_details)
+        secret_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.create_lbl_xrp_secret = wx.StaticText(content_panel, label="XRP Secret:")
+        secret_sizer.Add(self.create_lbl_xrp_secret, 0, wx.BOTTOM, 5)
+        
+        secret_input_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.create_txt_xrp_secret = wx.TextCtrl(content_panel, style=wx.TE_PASSWORD, size=(text_ctrl_width - 100, -1))
+        secret_input_sizer.Add(self.create_txt_xrp_secret, 1, wx.EXPAND | wx.RIGHT, 10)
+        self.chk_show_secret = wx.CheckBox(content_panel, label="Show Secret")
+        secret_input_sizer.Add(self.chk_show_secret, 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        secret_sizer.Add(secret_input_sizer, 1, wx.EXPAND)
+        content_sizer.Add(secret_sizer, 0, wx.ALL | wx.EXPAND, 10)
 
         # Username
-        self.create_lbl_username = wx.StaticText(panel, label="Username:")
-        user_details_sizer.Add(self.create_lbl_username, flag=wx.ALL, border=5)
-        self.create_txt_username = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
-        user_details_sizer.Add(self.create_txt_username, flag=wx.EXPAND | wx.ALL, border=5)
-
-        # Bind event to force lowercase
-        self.create_txt_username.Bind(wx.EVT_TEXT, self.on_force_lowercase)
+        username_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.create_lbl_username = wx.StaticText(content_panel, label="Username:")
+        username_sizer.Add(self.create_lbl_username, 0, wx.BOTTOM, 5)
+        self.create_txt_username = wx.TextCtrl(content_panel, style=wx.TE_PROCESS_ENTER, size=(text_ctrl_width, -1))
+        username_sizer.Add(self.create_txt_username, 1, wx.EXPAND)
+        content_sizer.Add(username_sizer, 0, wx.ALL | wx.EXPAND, 10)
 
         # Password
-        self.create_lbl_password = wx.StaticText(panel, label="Password (minimum 8 characters):")
-        user_details_sizer.Add(self.create_lbl_password, flag=wx.ALL, border=5)
-        self.create_txt_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        user_details_sizer.Add(self.create_txt_password, flag=wx.EXPAND | wx.ALL, border=5)
+        password_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.create_lbl_password = wx.StaticText(content_panel, label="Password (minimum 8 characters):")
+        password_sizer.Add(self.create_lbl_password, 0, wx.BOTTOM, 5)
+        self.create_txt_password = wx.TextCtrl(content_panel, style=wx.TE_PASSWORD, size=(text_ctrl_width, -1))
+        password_sizer.Add(self.create_txt_password, 1, wx.EXPAND)
+        content_sizer.Add(password_sizer, 0, wx.ALL | wx.EXPAND, 10)
 
         # Confirm Password
-        self.create_lbl_confirm_password = wx.StaticText(panel, label="Confirm Password:")
-        user_details_sizer.Add(self.create_lbl_confirm_password, flag=wx.ALL, border=5)
-        self.create_txt_confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        user_details_sizer.Add(self.create_txt_confirm_password, flag=wx.EXPAND | wx.ALL, border=5)
+        confirm_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.create_lbl_confirm_password = wx.StaticText(content_panel, label="Confirm Password:")
+        confirm_sizer.Add(self.create_lbl_confirm_password, 0, wx.BOTTOM, 5)
+        self.create_txt_confirm_password = wx.TextCtrl(content_panel, style=wx.TE_PASSWORD, size=(text_ctrl_width, -1))
+        confirm_sizer.Add(self.create_txt_confirm_password, 1, wx.EXPAND)
+        content_sizer.Add(confirm_sizer, 0, wx.ALL | wx.EXPAND, 10)
+        # Wallet buttons
+        wallet_buttons_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_generate_wallet = wx.Button(content_panel, label="Generate New XRP Wallet")
+        self.btn_restore_wallet = wx.Button(content_panel, label="Restore from Seed")
+        wallet_buttons_sizer.Add(self.btn_generate_wallet, 1, wx.RIGHT, 5)
+        wallet_buttons_sizer.Add(self.btn_restore_wallet, 1, wx.LEFT, 5)
+        content_sizer.Add(wallet_buttons_sizer, 0, wx.ALL | wx.EXPAND, 10)
 
-        # Tooltips
+        self.btn_generate_wallet.Bind(wx.EVT_BUTTON, self.on_generate_wallet)
+        self.btn_restore_wallet.Bind(wx.EVT_BUTTON, self.on_restore_wallet)
+
+        # Cache button
+        self.btn_cache_user = wx.Button(content_panel, label="Cache Credentials")
+        content_sizer.Add(self.btn_cache_user, 0, wx.ALL | wx.EXPAND, 10)
+        self.btn_cache_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
+
+        content_panel.SetSizer(content_sizer)
+
+        # Add content panel to main sizer with centering
+        main_sizer.AddStretchSpacer(1)
+        main_sizer.Add(content_panel, 0, wx.ALIGN_CENTER | wx.ALL, 20)
+        main_sizer.AddStretchSpacer(1)
+
+        # Set tooltips
         self.tooltip_xrp_address = wx.ToolTip("This is your XRP address. It is used to receive XRP or PFT.")
         self.tooltip_xrp_secret = wx.ToolTip("This is your XRP secret. NEVER SHARE THIS SECRET WITH ANYONE! NEVER LOSE THIS SECRET!")
         self.tooltip_username = wx.ToolTip("Set a username that you will use to log in with. You can use lowercase letters, numbers, and underscores.")
         self.tooltip_password = wx.ToolTip("Set a password that you will use to log in with. This password is used to encrypt your XRP address and secret.")
         self.tooltip_confirm_password = wx.ToolTip("Confirm your password.")
+        
         self.create_txt_xrp_address.SetToolTip(self.tooltip_xrp_address)
         self.create_txt_xrp_secret.SetToolTip(self.tooltip_xrp_secret)
         self.create_txt_username.SetToolTip(self.tooltip_username)
         self.create_txt_password.SetToolTip(self.tooltip_password)
         self.create_txt_confirm_password.SetToolTip(self.tooltip_confirm_password)
 
-        # Buttons
-        wallet_buttons_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_generate_wallet = wx.Button(panel, label="Generate New XRP Wallet")
-        wallet_buttons_sizer.Add(self.btn_generate_wallet, 1, flag=wx.EXPAND | wx.RIGHT, border=5)
-        self.btn_generate_wallet.Bind(wx.EVT_BUTTON, self.on_generate_wallet)
-
-        self.btn_restore_wallet = wx.Button(panel, label="Restore from Seed")
-        wallet_buttons_sizer.Add(self.btn_restore_wallet, 1, flag=wx.EXPAND | wx.LEFT, border=5)
-        self.btn_restore_wallet.Bind(wx.EVT_BUTTON, self.on_restore_wallet)
-
-        user_details_sizer.Add(wallet_buttons_sizer, flag=wx.EXPAND | wx.ALL, border=5)
-
-        self.btn_cache_user = wx.Button(panel, label="Cache Credentials")
-        user_details_sizer.Add(self.btn_cache_user, flag=wx.EXPAND, border=15)
-        self.btn_cache_user.Bind(wx.EVT_BUTTON, self.on_cache_user)
-
-        sizer.Add(user_details_sizer, 1, wx.EXPAND | wx.ALL, 10)
-
-        panel.SetSizer(sizer)
+        panel.SetSizer(main_sizer)
 
         return panel
     
@@ -1308,12 +1263,14 @@ class WalletApp(wx.Frame):
 
         except (ValueError, InvalidToken, KeyError) as e:
             logger.error(f"Login failed: {e}")
+            logger.error(traceback.format_exc())
             self.show_error("Invalid username or password")
             self.btn_login.SetLabel("Login")
             self.btn_login.Update()
             return
         except Exception as e:
             logger.error(f"Login failed: {e}")
+            logger.error(traceback.format_exc())
             self.show_error(f"Login failed: {e}")
             self.btn_login.SetLabel("Login")
             self.btn_login.Update()
@@ -1356,9 +1313,6 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
         self.update_all_destination_comboboxes()
-
-        # TEMPORARY METHOD WHILE NODETOOLS IS BEING UPDATED
-        self.on_memo_recipient_changed(None)
 
     def update_network_display(self):
         """Update UI elements that display network information"""
@@ -1524,6 +1478,29 @@ class WalletApp(wx.Frame):
                 dialog.Destroy()
 
             case WalletState.INITIATED:
+                message = (
+                    "To continue with wallet initialization,\n"
+                    "you need to establish secure communication with the network.\n\n"
+                    "This will:\n"
+                    "- Set up encrypted messaging capabilities\n"
+                    "- Cost a small amount of XRP (~0.00001 XRP)\n"
+                    "- Enable secure communication with the network\n\n"
+                    "Would you like to proceed?"
+                )
+                if wx.YES == wx.MessageBox(message, "Send Handshake", wx.YES_NO | wx.ICON_QUESTION):
+                    try:
+                        self.worker.expecting_state_change = True
+                        response = self.task_manager.send_handshake(self.default_node)
+                        formatted_response = self.format_response(response)
+                        dialog = SelectableMessageDialog(self, "Handshake Result", formatted_response)
+                        dialog.ShowModal()
+                        dialog.Destroy()
+                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                    except Exception as e:
+                        logger.error(f"Error sending handshake: {e}")
+                        wx.MessageBox(f"Error sending handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+            case WalletState.HANDSHAKE_SENT:
                 template_text = (
                     f"{self.wallet.classic_address}\n"
                     "___x TASK VERIFICATION SECTION START x___\n \n"
@@ -1558,24 +1535,6 @@ class WalletApp(wx.Frame):
                         logger.error(f"Error setting up Google Doc: {e}")
                         wx.MessageBox(f"Error setting up Google Doc: {e}", "Error", wx.OK | wx.ICON_ERROR)
                 dialog.Destroy()
-            
-            case WalletState.GOOGLE_DOC_SENT:
-                message = (
-                    "To continue with wallet initialization, you need to send a User Genesis transaction.\n\n"
-                    "This transaction will:\n"
-                    "- Cost 7 PFT\n"
-                    "- Register you as a user in the Post Fiat network\n"
-                    "- Enable you to start accepting tasks\n\n"
-                    "Proceed?"
-                )
-                if wx.YES == wx.MessageBox(message, "Send Genesis Transaction", wx.YES_NO | wx.ICON_QUESTION):
-                    try:
-                        self.worker.expecting_state_change = True
-                        self.task_manager.handle_genesis()
-                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
-                    except Exception as e:
-                        logger.error(f"Error sending genesis transaction: {e}")
-                        wx.MessageBox(f"Error sending genesis transaction: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
             case _:
                 logger.error(f"Unknown wallet state: {current_state}")
@@ -1640,32 +1599,32 @@ class WalletApp(wx.Frame):
                 wx.CallAfter(lambda: wx.MessageBox(message, "Initiation Complete!", wx.OK | wx.ICON_INFORMATION))
                 wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
 
-            # If Google Doc is detected and current state is INITIATED
-            elif (current_state == WalletState.INITIATED and self.task_manager.google_doc_sent()):
-                logger.info("Google Doc detected. Updating wallet state.")
-                self.task_manager.wallet_state = WalletState.GOOGLE_DOC_SENT
+            # If Handshake is detected and current state is INITIATED
+            elif (current_state == WalletState.INITIATED and self.task_manager.handshake_sent()):
+                logger.info("Handshake detected. Updating wallet state.")
+                self.task_manager.wallet_state = WalletState.HANDSHAKE_SENT
                 if hasattr(self, 'worker'):
                     self.worker.expecting_state_change = False
                 message = (
-                    "Google Doc successfully set up!\n\n"
-                    "You can now proceed with the final step: sending your genesis transaction.\n"
+                    "Handshake successfully sent!\n\n"
+                    "You can now proceed with setting up your Google Doc.\n"
                     "Click the 'Take Action' button to continue."
                 )
-                wx.CallAfter(lambda: wx.MessageBox(message, "Google Doc Ready!", wx.OK | wx.ICON_INFORMATION))
+                wx.CallAfter(lambda: wx.MessageBox(message, "Handshake Sent!", wx.OK | wx.ICON_INFORMATION))
                 wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
 
-            # If genesis is detected and current state is GOOGLE_DOC_SENT
-            elif (current_state == WalletState.GOOGLE_DOC_SENT and self.task_manager.genesis_sent()):
-                logger.info("Genesis transaction detected. Updating wallet state.")
+            # TIf Google Doc is detected and current state is HANDSHAKE_SENT
+            elif (current_state == WalletState.HANDSHAKE_SENT and self.task_manager.google_doc_sent()):
+                logger.info("Google Doc detected. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.ACTIVE
                 if hasattr(self, 'worker'):
                     self.worker.expecting_state_change = False
                 message = (
-                    "Genesis transaction successful!\n\n"
+                    "Google Doc successfully set up!\n\n"
                     "Your wallet is now fully initialized and ready to use.\n"
                     "You can now start accepting tasks."
                 )
-                wx.CallAfter(lambda: wx.MessageBox(message, "Wallet Activated!", wx.OK | wx.ICON_INFORMATION))
+                wx.CallAfter(lambda: wx.MessageBox(message, "Google Doc Ready!", wx.OK | wx.ICON_INFORMATION))
                 wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
 
     @requires_wallet_state(TRUSTLINED_STATES)
@@ -1790,7 +1749,7 @@ class WalletApp(wx.Frame):
                     logger.error(f"Failed updating {grid_type} grid: {e}")
 
         # Proposals, Rewards, and Verification grids (available in PFT_STATES)
-        if current_state in PFT_STATES:
+        if current_state in ACTIVATED_STATES:
             for grid_type, getter_method in [
                 ("proposals", self.task_manager.get_proposals_df),
                 ("rewards", self.task_manager.get_rewards_df),
@@ -1813,9 +1772,9 @@ class WalletApp(wx.Frame):
 
         # Define wallet state requirements for each grid
         grid_state_requirements = {
-            'rewards': PFT_STATES,
-            'verification': PFT_STATES,
-            'proposals': PFT_STATES,
+            'rewards': ACTIVATED_STATES,
+            'verification': ACTIVATED_STATES,
+            'proposals': ACTIVATED_STATES,
             'memos': TRUSTLINED_STATES,
             'payments': TRUSTLINED_STATES,  # XRP requires FUNDED_STATES, but PFT requires TRUSTLINED_STATES
             'summary': []
@@ -2347,6 +2306,29 @@ class WalletApp(wx.Frame):
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
+    def on_update_google_doc(self, event):
+        """Handle updating Google Doc link"""
+        dialog = UpdateGoogleDocDialog(self)
+        while True:
+            if dialog.ShowModal() == wx.ID_OK:
+                google_doc_link = dialog.get_link()
+                try:
+                    # Validate and send the new Google Doc link
+                    response = self.task_manager.handle_google_doc_setup(google_doc_link)
+                    if response.is_successful():
+                        formatted_response = self.format_response(response)
+                        success_dialog = SelectableMessageDialog(self, "Success", formatted_response)
+                        success_dialog.ShowModal()
+                        success_dialog.Destroy()
+                except Exception as e:
+                    logger.error(f"Error updating Google Doc link: {e}")
+                    logger.error(traceback.format_exc())
+                    dialog.show_error(str(e))
+                    continue
+            else:
+                break
+        dialog.Destroy()
+
     def on_show_secret(self, event):
         dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your secret.")
 
@@ -2704,633 +2686,22 @@ class WalletApp(wx.Frame):
         """
         try:
             # Create a JsonRpcClient for the endpoint
+            logger.debug(f"Attempting to connect to {endpoint}")
             client = xrpl.clients.JsonRpcClient(endpoint)
             
             # Try to get server info as a connection test
             response = client.request(xrpl.models.requests.ServerInfo())
             
-            # If we got a response without error, connection was successful
-            return response.is_successful()
+            success = response.is_successful()
+            message = f"Successful connection to {endpoint}" if success else f"Failed connection to {endpoint}: {response}"
+            logger.debug(message)
+
+            return success
 
         except Exception as e:
             logger.error(f"Connection test failed for {endpoint}: {e}")
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
             return False
-
-class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
-    def OnLinkClicked(self, link):
-        url = link.GetHref()
-        logger.debug(f"Link clicked: {url}")
-        try:
-            webbrowser.open(url, new=2)
-            logger.debug(f"Attempted to open URL: {url}")
-        except Exception as e:
-            logger.error(f"Failed to open URL {url}. Error: {str(e)}")
-
-class SelectableMessageDialog(wx.Dialog):
-    def __init__(self, parent, title, message):
-        super(SelectableMessageDialog, self).__init__(parent, title=title, size=(500, 400))
-
-        panel = wx.Panel(self)
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        self.html_window = LinkOpeningHtmlWindow(panel, style=wx.html.HW_SCROLLBAR_AUTO)
-        sizer.Add(self.html_window, 1, wx.EXPAND | wx.ALL, 10)
-
-        ok_button = wx.Button(panel, wx.ID_OK, label="OK")
-        sizer.Add(ok_button, 0, wx.ALIGN_CENTER | wx.ALL, 10)
-
-        panel.SetSizer(sizer)
-
-        self.SetContent(message)
-        self.Center()
-
-    def SetContent(self, message):
-        html_content = f"""
-        <html>
-        <head>
-            <style>
-                body {{ word-wrap: break-word; }}
-                pre {{ white-space: pre-wrap; }}
-            </style>
-        </head>
-        <body>
-            <pre>{message}</pre>
-        </body>
-        </html>
-        """
-        self.html_window.SetPage(html_content)
-
-class ChangePasswordDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="Change Password")
-
-        panel = wx.Panel(self)
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        # Current password
-        current_label = wx.StaticText(panel, label="Current Password:")
-        self.current_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        sizer.Add(current_label, 0, wx.ALL, 5)
-        sizer.Add(self.current_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
-
-        # New password
-        new_label = wx.StaticText(panel, label="New Password:")
-        self.new_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        sizer.Add(new_label, 0, wx.ALL, 5)
-        sizer.Add(self.new_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
-        
-        # Confirm password
-        confirm_label = wx.StaticText(panel, label="Confirm New Password:")
-        self.confirm_password = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        sizer.Add(confirm_label, 0, wx.ALL, 5)
-        sizer.Add(self.confirm_password, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
-        
-        # Buttons
-        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        ok_button = wx.Button(panel, wx.ID_OK, "Change Password")
-        cancel_button = wx.Button(panel, wx.ID_CANCEL, "Cancel")
-        button_sizer.Add(ok_button, 0, wx.ALL, 5)
-        button_sizer.Add(cancel_button, 0, wx.ALL, 5)
-        sizer.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
-
-        panel.SetSizer(sizer)
-        self.Center()
-
-class DeleteCredentialsDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="Delete Credentials")
-        self.InitUI()
-
-    def InitUI(self):
-        main_sizer = wx.BoxSizer(wx.VERTICAL)
-
-        # Warning icon and text
-        warning_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        warning_bitmap = wx.ArtProvider.GetBitmap(wx.ART_WARNING, size=(32, 32))
-        warning_icon = wx.StaticBitmap(self, bitmap=warning_bitmap)
-        warning_sizer.Add(warning_icon, 0, wx.ALL, 5)
-
-        warning_text = (
-            "WARNING: This action cannot be undone!\n\n"
-            "• All local credentials and saved contacts will be deleted for this account.\n"
-            "• Your XRP wallet will remain on the XRPL but you will lose access.\n"
-            "• Any PFT tokens in your wallet will become inaccessible.\n\n"
-            "MAKE SURE YOU HAVE BACKED UP YOUR XRP SECRET KEY BEFORE PROCEEDING!\n\n"
-        )
-
-        warning_label = wx.StaticText(self, label=warning_text)
-        warning_label.Wrap(400)
-        warning_sizer.Add(warning_label, 1, wx.ALL, 5)
-        main_sizer.Add(warning_sizer, 0, wx.EXPAND | wx.ALL, 10)
-
-        # Confirmation text input
-        confirm_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        confirm_label = wx.StaticText(self, label="Type DELETE to confirm:")
-        self.confirm_input = wx.TextCtrl(self)
-        
-        confirm_sizer.Add(confirm_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
-        confirm_sizer.Add(self.confirm_input, 1, wx.EXPAND, 10)
-        main_sizer.Add(confirm_sizer, 0, wx.EXPAND | wx.ALL, 5)
-
-        # Buttons
-        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        warning_bitmap = wx.ArtProvider.GetBitmap(wx.ART_WARNING, size=(16, 16))
-        warning_icon = wx.StaticBitmap(self, bitmap=warning_bitmap)
-        self.delete_button = wx.Button(self, label="Delete Account")
-        cancel_button = wx.Button(self, label="Cancel")
-
-        button_sizer.Add(warning_icon, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
-        button_sizer.Add(self.delete_button, 1, wx.ALL, 5)
-        button_sizer.Add(cancel_button, 1, wx.ALL, 5)
-        main_sizer.Add(button_sizer, 0, wx.ALL | wx.EXPAND, 5)
-
-        self.SetSizer(main_sizer)
-
-        # Bind events
-        self.delete_button.Bind(wx.EVT_BUTTON, self.on_delete)
-        cancel_button.Bind(wx.EVT_BUTTON, self.on_cancel)
-        self.confirm_input.Bind(wx.EVT_TEXT, self.on_text_change)
-
-        # Initially disable delete button
-        self.delete_button.Enable(False)
-
-        # Set initial size
-        self.SetSize(self.GetBestSize())
-
-    def on_text_change(self, event):
-        """Enable delete button only when confirmation text matches exactly"""
-        self.delete_button.Enable(
-            self.confirm_input.GetValue() == "DELETE"
-        )
-
-    def on_delete(self, event):
-        self.EndModal(wx.ID_OK)
-
-    def on_cancel(self, event):
-        self.EndModal(wx.ID_CANCEL)
-
-class EncryptionRequestsDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="Encryption Requests", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.parent: WalletApp = parent
-        self.task_manager: PostFiatTaskManager = parent.task_manager
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        help_text = (
-            "This dialog shows the status of encryption setup with other users.\n\n"
-            "• When you receive a handshake request, it appears in the 'Received' column\n"
-            "• After you send a handshake, the time appears in the 'Sent' column\n"
-            "• Encryption is ready when both handshakes are exchanged\n\n"
-            "Select a received request and click 'Accept' to enable encrypted messaging with that user."
-        )
-        text = wx.StaticText(self, label=help_text)
-        text.Wrap(450)
-        sizer.Add(text, 0, wx.ALL | wx.EXPAND, 5)
-
-        # Create list control
-        self.list_ctrl = wx.ListCtrl(self, style=wx.LC_REPORT | wx.BORDER_SUNKEN | wx.LC_SINGLE_SEL)
-        self.list_ctrl.InsertColumn(0, "From", width=300)
-        self.list_ctrl.InsertColumn(1, "Received", width=150)
-        self.list_ctrl.InsertColumn(2, "Sent", width=150)
-        self.list_ctrl.InsertColumn(3, "Encryption Ready", width=110)
-        sizer.Add(self.list_ctrl, 1, wx.EXPAND | wx.ALL, 5)
-
-        # Add buttons
-        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.accept_btn = wx.Button(self, label="Accept")
-        self.accept_btn.Bind(wx.EVT_BUTTON, self.on_accept)
-        btn_sizer.Add(self.accept_btn, 0, wx.RIGHT, 5)
-        
-        self.close_btn = wx.Button(self, label="Close")
-        self.close_btn.Bind(wx.EVT_BUTTON, self.on_close)
-        btn_sizer.Add(self.close_btn)
-        
-        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
-        
-        self.SetSizer(sizer)
-        self.load_requests()
-
-        # Enable/disable accept button based on selection
-        self.accept_btn.Enable(False)
-        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_selection_changed)
-        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_DESELECTED, self.on_selection_changed)
-
-        start_size = (800, 400)
-        self.SetSize(start_size)
-        self.SetMinSize(start_size)
-
-    def on_selection_changed(self, event):
-        """Enable accept button if an item is selected and not already accepted"""
-        idx = self.list_ctrl.GetFirstSelected()
-        if idx != -1:
-            handshakes = self.task_manager.get_handshakes()
-            selected_handshake = handshakes.iloc[self.list_ctrl.GetItemData(idx)]
-            # Only enable Accept if we received a handshake but haven't sent one
-            can_accept = (pd.notna(selected_handshake['received_at']) and pd.isna(selected_handshake['sent_at']))
-            self.accept_btn.Enable(can_accept)
-        else:
-            self.accept_btn.Enable(False)
-
-    def load_requests(self):
-        """Load pending encryption requests into the list control"""
-        self.list_ctrl.DeleteAllItems()
-        handshakes = self.task_manager.get_handshakes()
-
-        for idx, handshake in handshakes.iterrows():
-            index = self.list_ctrl.GetItemCount()
-            display_name = handshake['contact_name'] if pd.notna(handshake['contact_name']) else handshake['address']
-            self.list_ctrl.InsertItem(index, display_name)
-
-            # Show received time or "Not received" if we haven't received a handshake
-            received_at = handshake['received_at']
-            if pd.notna(received_at):  # check if timestamp is not NaT/None
-                self.list_ctrl.SetItem(index, 1, received_at.strftime('%Y-%m-%d %H:%M:%S'))
-            else:
-                self.list_ctrl.SetItem(index, 1, "")
-
-            # Show accepted time or "Not sent" if we haven't sent a handshake
-            sent_at = handshake['sent_at']
-            if pd.notna(sent_at):  # check if timestamp is not NaT/None
-                self.list_ctrl.SetItem(index, 2, sent_at.strftime('%Y-%m-%d %H:%M:%S'))
-            else:
-                self.list_ctrl.SetItem(index, 2, "")
-
-            # Show encryption ready status
-            encryption_ready = handshake['encryption_ready']
-            self.list_ctrl.SetItem(index, 3, "Yes" if encryption_ready else "No")
-
-            self.list_ctrl.SetItemData(index, idx)
-
-    def on_accept(self, event):
-        idx = self.list_ctrl.GetFirstSelected()
-        if idx == -1:
-            return
-        
-        address = self.task_manager.get_handshakes().iloc[self.list_ctrl.GetItemData(idx)]['address']
-        
-        try:
-            response = self.task_manager.send_handshake(address)
-            formatted_response = self.parent.format_response(response)
-            handshake_dialog = SelectableMessageDialog(self, "Handshake Sent", formatted_response)
-            handshake_dialog.ShowModal()
-            handshake_dialog.Destroy()
-            self.parent._sync_and_refresh()
-            self.load_requests()
-        except Exception as e:
-            wx.MessageBox(f"Failed to send handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
-
-    def on_close(self, event):
-        self.Close()
-
-class PreferencesDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="Preferences")
-        self.config: ConfigurationManager = parent.config
-        self.parent: WalletApp = parent
-
-        panel = wx.Panel(self)
-        vbox = wx.BoxSizer(wx.VERTICAL)
-
-        # Application Settings Box
-        app_sb = wx.StaticBox(panel, label="Application Settings")
-        app_sbs = wx.StaticBoxSizer(app_sb, wx.VERTICAL)
-
-        # Require password for payment checkbox
-        self.require_password_for_payment = wx.CheckBox(panel, label="Require password for payment")
-        self.require_password_for_payment.SetValue(self.config.get_global_config('require_password_for_payment'))
-        app_sbs.Add(self.require_password_for_payment, 0, wx.ALL | wx.EXPAND, 5)
-
-        # Performance Monitor checkbox
-        self.perf_monitor = wx.CheckBox(panel, label="Enable Performance Monitor")
-        self.perf_monitor.SetValue(self.config.get_global_config('performance_monitor'))
-        app_sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
-
-        # Cache Format radio buttons
-        cache_box = wx.StaticBox(panel, label="Transaction Cache Format")
-        cache_sbs = wx.StaticBoxSizer(cache_box, wx.HORIZONTAL)
-        self.cache_csv = wx.RadioButton(panel, label="CSV", style=wx.RB_GROUP)
-        self.cache_pickle = wx.RadioButton(panel, label="Pickle")
-        current_format = self.config.get_global_config("transaction_cache_format")
-        self.cache_csv.SetValue(current_format == "csv")
-        self.cache_pickle.SetValue(current_format != "csv")
-        cache_sbs.Add(self.cache_csv, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        cache_sbs.Add(self.cache_pickle, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        app_sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
-
-        vbox.Add(app_sbs, 0, wx.ALL | wx.EXPAND, 10)
-
-        # Network Settings Box
-        net_sb = wx.StaticBox(panel, label="Network Settings")
-        net_sbs = wx.StaticBoxSizer(net_sb, wx.VERTICAL)
-
-        # Network selection radio buttons
-        network_box = wx.StaticBox(panel, label="XRPL Network")
-        network_sbs = wx.StaticBoxSizer(network_box, wx.HORIZONTAL)
-        self.mainnet_radio = wx.RadioButton(panel, label="Mainnet", style=wx.RB_GROUP)
-        self.testnet_radio = wx.RadioButton(panel, label="Testnet")
-        use_testnet = self.config.get_global_config('use_testnet')
-        self.testnet_radio.SetValue(use_testnet)
-        self.mainnet_radio.SetValue(not use_testnet)
-        network_sbs.Add(self.mainnet_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        network_sbs.Add(self.testnet_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        net_sbs.Add(network_sbs, 0, wx.ALL | wx.EXPAND, 5)
-
-        # RPC Endpoint selection
-        endpoint_box = wx.BoxSizer(wx.HORIZONTAL)
-        endpoint_box.Add(wx.StaticText(panel, label="RPC Endpoint:"), 0, wx.CENTER | wx.ALL, 5)
-        self.endpoint_combo = wx.ComboBox(panel, style=wx.CB_DROPDOWN | wx.TE_PROCESS_ENTER)
-        self.update_endpoint_combo()
-        endpoint_box.Add(self.endpoint_combo, 1, wx.EXPAND | wx.ALL, 5)
-        net_sbs.Add(endpoint_box, 0, wx.EXPAND | wx.ALL, 5)
-
-        # Add the static box to the main vertical box
-        vbox.Add(net_sbs, 0, wx.ALL | wx.EXPAND, 10)
-
-        # Bind events
-        self.mainnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
-        self.testnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
-        self.endpoint_combo.Bind(wx.EVT_COMBOBOX, self.on_endpoint_selected)
-        self.endpoint_combo.Bind(wx.EVT_TEXT_ENTER, self.on_endpoint_text_enter)
-
-        # Add OK and Cancel buttons
-        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        ok_button = wx.Button(panel, wx.ID_OK, "OK")
-        cancel_button = wx.Button(panel, wx.ID_CANCEL, "Cancel")
-        button_sizer.Add(ok_button, 0, wx.ALL, 5)
-        button_sizer.Add(cancel_button, 0, wx.ALL, 5)
-        vbox.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
-
-        # Bind the OK button event
-        ok_button.Bind(wx.EVT_BUTTON, self.on_ok)
-
-        panel.SetSizer(vbox)
-        vbox.Fit(panel)
-
-        self.SetMinSize((500, -1))
-        self.SetSize(self.GetBestSize())
-        self.Center()
-
-    # def on_endpoint_text_changed(self, event):
-    #     """Handle endpoint text changes"""
-    #     event.Skip()
-
-    def update_endpoint_combo(self):
-        """Update endpoint combobox based on selected network"""
-        current = self.config.get_current_endpoint()
-        recent = self.config.get_network_endpoints()
-
-        # Get the desired list of items (current first, then others)
-        desired_items = [current] + [ep for ep in recent if ep != current]
-        
-        # Remove any items that shouldn't be there
-        count = self.endpoint_combo.GetCount()
-        for i in range(count-1, -1, -1):  # Iterate backwards to safely remove items
-            if self.endpoint_combo.GetString(i) not in desired_items:
-                self.endpoint_combo.Delete(i)
-        
-        # Add any missing items
-        existing_items = [self.endpoint_combo.GetString(i) for i in range(self.endpoint_combo.GetCount())]
-        for item in desired_items:
-            if item not in existing_items:
-                self.endpoint_combo.Append(item)
-    
-        # Set the value without clearing first
-        self.endpoint_combo.SetValue(current)
-        self.endpoint_combo.Refresh()
-        self.endpoint_combo.Update()
-
-    def on_network_changed(self, event):
-        """Handle network selection change"""
-        self.update_endpoint_combo()
-
-    def on_endpoint_selected(self, event):
-        """Handle endpoint selection from dropdown"""
-        selected_endpoint = self.endpoint_combo.GetValue()
-        
-        # Ensure the selected value is displayed in the combobox
-        self.endpoint_combo.SetValue(selected_endpoint)
-        
-        # Process the endpoint change
-        self.handle_endpoint_change(selected_endpoint)
-
-    def on_endpoint_text_enter(self, event):
-        """Handle endpoint text entry"""
-        self.handle_endpoint_change(self.endpoint_combo.GetValue())
-
-    def handle_endpoint_change(self, new_endpoint: str):
-        """Handle endpoint selection/entry"""
-        new_endpoint = new_endpoint.strip()
-
-        if not new_endpoint:
-            return
-        
-        try:
-            # Store current endpoint for fallback
-            current_endpoint = self.config.get_current_endpoint()
-
-            # Attempt to connect with timeout
-            success = self.parent.try_connect_endpoint(new_endpoint)
-
-            if success:
-                self.config.set_current_endpoint(new_endpoint)
-                self.update_endpoint_combo()
-
-                # Update the main WalletApp's network_url
-                self.parent.network_url = new_endpoint
-                self.parent.update_network_display()
-                logger.debug(f"Updated WalletApp network_url to: {self.parent.network_url}")
-            else:
-                wx.MessageBox(
-                    "Failed to connect to endpoint. Reverting to previous endpoint.",
-                    "Connection Failed",
-                    wx.OK | wx.ICON_ERROR
-                )
-                # Revert to previous endpoint
-                self.config.set_current_endpoint(current_endpoint)
-                self.update_endpoint_combo()
-        except Exception as e:
-            wx.MessageBox(
-                f"Error connecting to endpoint: {e}",
-                "Connection Error",
-                wx.OK | wx.ICON_ERROR
-            )
-            self.update_endpoint_combo()
-
-    def on_ok(self, event):
-        """Save config when OK is clicked"""
-        # Check if network setting changed
-        old_network = self.config.get_global_config('use_testnet')
-        new_network = self.testnet_radio.GetValue()
-
-        if old_network != new_network:
-            wx.MessageBox("Network change requires a restart to take effect", "Restart Required", wx.OK | wx.ICON_WARNING)
-            
-        self.config.set_global_config('use_testnet', new_network)
-        self.config.set_global_config('require_password_for_payment', self.require_password_for_payment.GetValue())
-        self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
-        self.config.set_global_config('transaction_cache_format', 'csv' if self.cache_csv.GetValue() else 'pickle')
-        self.EndModal(wx.ID_OK)
-
-class ContactsDialog(wx.Dialog):
-    def __init__(self, parent):
-        super().__init__(parent, title="Manage Contacts", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.task_manager: PostFiatTaskManager = parent.task_manager
-        self.changes_made = False
-
-        panel = wx.Panel(self)
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        # Contacts list 
-        self.contacts_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.BORDER_SUNKEN)
-        self.contacts_list.InsertColumn(0, "Name", width=150)
-        self.contacts_list.InsertColumn(1, "Address", width=300)
-        sizer.Add(self.contacts_list, 1, wx.EXPAND | wx.ALL, 5)
-
-        # Add contact section
-        add_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.name_ctrl = wx.TextCtrl(panel)
-        self.address_ctrl = wx.TextCtrl(panel)
-
-        add_sizer.Add(wx.StaticText(panel, label="Name:"), 0, wx.CENTER | wx.ALL, 5)
-        add_sizer.Add(self.name_ctrl, 1, wx.EXPAND | wx.ALL, 5)
-        add_sizer.Add(wx.StaticText(panel, label="Address:"), 0, wx.CENTER | wx.ALL, 5)
-        add_sizer.Add(self.address_ctrl, 1, wx.EXPAND | wx.ALL, 5)
-        
-        sizer.Add(add_sizer, 0, wx.EXPAND | wx.ALL, 5)
-
-        # Buttons
-        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        add_btn = wx.Button(panel, label="Add Contact")
-        del_btn = wx.Button(panel, label="Delete Contact")
-        close_btn = wx.Button(panel, label="Close")
-        btn_sizer.Add(add_btn, 0, wx.ALL, 5)
-        btn_sizer.Add(del_btn, 0, wx.ALL, 5)
-        btn_sizer.Add(close_btn, 0, wx.ALL, 5)
-        sizer.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 5)
-        
-        panel.SetSizer(sizer)
-
-        start_size = (600, 400)
-        self.SetSize(start_size)
-        self.SetMinSize(start_size)
-        
-        # Bind events
-        add_btn.Bind(wx.EVT_BUTTON, self.on_add)
-        del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
-        close_btn.Bind(wx.EVT_BUTTON, self.on_close)
-        
-        self.load_contacts()
-
-    def load_contacts(self):
-        """Reload contacts list from storage"""
-        self.contacts_list.DeleteAllItems()
-        contacts = self.task_manager.get_contacts()
-        for address, name in contacts.items():
-            index = self.contacts_list.GetItemCount()
-            self.contacts_list.InsertItem(index, name)
-            self.contacts_list.SetItem(index, 1, address)
-        self.contacts_list.Layout()
-        self.Layout()
-
-    def on_add(self, event):
-        name = self.name_ctrl.GetValue().strip()
-        address = self.address_ctrl.GetValue().strip()
-        if name and address:
-            logger.debug(f"Saving contact: {name} - {address}")
-            try:
-                self.task_manager.save_contact(address, name)
-            except ValueError as e:
-                wx.MessageBox(f"Error saving contact: {e}", 'Error', wx.OK | wx.ICON_ERROR)
-                return
-            else:
-                self.load_contacts()
-                self.name_ctrl.SetValue("")
-                self.address_ctrl.SetValue("")
-                self.changes_made = True
-
-    def on_delete(self, event):
-        index = self.contacts_list.GetFirstSelected()
-        if index >= 0:
-            name = self.contacts_list.GetItem(index, 0).GetText()
-            address = self.contacts_list.GetItem(index, 1).GetText()
-            logger.debug(f"Deleting contact: {name} - {address}")
-            self.task_manager.delete_contact(address)
-            self.load_contacts()
-            self.changes_made = True
-
-    def on_close(self, event):
-        """Handle dialog close"""
-        if self.changes_made:
-            self.EndModal(wx.ID_OK)
-        else:
-            self.EndModal(wx.ID_CANCEL)
-
-class ConfirmPaymentDialog(wx.Dialog):
-    def __init__(self, parent, amount, destination, token_type):
-        super().__init__(parent, title="Confirm Payment", style=wx.DEFAULT_DIALOG_STYLE)
-        self.task_manager = parent.task_manager
-        self.destination = destination
-    
-        # Check if destination is a known contact
-        contacts = self.task_manager.get_contacts()
-        contact_name = contacts.get(destination)
-
-        self.InitUI(amount, destination, token_type, contact_name)
-        self.Fit()
-        self.Center()
-
-    def InitUI(self, amount, destination, token_type, contact_name):
-        sizer = wx.BoxSizer(wx.VERTICAL)
-
-        # Create messge with contact name if it exists
-        if contact_name:
-            message = f"Send {amount} {token_type} to {contact_name} ({destination})?"
-        else:
-            message = f"Send {amount} {token_type} to {destination}?"
-
-        msg_text = wx.StaticText(self, label=message)
-        msg_text.Wrap(400)
-        sizer.Add(msg_text, 0, wx.ALL | wx.EXPAND, 10)
-
-        # Only show contact controls if this isn't already a contact
-        if not contact_name:
-            # Add save contact checkbox and name input
-            self.save_contact = wx.CheckBox(self, label="Save as contact")
-            self.contact_name = wx.TextCtrl(self)
-            self.contact_name.Hide()
-
-            sizer.Add(self.save_contact, 0, wx.ALL, 5)
-            sizer.Add(self.contact_name, 0, wx.EXPAND | wx.ALL, 5)
-
-            self.save_contact.Bind(wx.EVT_CHECKBOX, self.on_checkbox)
-
-        # Button sizer
-        btn_sizer = wx.StdDialogButtonSizer()
-
-        self.ok_btn = wx.Button(self, wx.ID_OK, "Send")
-        self.ok_btn.SetDefault()
-        btn_sizer.AddButton(self.ok_btn)
-
-        cancel_btn = wx.Button(self, wx.ID_CANCEL, "Cancel")
-        btn_sizer.AddButton(cancel_btn)
-
-        btn_sizer.Realize()
-        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
-
-        self.SetSizer(sizer)
-
-    def on_checkbox(self, event):
-        """Handle checkbox toggle"""
-        self.contact_name.Show(self.save_contact.GetValue())
-        self.Fit() # Resize dialog to fit new size
-
-    def get_contact_info(self):
-        """Return contact info if saving was requested"""
-        if not hasattr(self, 'save_contact') or not self.save_contact.GetValue():
-            return None
-        name = self.contact_name.GetValue().strip()
-        return name if name else None
 
 def main():
     logger.info("Starting Post Fiat Wallet")

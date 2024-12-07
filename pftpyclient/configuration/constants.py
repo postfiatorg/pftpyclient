@@ -1,6 +1,8 @@
 from enum import Enum
+from decimal import Decimal
 
 DEFAULT_PFT_LIMIT = 100_000_000
+MIN_XRP_PER_TRANSACTION = Decimal('0.000001')
 
 class SystemMemoType(Enum):
     HANDSHAKE = 'HANDSHAKE'
