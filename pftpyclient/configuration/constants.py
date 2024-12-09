@@ -21,7 +21,6 @@ class TaskType(Enum):
     VERIFICATION_PROMPT = 'VERIFICATION PROMPT ___ '
     VERIFICATION_RESPONSE = 'VERIFICATION RESPONSE ___ '
     REWARD = 'REWARD RESPONSE __ '
-    USER_GENESIS = 'USER GENESIS __ '  # TODO: Remove
 
 # Additional patterns for specific task types
 TASK_PATTERNS = {

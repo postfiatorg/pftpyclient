@@ -51,7 +51,7 @@ wx_sink = configure_logger(
 from pftpyclient.configuration.constants import *
 
 UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
-REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 10  # 10 seconds
+REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 5  # 5 seconds
 
 # Try to use the default browser
 if os.name == 'nt':
@@ -537,6 +537,10 @@ class WalletApp(wx.Frame):
 
         # Add grid to Proposals tab
         self.proposals_grid = self.setup_grid(gridlib.Grid(self.proposals_tab), 'proposals')
+        self.proposals_grid.EnableEditing(False)
+        self.proposals_grid.SetSelectionMode(gridlib.Grid.SelectRows)
+        self.proposals_grid.Bind(gridlib.EVT_GRID_SELECT_CELL, self.on_proposal_selection)  # Bind selection event
+        self.proposals_grid.SetDefaultCellBackgroundColour(wx.WHITE)
         self.proposals_sizer.Add(self.proposals_grid, 1, wx.EXPAND | wx.ALL, 20)
 
         # Store reference to proposals tab page
@@ -552,10 +556,12 @@ class WalletApp(wx.Frame):
         self.verification_tab.SetSizer(self.verification_sizer)
 
         # Task ID input box
-        self.verification_lbl_task_id = wx.StaticText(self.verification_tab, label="Task ID:")
-        self.verification_sizer.Add(self.verification_lbl_task_id, flag=wx.ALL, border=5)
-        self.verification_txt_task_id = wx.TextCtrl(self.verification_tab)
-        self.verification_sizer.Add(self.verification_txt_task_id, flag=wx.EXPAND | wx.ALL, border=5)
+        task_id_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        task_id_label = wx.StaticText(self.verification_tab, label="Task ID:")
+        self.verification_txt_task_id = wx.StaticText(self.verification_tab, label="")
+        task_id_sizer.Add(task_id_label, flag=wx.ALL | wx.CENTER, border=5)
+        task_id_sizer.Add(self.verification_txt_task_id, flag=wx.ALL | wx.CENTER, border=5)
+        self.verification_sizer.Add(task_id_sizer, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Verification Details input box
         self.verification_lbl_details = wx.StaticText(self.verification_tab, label="Verification Details:")
@@ -564,24 +570,30 @@ class WalletApp(wx.Frame):
         self.verification_sizer.Add(self.verification_txt_details, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Submit Verification Details and Log Pomodoro buttons
-        self.verification_button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.verification_button_sizer_1 = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_submit_verification_details = wx.Button(self.verification_tab, label="Submit Verification Details")
-        self.verification_button_sizer.Add(self.btn_submit_verification_details, 1, wx.EXPAND | wx.ALL, 5)
-        self.btn_submit_verification_details.Bind(wx.EVT_BUTTON, self.on_submit_verification_details)
-
         self.btn_log_pomodoro = wx.Button(self.verification_tab, label="Log Pomodoro")
-        self.verification_button_sizer.Add(self.btn_log_pomodoro, 1, wx.EXPAND | wx.ALL, 5)
+        self.verification_button_sizer_1.Add(self.btn_submit_verification_details, 1, wx.EXPAND | wx.ALL, 5)
+        self.verification_button_sizer_1.Add(self.btn_log_pomodoro, 1, wx.EXPAND | wx.ALL, 5)
+        self.btn_submit_verification_details.Bind(wx.EVT_BUTTON, self.on_submit_verification_details)
         self.btn_log_pomodoro.Bind(wx.EVT_BUTTON, self.on_log_pomodoro)
+        self.verification_sizer.Add(self.verification_button_sizer_1, 0, wx.EXPAND)
 
-        self.verification_sizer.Add(self.verification_button_sizer, 0, wx.EXPAND)
-
-        # Add a Force Update button to the Verification tab
+        # Refuse button and force update button
+        self.verification_button_sizer_2 = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_refuse_verification = wx.Button(self.verification_tab, label="Refuse")
         self.btn_force_update = wx.Button(self.verification_tab, label="Force Update")
-        self.verification_sizer.Add(self.btn_force_update, flag=wx.EXPAND | wx.ALL, border=5)
+        self.verification_button_sizer_2.Add(self.btn_refuse_verification, 1, wx.EXPAND | wx.ALL, 5)
+        self.verification_button_sizer_2.Add(self.btn_force_update, 1, wx.EXPAND | wx.ALL, 5)
+        self.btn_refuse_verification.Bind(wx.EVT_BUTTON, self.on_refuse_verification)
         self.btn_force_update.Bind(wx.EVT_BUTTON, self.on_force_update)
+        self.verification_sizer.Add(self.verification_button_sizer_2, 0, wx.EXPAND)
 
         # Add grid to Verification tab
         self.verification_grid = self.setup_grid(gridlib.Grid(self.verification_tab), 'verification')
+        self.verification_grid.EnableEditing(False)
+        self.verification_grid.SetSelectionMode(gridlib.Grid.SelectRows)
+        self.verification_grid.Bind(gridlib.EVT_GRID_SELECT_CELL, self.on_verification_selection)
         self.verification_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 20)
 
         # Store reference to verification tab page
@@ -1012,6 +1024,7 @@ class WalletApp(wx.Frame):
         
         self.btn_send.Enable()
         self.btn_send.SetLabel("Send")
+        self._sync_and_refresh()
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def populate_username_dropdown(self):
@@ -1195,7 +1208,7 @@ class WalletApp(wx.Frame):
 
     def on_restore_wallet(self, event):
         """Restore wallet from existing seed"""
-        dialog = CustomDialog("Restore Wallet", ["XRP Secret"])
+        dialog = CustomDialog(self, "Restore Wallet", ["XRP Secret"])
         if dialog.ShowModal() == wx.ID_OK:
             seed = dialog.GetValues()["XRP Secret"]
             try:
@@ -1441,7 +1454,7 @@ class WalletApp(wx.Frame):
                     "Your wallet needs a trust line to handle PFT tokens.\n\n"
                     "This transaction will:\n"
                     "- Set up the required trust line\n"
-                    "- Cost a small amount of XRP (~0.00001 XRP)\n"
+                    "- Cost a small amount of XRP (~0.000001 XRP)\n"
                     "- Enable PFT token transactions\n\n"
                     "Proceed?"
                 )
@@ -1461,7 +1474,7 @@ class WalletApp(wx.Frame):
                     "This transaction will cost 1 XRP.\n\n"
                     "Please write 1 sentence committing to a long term objective of your choice:"
                 )
-                dialog = CustomDialog("Initiation Rite", ["Commitment"], message=message)
+                dialog = CustomDialog(self, "Initiation Rite", ["Commitment"], message=message)
                 if dialog.ShowModal() == wx.ID_OK:
                     commitment = dialog.GetValues()["Commitment"]
                     try:
@@ -1483,14 +1496,14 @@ class WalletApp(wx.Frame):
                     "you need to establish secure communication with the network.\n\n"
                     "This will:\n"
                     "- Set up encrypted messaging capabilities\n"
-                    "- Cost a small amount of XRP (~0.00001 XRP)\n"
+                    "- Cost a small amount of XRP (~0.000001 XRP)\n"
                     "- Enable secure communication with the network\n\n"
                     "Would you like to proceed?"
                 )
                 if wx.YES == wx.MessageBox(message, "Send Handshake", wx.YES_NO | wx.ICON_QUESTION):
                     try:
                         self.worker.expecting_state_change = True
-                        response = self.task_manager.send_handshake(self.default_node)
+                        response = self.task_manager.send_handshake(self.network_config.node_address)
                         formatted_response = self.format_response(response)
                         dialog = SelectableMessageDialog(self, "Handshake Result", formatted_response)
                         dialog.ShowModal()
@@ -1524,7 +1537,7 @@ class WalletApp(wx.Frame):
 
                 message = "Now enter the link for your Google Doc:"
 
-                dialog = CustomDialog("Google Doc Setup", ["Google Doc Share Link"], message=message)
+                dialog = CustomDialog(self, "Google Doc Setup", ["Google Doc Share Link"], message=message)
                 if dialog.ShowModal() == wx.ID_OK:
                     google_doc_link = dialog.GetValues()["Google Doc Share Link"]
                     try:
@@ -1822,6 +1835,15 @@ class WalletApp(wx.Frame):
             logger.debug(f"No data to populate {grid_name} grid")
             grid.ClearGrid()
             return
+        
+        # Store all values from the selected row if there is one
+        had_selection = grid.GetSelectedRows()
+        selected_row_values = None
+        if had_selection:
+            selected_row_values = [
+                grid.GetCellValue(had_selection[0], col) 
+                for col in range(grid.GetNumberCols())
+            ]
 
         if grid.GetNumberRows() > 0:
             grid.DeleteRows(0, grid.GetNumberRows())
@@ -1873,6 +1895,22 @@ class WalletApp(wx.Frame):
             grid.SetColSize(col, int(original_width * column_zoom_factor))
 
         self.auto_size_window()
+
+        # Restore selection if there was one
+        if selected_row_values:
+            # Find the row with matching values
+            for row in range(grid.GetNumberRows()):
+                current_row_values = [
+                    grid.GetCellValue(row, col) 
+                    for col in range(grid.GetNumberCols())
+                ]
+                if current_row_values == selected_row_values:
+                    grid.SelectRow(row)
+                    break
+        else:
+            grid.ClearSelection()  # Only clear if there wasn't a previous selection
+
+        grid.Refresh()
 
     @PerformanceMonitor.measure('populate_summary_grid')
     def populate_summary_grid(self, key_account_details):
@@ -1981,13 +2019,59 @@ class WalletApp(wx.Frame):
     def on_tab_changed(self, event):
         self.auto_size_window()
         event.Skip()
+        
+    def on_proposal_selection(self, event):
+        """Handle proposal grid selection"""
+        row = event.GetRow()
+
+        # Get task ID from selected row
+        task_id = self.proposals_grid.GetCellValue(row, 0)  # First column is task ID
+
+        if not task_id:
+            logger.debug("No task ID found in selected row")
+            event.Skip()
+            return
+
+        logger.debug(f"Selected task ID: {task_id}")
+
+        # Update button states based on task state
+        self.update_proposal_buttons(task_id)
+
+        self.proposals_grid.Refresh()
+        event.Skip()
+
+    def update_proposal_buttons(self, task_id):
+        """Enable/disable buttons based on task state"""
+        try:
+            task_df = self.task_manager.get_task(task_id)
+            latest_state = self.task_manager.get_task_state(task_df)
+
+            # Enable/disable buttons based on task state
+            self.btn_accept_task.Enable(latest_state == TaskType.PROPOSAL.name)
+            self.btn_refuse_task.Enable(latest_state != TaskType.REFUSAL.name)
+            self.btn_submit_for_verification.Enable(latest_state == TaskType.ACCEPTANCE.name)
+
+        except Exception as e:
+            logger.error(f"Error updating proposal buttons: {e}")
+            self.btn_accept_task.Enable(False)
+            self.btn_refuse_task.Enable(False)
+            self.btn_submit_for_verification.Enable(False)
+
+    def get_selected_task_id(self):
+        """Get task ID from selected row in proposals grid"""
+        selected_rows = self.proposals_grid.GetSelectedRows()
+        if not selected_rows:
+            wx.MessageBox("Please select a task first", "No Task Selected", wx.OK | wx.ICON_WARNING)
+            return None
+        
+        return self.proposals_grid.GetCellValue(selected_rows[0], 0)  # First column is task ID
 
     def on_request_task(self, event):
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Requesting Task...")
         self.btn_request_task.SetLabel("Requesting Task...")
         self.btn_request_task.Update()
 
-        dialog = CustomDialog("Request Task", ["Task Request"])
+        dialog = CustomDialog(self, "Request Task", ["Task Request"])
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
             try:
@@ -2006,11 +2090,21 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_accept_task(self, event):
+        task_id = self.get_selected_task_id()
+        if not task_id:
+            return
+
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Accepting Task...")
         self.btn_accept_task.SetLabel("Accepting Task...")
         self.btn_accept_task.Update()
 
-        dialog = CustomDialog("Accept Task", ["Task ID", "Acceptance String"])
+        dialog = CustomDialog(
+            self, 
+            "Accept Task", 
+            ["Task ID", "Acceptance String"],
+            placeholders={"Acceptance String": "I accept!"},
+            readonly_values={"Task ID": task_id}
+        )
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
             task_id = values["Task ID"]
@@ -2034,7 +2128,7 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
             else:
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -2042,11 +2136,21 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_refuse_task(self, event):
+        task_id = self.get_selected_task_id()
+        if not task_id:
+            return
+        
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Refusing Task...")
         self.btn_refuse_task.SetLabel("Refusing Task...")
         self.btn_refuse_task.Update()
 
-        dialog = CustomDialog("Refuse Task", ["Task ID", "Refusal Reason"])
+        dialog = CustomDialog(
+            self, 
+            "Refuse Task", 
+            ["Task ID", "Refusal Reason"],
+            placeholders={"Refusal Reason": "I refuse because of ..."},
+            readonly_values={"Task ID": task_id}
+        )
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
             task_id = values["Task ID"]
@@ -2070,8 +2174,7 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error refusing task: {e}")
                 wx.MessageBox(f"Error refusing task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
             else:
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
-
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         dialog.Destroy()
         self.btn_refuse_task.SetLabel("Refuse Task")
@@ -2079,11 +2182,21 @@ class WalletApp(wx.Frame):
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_submit_for_verification(self, event):
+        task_id = self.get_selected_task_id()
+        if not task_id:
+            return
+
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting for Verification...")
         self.btn_submit_for_verification.SetLabel("Submitting for Verification...")
         self.btn_submit_for_verification.Update()
 
-        dialog = CustomDialog("Submit for Verification", ["Task ID", "Completion String"])
+        dialog = CustomDialog(
+            self, 
+            "Submit for Verification", 
+            ["Task ID", "Completion String"],
+            placeholders={"Completion String": "Place something like 'I completed the task!' here"},
+            readonly_values={"Task ID": task_id}
+        )
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
             task_id = values["Task ID"]
@@ -2097,7 +2210,6 @@ class WalletApp(wx.Frame):
                 dialog = SelectableMessageDialog(self, "Task Submission Result", formatted_response)
                 dialog.ShowModal()
                 dialog.Destroy()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
             except NoMatchingTaskException as e:
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Couldn't find task with task ID {task_id}. Did you enter it correctly?", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
@@ -2108,23 +2220,75 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
             else:
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
         self.btn_submit_for_verification.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
+    def on_verification_selection(self, event):
+        """Handle verification grid selection"""
+        row = event.GetRow()
+
+        # Get task ID from selected row
+        task_id = self.verification_grid.GetCellValue(row, 0)
+
+        if not task_id:
+            logger.debug("No task ID found in selected row")
+            event.Skip()
+            return
+
+        logger.debug(f"Selected task ID: {task_id}")
+
+        self.verification_txt_task_id.SetLabel(task_id)
+
+        self.verification_grid.Refresh()
+        event.Skip()
+
+    def on_refuse_verification(self, event):
+        """Handle refusal of verification"""
+        task_id = self.verification_txt_task_id.GetLabel()
+        if not task_id:
+            wx.MessageBox("Please select a task first", "No Task Selected", wx.OK | wx.ICON_WARNING)
+            return
+        
+        dialog = CustomDialog(
+            self,
+            "Refuse Task",
+            ["Task ID", "Refusal Reason"],
+            placeholders={"Refusal Reason": "I refuse because of ..."},
+            readonly_values={"Task ID": task_id}
+        )
+
+        if dialog.ShowModal() == wx.ID_OK:
+            values = dialog.GetValues()
+            try:
+                response = self.task_manager.send_refusal_for_task(
+                    task_id=values["Task ID"],
+                    refusal_reason=values["Refusal Reason"]
+                )
+                formatted_response = self.format_response(response)
+                result_dialog = SelectableMessageDialog(self, "Task Refusal Result", formatted_response)
+                result_dialog.ShowModal()
+                result_dialog.Destroy()
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+            except Exception as e:
+                wx.MessageBox(f"Error refusing task: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+        dialog.Destroy()  
+
     def on_submit_verification_details(self, event):
+        """Handle submission of verification details"""
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Verification Details...")
         self.btn_submit_verification_details.SetLabel("Submitting Verification Details...")
         self.btn_submit_verification_details.Update()
 
-        task_id = self.verification_txt_task_id.GetValue()
+        task_id = self.verification_txt_task_id.GetLabel()
         response_string = self.verification_txt_details.GetValue()
 
         if not task_id or not response_string:
-            wx.MessageBox("Please enter a task ID and verification details", "Error", wx.OK | wx.ICON_ERROR)
+            wx.MessageBox("Please enter verification details", "Error", wx.OK | wx.ICON_ERROR)
         else:
             try:
                 response = self.task_manager.send_verification_response(
@@ -2146,8 +2310,10 @@ class WalletApp(wx.Frame):
                 wx.MessageBox(f"Error sending verification response: {e}", 'Verification Submission Error', wx.OK | wx.ICON_ERROR)
             else:
                 self.verification_txt_details.SetValue("")
-                self.verification_txt_task_id.SetValue("")
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+                self.verification_txt_task_id.SetLabel("")
+                self.btn_submit_verification_details.SetLabel("Submit Verification Details")
+                self.btn_submit_verification_details.Update()
+                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
@@ -2282,7 +2448,7 @@ class WalletApp(wx.Frame):
                     return
                 
             # Send the memo
-            responses = self.task_manager.send_memo(recipient, memo_text, encrypt=encrypt)
+            responses = self.task_manager.send_memo(recipient, memo_text, chunk=True, encrypt=encrypt)
             
             formatted_responses = [self.format_response(response) for response in responses]
             logger.info(f"Memo Submission Result: {formatted_responses}")
@@ -2300,7 +2466,7 @@ class WalletApp(wx.Frame):
             wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
         else:
             self.txt_memo_input.SetValue("")
-            wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+            wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
 
         self.btn_submit_memo.SetLabel("Submit Memo")
@@ -2308,6 +2474,7 @@ class WalletApp(wx.Frame):
 
     def on_update_google_doc(self, event):
         """Handle updating Google Doc link"""
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Updating Google Doc Link...")
         dialog = UpdateGoogleDocDialog(self)
         while True:
             if dialog.ShowModal() == wx.ID_OK:
@@ -2325,9 +2492,12 @@ class WalletApp(wx.Frame):
                     logger.error(traceback.format_exc())
                     dialog.show_error(str(e))
                     continue
+                else:
+                    wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
             else:
                 break
         dialog.Destroy()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_show_secret(self, event):
         dialog = wx.PasswordEntryDialog(self, "Enter Password", "Please enter your password to view your secret.")

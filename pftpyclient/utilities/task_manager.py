@@ -802,7 +802,7 @@ class PostFiatTaskManager:
             user=self.credential_manager.postfiat_username,
             ecdh_public_key=ecdh_public_key
         )
-        return self._send_memo_single(destination, handshake)
+        return self.send_memo(destination, handshake, compress=False)
     
     def _split_text_into_chunks(self, text, max_chunk_size=MAX_CHUNK_SIZE):
         """ Helper method to build a list of Memo objects representing a single memo string split into chunks """
@@ -1153,7 +1153,7 @@ class PostFiatTaskManager:
             # Handle decompression
             if decompress and processed_data.startswith('COMPRESSED__'):
                 processed_data = processed_data.replace('COMPRESSED__', '', 1)
-                logger.debug(f"Decompressing data of length {len(processed_data)}")
+                # logger.debug(f"Decompressing data of length {len(processed_data)}")
                 processed_data = decompress_string(processed_data)
 
             # Handle decryption
@@ -1173,7 +1173,7 @@ class PostFiatTaskManager:
                 
                 # Remove the WHISPER__ prefix and decrypt
                 processed_data = processed_data.replace('WHISPER__', '', 1)
-                processed_data = self.decrypt_memo(processed_data, shared_secret)
+                processed_data = '[DECRYPTED] ' + self.decrypt_memo(processed_data, shared_secret)
 
             return processed_data
         
@@ -1712,12 +1712,12 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
 
-        if most_recent_status != 'PROPOSAL':
-            raise WrongTaskStateException('PROPOSAL', most_recent_status)
+        if most_recent_status != TaskType.PROPOSAL.name:
+            raise WrongTaskStateException(TaskType.PROPOSAL.name, most_recent_status)
 
         proposal_source = task_df.iloc[0]['counterparty_address']
-        if 'ACCEPTANCE REASON ___' not in acceptance_string:
-            classified_string='ACCEPTANCE REASON ___ '+acceptance_string
+        if TaskType.ACCEPTANCE.value not in acceptance_string:
+            classified_string=TaskType.ACCEPTANCE.value + acceptance_string
         else:
             classified_string=acceptance_string
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 

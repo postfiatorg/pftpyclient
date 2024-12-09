@@ -802,7 +802,9 @@ class CustomDialog(wx.Dialog):
             parent: WalletDialogParent, 
             title: str, 
             fields: list[str], 
-            message: str = None
+            message: str = None,
+            placeholders: Optional[dict[str, str]] = None,
+            readonly_values: Optional[dict[str, str]] = None
         ) -> None:
         """Initialize the custom dialog
         
@@ -811,10 +813,13 @@ class CustomDialog(wx.Dialog):
             title: Dialog title
             fields: List of field names
             message: Optional message to display above the fields
+            placeholders: Optional dict mapping field names to placeholder text
         """
         super().__init__(parent, title=title, size=(500, 200))
         self.fields = fields
         self.message = message
+        self.placeholders = placeholders or {}
+        self.readonly_values = readonly_values or {}
         self.InitUI()
 
         # For layout update before getting best size
@@ -839,9 +844,18 @@ class CustomDialog(wx.Dialog):
             hbox = wx.BoxSizer(wx.HORIZONTAL)
             label = wx.StaticText(pnl, label=field)
             hbox.Add(label, flag=wx.RIGHT, border=8)
-            text_ctrl = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 100))
-            hbox.Add(text_ctrl, proportion=1)
-            self.text_controls[field] = text_ctrl
+
+            if field in self.readonly_values:
+                value_label = wx.StaticText(pnl, label=self.readonly_values[field])
+                hbox.Add(value_label, proportion=1)
+                self.text_controls[field] = value_label
+            else:
+                text_ctrl = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 100))
+                if field in self.placeholders:
+                    text_ctrl.SetHint(self.placeholders[field])
+                self.text_controls[field] = text_ctrl
+                hbox.Add(text_ctrl, proportion=1)
+
             vbox.Add(hbox, flag=wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, border=10)
 
         vbox.Add((-1, 25))
@@ -862,6 +876,9 @@ class CustomDialog(wx.Dialog):
         self.submit_button.Bind(wx.EVT_BUTTON, self.OnSubmit)
         self.close_button.Bind(wx.EVT_BUTTON, self.OnClose)
 
+        # Set initial focus to close button so that placeholder text appears
+        wx.CallAfter(self.close_button.SetFocus)
+
     def OnSubmit(self, e: wx.CommandEvent) -> None:
         self.EndModal(wx.ID_OK)
 
@@ -869,4 +886,11 @@ class CustomDialog(wx.Dialog):
         self.EndModal(wx.ID_CANCEL)
 
     def GetValues(self) -> dict[str, str]:
-        return {field: text_ctrl.GetValue() for field, text_ctrl in self.text_controls.items()}
+        """Get values from all controls, including read-only values"""
+        values = {}
+        for field, control in self.text_controls.items():
+            if isinstance(control, wx.TextCtrl):
+                values[field] = control.GetValue()
+            else:  # wx.StaticText for read-only fields
+                values[field] = control.GetLabel()
+        return values
