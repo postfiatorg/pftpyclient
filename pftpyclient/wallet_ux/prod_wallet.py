@@ -22,14 +22,15 @@ from pftpyclient.utilities.task_manager import (
     PostFiatTaskManager, 
     NoMatchingTaskException, 
     WrongTaskStateException, 
-    MAX_CHUNK_SIZE, 
-    compress_string
+    compress_string,
+    construct_memo
 )
 from pftpyclient.user_login.credentials import CredentialManager
 import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
+import pftpyclient.configuration.constants as constants
 from loguru import logger
 from pathlib import Path
 from cryptography.fernet import InvalidToken
@@ -48,10 +49,6 @@ wx_sink = configure_logger(
     log_filename="prod_wallet.log",
     level="DEBUG"
 )
-from pftpyclient.configuration.constants import *
-
-UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
-REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 5  # 5 seconds
 
 # Try to use the default browser
 if os.name == 'nt':
@@ -89,7 +86,7 @@ class PostFiatWalletApp(wx.App):
 class XRPLMonitorThread(Thread):
     def __init__(self, gui):
         Thread.__init__(self, daemon=True)
-        self.gui = gui
+        self.gui: WalletApp = gui
         self.network_config = get_network_config()
         self.nodes = self.network_config.websockets
         self.current_node_index = 0
@@ -960,7 +957,7 @@ class WalletApp(wx.Frame):
                 
             password = dialog.GetValue()
             dialog.Destroy()
-            wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+            wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
         
             if not self.task_manager.verify_password(password):
                 wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
@@ -1686,12 +1683,12 @@ class WalletApp(wx.Frame):
     def start_pft_update_timer(self):
         self.pft_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
-        self.pft_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
+        self.pft_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def start_transaction_update_timer(self):
         self.tx_update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
-        self.tx_update_timer.Start(UPDATE_TIMER_INTERVAL_SEC * 1000)
+        self.tx_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def _sync_and_refresh(self):
         """Internal method to sync transactions and refresh grids"""
@@ -2128,7 +2125,7 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
             else:
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -2174,7 +2171,7 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error refusing task: {e}")
                 wx.MessageBox(f"Error refusing task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
             else:
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         dialog.Destroy()
         self.btn_refuse_task.SetLabel("Refuse Task")
@@ -2220,7 +2217,7 @@ class WalletApp(wx.Frame):
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
             else:
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
@@ -2272,7 +2269,7 @@ class WalletApp(wx.Frame):
                 result_dialog = SelectableMessageDialog(self, "Task Refusal Result", formatted_response)
                 result_dialog.ShowModal()
                 result_dialog.Destroy()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
             except Exception as e:
                 wx.MessageBox(f"Error refusing task: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
@@ -2313,7 +2310,7 @@ class WalletApp(wx.Frame):
                 self.verification_txt_task_id.SetLabel("")
                 self.btn_submit_verification_details.SetLabel("Submit Verification Details")
                 self.btn_submit_verification_details.Update()
-                wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
@@ -2424,29 +2421,24 @@ class WalletApp(wx.Frame):
                 # Add encryption overhead to size estimate
                 test_memo = self.task_manager.encrypt_memo(test_memo, received_key)
 
-            # Estimate compressed size
-            compressed_text = compress_string(test_memo)
-            compressed_bytes = compressed_text.encode('utf-8')
-            num_chunks = len(compressed_bytes) // MAX_CHUNK_SIZE
-            if len(compressed_bytes) % MAX_CHUNK_SIZE != 0:
-                num_chunks += 1
+            # Create test Memo object
+            compressed_memo = construct_memo(
+                memo_format=self.task_manager.credential_manager.postfiat_username,
+                memo_type=self.task_manager.generate_custom_id(),
+                memo_data=compress_string(test_memo)
+            )
 
-            # Calculate uncompressed chunks for comparison
-            uncompressed_bytes = test_memo.encode('utf-8')
-            uncompressed_chunks = len(uncompressed_bytes) // MAX_CHUNK_SIZE
-            if len(uncompressed_bytes) % MAX_CHUNK_SIZE != 0:
-                uncompressed_chunks += 1        
+            # Calculate chunks needed
+            num_chunks = self.task_manager.calculate_required_chunks(compressed_memo)
 
-            if num_chunks > 1:
-                message = (
-                    f"Memo will be encrypted, compressed and sent over {num_chunks} transactions "
-                    f"(compared to {uncompressed_chunks} without compression) and "
-                    f"cost 1 PFT per chunk ({num_chunks} PFT total). Continue?"
-                )
-                if wx.NO == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
-                    self.btn_submit_memo.SetLabel("Submit Memo")
-                    return
-                
+            message = (
+                f"Memo will be {"encrypted, " if encrypt else ""}compressed and sent over {num_chunks} transaction(s) and "
+                f"cost 1 PFT per chunk ({num_chunks} PFT + {num_chunks * constants.MIN_XRP_PER_TRANSACTION} XRP total). Continue?"
+            )
+            if wx.NO == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
+                self.btn_submit_memo.SetLabel("Submit Memo")
+                return
+            
             # Send the memo
             responses = self.task_manager.send_memo(recipient, memo_text, chunk=True, encrypt=encrypt)
             
@@ -2466,7 +2458,7 @@ class WalletApp(wx.Frame):
             wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
         else:
             self.txt_memo_input.SetValue("")
-            wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+            wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
 
         self.btn_submit_memo.SetLabel("Submit Memo")
@@ -2493,7 +2485,7 @@ class WalletApp(wx.Frame):
                     dialog.show_error(str(e))
                     continue
                 else:
-                    wx.CallLater(REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                    wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
             else:
                 break
         dialog.Destroy()

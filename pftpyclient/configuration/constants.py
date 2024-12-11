@@ -1,8 +1,15 @@
 from enum import Enum
 from decimal import Decimal
 
+# Pftpyclient runtime constants
+UPDATE_TIMER_INTERVAL_SEC = 60  # 60 Seconds
+REFRESH_GRIDS_AFTER_TASK_DELAY_SEC = 5  # 5 seconds
+
+# XRPL constants
 DEFAULT_PFT_LIMIT = 100_000_000
 MIN_XRP_PER_TRANSACTION = Decimal('0.000001')
+MAX_CHUNK_SIZE = 1024
+XRP_MEMO_STRUCTURAL_OVERHEAD = 100  # JSON structure, quotes, etc.
 
 class SystemMemoType(Enum):
     HANDSHAKE = 'HANDSHAKE'

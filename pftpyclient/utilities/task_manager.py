@@ -41,10 +41,10 @@ from cryptography.fernet import Fernet
 import pftpyclient.configuration.constants as constants
 from pftpyclient.utilities.transaction_requirements import TransactionRequirementService
 import traceback
+from typing import List
+import math
 
 nest_asyncio.apply()
-
-MAX_CHUNK_SIZE = 760
 
 SAVE_MEMO_TRANSACTIONS = True
 SAVE_TASKS = True
@@ -352,7 +352,7 @@ class PostFiatTaskManager:
 
         # Extract first memo into a new column, serialize to dict
         # Any additional memos are ignored
-        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.convert_memo_dict(x['Memos'][0]['Memo']))
+        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.decode_memo_fields_to_dict(x['Memos'][0]['Memo']))
         
         # Extract account and destination from tx_json into new columns
         memo_tx_df['account']= memo_tx_df['tx_json'].apply(lambda x: x['Account'])
@@ -568,12 +568,14 @@ class PostFiatTaskManager:
         date_object = datetime.datetime.fromtimestamp(unix_timestamp)
         return date_object
 
-    def hex_to_text(self,hex_string):
+    @staticmethod
+    def hex_to_text(hex_string):
         bytes_object = bytes.fromhex(hex_string)
         ascii_string = bytes_object.decode("utf-8")
         return ascii_string
     
-    def generate_custom_id(self):
+    @staticmethod
+    def generate_custom_id():
         """ These are the custom IDs generated for each task that is generated
         in a Post Fiat Node """ 
         letters = ''.join(random.choices(string.ascii_uppercase, k=2))
@@ -588,8 +590,9 @@ class PostFiatTaskManager:
     def send_xrp(self, amount, destination, memo="", destination_tag=None):
         return send_xrp(self.network_url, self.user_wallet, amount, destination, memo, destination_tag=destination_tag)
 
-    def convert_memo_dict(self, memo_dict):
-        """Constructs a memo object from hex-encoded XRP memo fields.
+    @staticmethod
+    def decode_memo_fields_to_dict(memo: Union[xrpl.models.transactions.Memo, dict]):
+        """Decodes hex-encoded XRP memo fields from a dictionary to a more readable dictionary format.
         
         The mapping from XRP memo fields to our internal format:
         - MemoFormat -> user: The username that sent the memo
@@ -598,14 +601,23 @@ class PostFiatTaskManager:
             b) For system messages: The system message type (e.g., "HANDSHAKE", "INITIATION_RITE")
         - MemoData -> full_output: The actual content/payload of the memo
         """
-        fields = {
-            'user': 'MemoFormat',
-            'task_id': 'MemoType',
-            'full_output': 'MemoData'
-        }
+        # TODO: Remove key changes and rely on MemoFormat, MemoType, MemoData to avoid confusion from context-switching
+        # Handle xrpl.models.transactions.Memo objects
+        if hasattr(memo, 'memo_format'):  # This is a Memo object
+            fields = {
+                'user': memo.memo_format,
+                'task_id': memo.memo_type,
+                'full_output': memo.memo_data
+            }
+        else:  # This is a dictionary from transaction JSON
+            fields = {
+                'user': memo.get('MemoFormat', ''),
+                'task_id': memo.get('MemoType', ''),
+                'full_output': memo.get('MemoData', '')
+            }
         
         return {
-            key: self.hex_to_text(memo_dict.get(value, ''))
+            key: PostFiatTaskManager.hex_to_text(value or '')
             for key, value in fields.items()
         }
 
@@ -627,7 +639,7 @@ class PostFiatTaskManager:
         if isinstance(memo, str) and is_over_1kb(memo):
             response = []
             logger.debug("Memo exceeds 1 KB, splitting into chunks")
-            chunked_memo = self._split_text_into_chunks(memo)
+            chunked_memo = self._chunk_memos(memo)
 
             # Split amount by number of chunks
             amount_per_chunk = amount / len(chunked_memo)
@@ -804,25 +816,118 @@ class PostFiatTaskManager:
         )
         return self.send_memo(destination, handshake, compress=False)
     
-    def _split_text_into_chunks(self, text, max_chunk_size=MAX_CHUNK_SIZE):
-        """ Helper method to build a list of Memo objects representing a single memo string split into chunks """
+    @staticmethod
+    def calculate_memo_size(memo_format: str, memo_type: str, memo_data: str) -> dict:
+        return calculate_memo_size(memo_format, memo_type, memo_data)
 
-        chunks = []
+    @staticmethod
+    def calculate_required_chunks(memo: Memo, max_size: int = constants.MAX_CHUNK_SIZE) -> int:
+        """
+        Calculates how many chunks will be needed to send a memo.
+        
+        Args:
+            memo: Original Memo object to analyze
+            max_size: Maximum size in bytes for each complete Memo object
+            
+        Returns:
+            int: Number of chunks required
+            
+        Raises:
+            ValueError: If the memo cannot be chunked (overhead too large)
+        """
+        # Extract memo components
+        memo_dict = PostFiatTaskManager.decode_memo_fields_to_dict(memo)
+        memo_format = memo_dict['user']
+        memo_type = memo_dict['task_id']
+        memo_data = memo_dict['full_output']
 
-        text_bytes = text.encode('utf-8')
+        logger.debug(f"Deconstructed (plaintext) memo sizes: "
+                    f"memo_format: {len(memo_format)}, "
+                    f"memo_type: {len(memo_type)}, "
+                    f"memo_data: {len(memo_data)}")
 
-        for i in range(0, len(text_bytes), max_chunk_size):
-            chunk = text_bytes[i:i+max_chunk_size]
-            chunk_number = i // max_chunk_size + 1
-            chunk_label = f"chunk_{chunk_number}__".encode('utf-8')
-            chunk_with_label = chunk_label + chunk
-            chunks.append(chunk_with_label)
+        # Calculate overhead sizes
+        size_info = PostFiatTaskManager.calculate_memo_size(memo_format, memo_type, "chunk_999__")  # assuming chunk_999__ is worst-case chunk label overhead
+        max_data_size = max_size - size_info['total_size']
 
-        return [chunk.decode('utf-8', errors='ignore') for chunk in chunks]
+        logger.debug(f"Size allocation:")
+        logger.debug(f"  Max size: {max_size}")
+        logger.debug(f"  Total overhead: {size_info['total_size']}")
+        logger.debug(f"  Available for data: {max_size} - {size_info['total_size']} = {max_data_size}")
+
+        if max_data_size <= 0:
+            raise ValueError(
+                f"No space for data: max_size={max_size}, total_overhead={size_info['total_size']}"
+            )
+        
+        # Calculate number of chunks needed
+        data_bytes = memo_data.encode('utf-8')
+        return math.ceil(len(data_bytes) / max_data_size)
+    
+    @staticmethod
+    def _chunk_memos(memo: Memo, max_size: int = constants.MAX_CHUNK_SIZE) -> List[Memo]:
+        """
+        Splits a Memo object into multiple Memo objects, each under MAX_CHUNK_SIZE bytes.
+        Only chunks the memo_data field while preserving memo_format and memo_type.
+        
+        Args:
+            memo: Original Memo object to split
+            max_size: Maximum size in bytes for each complete Memo object
+            
+        Returns:
+            List of Memo objects, each under max_size bytes
+        """
+        logger.debug("Chunking memo...")
+
+        # Extract memo components
+        memo_dict = PostFiatTaskManager.decode_memo_fields_to_dict(memo)
+        memo_format = memo_dict['user']
+        memo_type = memo_dict['task_id']
+        memo_data = memo_dict['full_output']
+
+        # Calculate chunks needed and validate size
+        num_chunks = PostFiatTaskManager.calculate_required_chunks(memo, max_size)
+        chunk_size = len(memo_data.encode('utf-8')) // num_chunks
+                
+        # Split into chunks
+        chunked_memos = []
+        data_bytes = memo_data.encode('utf-8')
+        for chunk_number in range(1, num_chunks + 1):
+            start_idx = (chunk_number - 1) * chunk_size
+            end_idx = start_idx + chunk_size if chunk_number < num_chunks else len(data_bytes)
+            chunk = data_bytes[start_idx:end_idx]
+            chunk_with_label = f"chunk_{chunk_number}__{chunk.decode('utf-8', errors='ignore')}"
+
+            # Debug the sizes
+            test_format = str_to_hex(memo_format)
+            test_type = str_to_hex(memo_type)
+            test_data = str_to_hex(chunk_with_label)
+            
+            logger.debug(f"Chunk {chunk_number} sizes:")
+            logger.debug(f"  Plaintext Format size: {len(memo_format)}")
+            logger.debug(f"  Plaintext Type size: {len(memo_type)}")
+            logger.debug(f"  Plaintext Data size: {len(chunk_with_label)}")
+            logger.debug(f"  Plaintext Total size: {len(memo_format) + len(memo_type) + len(chunk_with_label)}")
+            logger.debug(f"  Hex Format size: {len(test_format)}")
+            logger.debug(f"  Hex Type size: {len(test_type)}")
+            logger.debug(f"  Hex Data size: {len(test_data)}")
+            logger.debug(f"  Hex Total size: {len(test_format) + len(test_type) + len(test_data)}")
+            
+            chunk_memo = construct_memo(
+                memo_format=memo_format,
+                memo_type=memo_type,
+                memo_data=chunk_with_label,
+                validate_size=False  # TODO: The size validation appears too conservative
+            )
+
+            chunked_memos.append(chunk_memo)
+
+        return chunked_memos
 
     @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('encrypt_memo')
-    def encrypt_memo(self, memo: str, shared_secret: str) -> str:
+    @staticmethod
+    def encrypt_memo(memo: str, shared_secret: str) -> str:
         """ Encrypts a memo using a shared secret """
         # Convert shared_secret to bytes if it isn't already
         if isinstance(shared_secret, str):
@@ -922,37 +1027,33 @@ class PostFiatTaskManager:
             memo_data = "COMPRESSED__" + compressed_data
 
         # For system memos, verify size and prevent chunking
+        # construct_memo will raise ValueError if size exceeds limit, since SystemMemoTypes cannot be chunked due to collision risk
+        memo = construct_memo(
+            memo_format=memo_format,
+            memo_type=memo_type,
+            memo_data=memo_data,
+            validate_size=(is_system_memo and chunk) or not chunk
+        )
+
         if is_system_memo and chunk:
-            # construct_memo will raise ValueError if size exceeds limit, since SystemMemoTypes cannot be chunked due to collision risk
-            memo_data = construct_memo(
-                memo_format=memo_format,
-                memo_type=memo_type,
-                memo_data=memo_data
-            )
             return self._send_memo_single(destination, memo_data)
 
         # Handle chunking for non-system memos if requested
         if chunk:
-            memo_chunks = self._split_text_into_chunks(memo_data)
-            responses = []
+            try:
+                chunk_memos = self._chunk_memos(memo)
+                responses = []
 
-            for idx, memo_chunk in enumerate(memo_chunks):
-                logger.debug(f"Sending chunk {idx+1} of {len(memo_chunks)}: {memo_chunk[:100]}...")
-                chunk_memo = construct_memo(
-                    memo_format=memo_format,
-                    memo_type=memo_type,
-                    memo_data=memo_chunk
-                )
-                responses.append(self._send_memo_single(destination, chunk_memo, pft_amount))
+                for idx, chunk_memo in enumerate(chunk_memos):
+                    logger.debug(f"Sending chunk {idx+1} of {len(chunk_memos)}: {chunk_memo.memo_data[:100]}...")
+                    responses.append(self._send_memo_single(destination, chunk_memo, pft_amount))
 
-            return responses
+                return responses
+            except Exception as e:
+                logger.error(f"Error chunking memo: {e}")
+                logger.error(f"traceback: {traceback.format_exc()}")
+
         else:
-            # Send as a single message
-            memo = construct_memo(
-                memo_format=memo_format,
-                memo_type=memo_type,
-                memo_data=memo_data
-            )
             return self._send_memo_single(destination, memo, pft_amount)
     
     def _send_memo_single(self, destination: str, memo: Memo, pft_amount: Decimal):
@@ -1230,7 +1331,7 @@ class PostFiatTaskManager:
                     logger.debug(f"Retrieved {len(transactions)} transactions")
                     all_transactions.extend(transactions)
                 else:
-                    logger.error(f"Error in XRPL response: {response.status}")
+                    logger.error(f"Error in XRPL response: {response}")
                     break
             except Exception as e:
                 logger.error(f"Error making XRPL request: {e}")
@@ -2045,6 +2146,43 @@ def is_over_1kb(value: Union[str, int, float]) -> bool:
         return value > 1024
     else:
         raise TypeError(f"Expected string or number, got {type(value)}")
+    
+def calculate_memo_size(memo_format: str, memo_type: str, memo_data: str) -> dict:
+    """
+    Calculates the size components of a memo using consistent logic.
+    
+    Args:
+        memo_format: The format field (usually username)
+        memo_type: The type field (usually task_id)
+        memo_data: The data field (the actual content)
+        
+    Returns:
+        dict: Size breakdown including:
+            - format_size: Size of hex-encoded format
+            - type_size: Size of hex-encoded type
+            - data_size: Size of hex-encoded data
+            - structural_overhead: Fixed overhead for JSON structure
+            - total_size: Total size including all components
+    """
+    format_size = len(str_to_hex(memo_format))
+    type_size = len(str_to_hex(memo_type))
+    data_size = len(str_to_hex(memo_data))
+    structural_overhead = constants.XRP_MEMO_STRUCTURAL_OVERHEAD
+
+    logger.debug(f"Memo size breakdown:")
+    logger.debug(f"  format_size: {format_size}")
+    logger.debug(f"  type_size: {type_size}")
+    logger.debug(f"  data_size: {data_size}")
+    logger.debug(f"  structural_overhead: {structural_overhead}")
+    logger.debug(f"  total_size: {format_size + type_size + data_size + structural_overhead}")
+
+    return {
+        'format_size': format_size,
+        'type_size': type_size,
+        'data_size': data_size,
+        'structural_overhead': structural_overhead,
+        'total_size': format_size + type_size + data_size + structural_overhead
+    }
 
 def to_hex(string):
     return binascii.hexlify(string.encode()).decode()
@@ -2061,20 +2199,20 @@ def construct_initiation_rite_memo(user='goodalexander', commitment='I commit to
 def construct_google_doc_context_memo(user, google_doc_link):                  
     return construct_memo(memo_format=user, memo_type=SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, memo_data=google_doc_link) 
 
-def construct_memo(memo_format, memo_type, memo_data):
+def construct_memo(memo_format, memo_type, memo_data, validate_size=False):
     """Constructs a memo object, checking total size"""
+    # NOTE: This is a hack and appears too conservative
+    # NOTE: We don't know if this is the correct way calculate the XRPL size limits
+    # NOTE: This will raise an error even when a transaction might otherwise succeed
+    if validate_size:
+        size_info = calculate_memo_size(memo_format, memo_type, memo_data)
+        if is_over_1kb(size_info['total_size']):
+            raise ValueError(f"Memo exceeds 1 KB, raising ValueError: {size_info['total_size']}")
+
     # Convert to hex
     hex_format = to_hex(memo_format)
     hex_type = to_hex(memo_type)
     hex_data = to_hex(memo_data)
-
-    # Calculate total size of all fields
-    total_size = len(hex_format.encode('utf-8')) + \
-                 len(hex_type.encode('utf-8')) + \
-                 len(hex_data.encode('utf-8'))
-
-    if is_over_1kb(total_size):
-        raise ValueError("Memo exceeds 1 KB, raising ValueError")
 
     return Memo(
         memo_data=hex_data,
