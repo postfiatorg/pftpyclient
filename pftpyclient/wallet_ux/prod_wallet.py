@@ -2044,9 +2044,9 @@ class WalletApp(wx.Frame):
             latest_state = self.task_manager.get_task_state(task_df)
 
             # Enable/disable buttons based on task state
-            self.btn_accept_task.Enable(latest_state == TaskType.PROPOSAL.name)
-            self.btn_refuse_task.Enable(latest_state != TaskType.REFUSAL.name)
-            self.btn_submit_for_verification.Enable(latest_state == TaskType.ACCEPTANCE.name)
+            self.btn_accept_task.Enable(latest_state == constants.TaskType.PROPOSAL.name)
+            self.btn_refuse_task.Enable(latest_state != constants.TaskType.REFUSAL.name)
+            self.btn_submit_for_verification.Enable(latest_state == constants.TaskType.ACCEPTANCE.name)
 
         except Exception as e:
             logger.error(f"Error updating proposal buttons: {e}")
