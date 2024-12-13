@@ -926,8 +926,7 @@ class PostFiatTaskManager:
 
     @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('encrypt_memo')
-    @staticmethod
-    def encrypt_memo(memo: str, shared_secret: str) -> str:
+    def encrypt_memo(self, memo: str, shared_secret: str) -> str:
         """ Encrypts a memo using a shared secret """
         # Convert shared_secret to bytes if it isn't already
         if isinstance(shared_secret, str):
@@ -1513,13 +1512,13 @@ class PostFiatTaskManager:
         if google_doc_text == "Failed to retrieve the document. Status code: 401":
             raise GoogleDocIsNotSharedException(google_doc_link)
         
-        # Check 4: google doc contains the correct XRP address at the top
-        if retrieve_xrp_address_from_google_doc(google_doc_text) != self.user_wallet.classic_address:
-            raise GoogleDocDoesNotContainXrpAddressException(self.user_wallet.classic_address)
+        # # Check 4: google doc contains the correct XRP address at the top
+        # if retrieve_xrp_address_from_google_doc(google_doc_text) != self.user_wallet.classic_address:
+        #     raise GoogleDocDoesNotContainXrpAddressException(self.user_wallet.classic_address)
         
-        # Check 5: XRP address has a balance
-        if self.get_xrp_balance() == 0:
-            raise GoogleDocIsNotFundedException(google_doc_link)    
+        # # Check 5: XRP address has a balance
+        # if self.get_xrp_balance() == 0:
+        #     raise GoogleDocIsNotFundedException(google_doc_link)    
     
     @requires_wallet_state(INITIATED_STATES)
     def handle_google_doc_setup(self, google_doc_link):
@@ -2435,17 +2434,17 @@ class InvalidGoogleDocException(Exception):
         self.google_url = google_url
         super().__init__(f"Invalid Google Doc URL: {google_url}")
 
-class GoogleDocDoesNotContainXrpAddressException(Exception):
-    """ This exception is raised when the google doc does not contain the XRP address """
-    def __init__(self, xrp_address):
-        self.xrp_address = xrp_address
-        super().__init__(f"Google Doc does not contain expected XRP address: {xrp_address}")
+# class GoogleDocDoesNotContainXrpAddressException(Exception):
+#     """ This exception is raised when the google doc does not contain the XRP address """
+#     def __init__(self, xrp_address):
+#         self.xrp_address = xrp_address
+#         super().__init__(f"Google Doc does not contain expected XRP address: {xrp_address}")
 
-class GoogleDocIsNotFundedException(Exception):
-    """ This exception is raised when the google doc's XRP address is not funded """
-    def __init__(self, google_url):
-        self.google_url = google_url
-        super().__init__(f"Google Doc's XRP address is not funded: {google_url}")
+# class GoogleDocIsNotFundedException(Exception):
+#     """ This exception is raised when the google doc's XRP address is not funded """
+#     def __init__(self, google_url):
+#         self.google_url = google_url
+#         super().__init__(f"Google Doc's XRP address is not funded: {google_url}")
 
 class GoogleDocIsNotSharedException(Exception):
     """ This exception is raised when the google doc is not shared """

@@ -1511,40 +1511,9 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(f"Error sending handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
             case WalletState.HANDSHAKE_SENT:
-                template_text = (
-                    f"{self.wallet.classic_address}\n"
-                    "___x TASK VERIFICATION SECTION START x___\n \n"
-                    "___x TASK VERIFICATION SECTION END x___\n"
-                )
-                
-                message = (
-                    "To continue with wallet initialization,\nyou need to provide a Google Doc link.\n\n"
-                    "This document should:\n"
-                    "- Be viewable by anyone who has the link\n"
-                    "- Have your XRP address on the first line\n"
-                    "- Include a task verification section\n\n"
-                    "Copy and paste the text below into your Google Doc:\n\n"
-                    f"\n{template_text}\n\n"
-                    "When you're ready, click OK to proceed."
-                )
-
-                template_dialog = SelectableMessageDialog(self, "Google Doc Setup", message)
-                template_dialog.ShowModal()
-                template_dialog.Destroy()
-
-                message = "Now enter the link for your Google Doc:"
-
-                dialog = CustomDialog(self, "Google Doc Setup", ["Google Doc Share Link"], message=message)
-                if dialog.ShowModal() == wx.ID_OK:
-                    google_doc_link = dialog.GetValues()["Google Doc Share Link"]
-                    try:
-                        self.worker.expecting_state_change = True
-                        self.task_manager.handle_google_doc_setup(google_doc_link)
-                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
-                    except Exception as e:
-                        logger.error(f"Error setting up Google Doc: {e}")
-                        wx.MessageBox(f"Error setting up Google Doc: {e}", "Error", wx.OK | wx.ICON_ERROR)
-                dialog.Destroy()
+                if self.show_google_doc_template(is_initial_setup=True):
+                    self.handle_google_doc_submission(event, is_initial_setup=True)
+                    self.worker.expecting_state_change = True
 
             case _:
                 logger.error(f"Unknown wallet state: {current_state}")
@@ -2466,8 +2435,37 @@ class WalletApp(wx.Frame):
 
     def on_update_google_doc(self, event):
         """Handle updating Google Doc link"""
+        if self.show_google_doc_template(is_initial_setup=False):
+            self.handle_google_doc_submission(event)
+
+    def show_google_doc_template(self, is_initial_setup: bool = False):
+        """Show the template and instructions for Google Doc Setup"""
+        header = "Setup Google Doc" if is_initial_setup else "Update Google Doc"
+        template_text = (
+            "___x TASK VERIFICATION SECTION START x___\n \n"
+            "___x TASK VERIFICATION SECTION END x___\n"
+        )
+        
+        message = (
+            f"{'To continue with wallet initialization,' if is_initial_setup else 'To update your Google Doc,'}\n"
+            "you need to provide a Google Doc link.\n\n"
+            "This document should:\n"
+            "- Be viewable by anyone who has the link\n"
+            "- Include a task verification section\n\n"
+            "Copy and paste the text below into your Google Doc:\n\n"
+            f"\n{template_text}\n\n"
+            "When you're ready, click OK to proceed."
+        )
+
+        template_dialog = SelectableMessageDialog(self, header, message)
+        result = template_dialog.ShowModal()
+        template_dialog.Destroy()
+        return result == wx.ID_OK
+
+    def handle_google_doc_submission(self, event, is_initial_setup: bool = False):
+        """Common handler for Google Doc submission/updates"""
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Updating Google Doc Link...")
-        dialog = UpdateGoogleDocDialog(self)
+        dialog = GoogleDocSetupDialog(self, is_initial_setup=is_initial_setup)
         while True:
             if dialog.ShowModal() == wx.ID_OK:
                 google_doc_link = dialog.get_link()
@@ -2479,6 +2477,7 @@ class WalletApp(wx.Frame):
                         success_dialog = SelectableMessageDialog(self, "Success", formatted_response)
                         success_dialog.ShowModal()
                         success_dialog.Destroy()
+                        break
                 except Exception as e:
                     logger.error(f"Error updating Google Doc link: {e}")
                     logger.error(traceback.format_exc())

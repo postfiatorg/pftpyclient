@@ -452,12 +452,24 @@ class SelectableMessageDialog(wx.Dialog):
         sizer.Add(self.html_window, 1, wx.EXPAND | wx.ALL, 10)
 
         ok_button = wx.Button(panel, wx.ID_OK, label="OK")
-        sizer.Add(ok_button, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        cancel_button = wx.Button(panel, wx.ID_CANCEL, label="Cancel")
+
+        button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        button_sizer.Add(ok_button, 0, wx.ALL, 5)
+        button_sizer.Add(cancel_button, 0, wx.ALL, 5)
+        sizer.Add(button_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
 
         panel.SetSizer(sizer)
 
         self.SetContent(message)
         self.Center()
+        
+        # Bind the close event
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def on_close(self, event):
+        """Handle window close button"""
+        self.EndModal(wx.ID_CANCEL)
 
     def SetContent(self, message: str) -> None:
         html_content = f"""
@@ -474,7 +486,6 @@ class SelectableMessageDialog(wx.Dialog):
         </html>
         """
         self.html_window.SetPage(html_content)
-
 
 class EncryptionRequestsDialog(wx.Dialog):
     """Dialog for managing encryption requests"""
@@ -721,20 +732,23 @@ class ChangePasswordDialog(wx.Dialog):
         panel.SetSizer(sizer)
         self.Center()
 
-class UpdateGoogleDocDialog(wx.Dialog):
-    """Dialog for updating the Google Doc link"""
+class GoogleDocSetupDialog(wx.Dialog):
+    """Dialog for setting up or updating the Google Doc link"""
 
-    def __init__(self, parent: WalletDialogParent) -> None:
+    def __init__(self, parent: WalletDialogParent, is_initial_setup: bool = False) -> None:
         """Initialize the update Google Doc link dialog
         
         Args:
             parent: Parent window implementing WalletDialogParent protocol
         """
-        super().__init__(parent, title="Update Google Doc", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-    
-        # Create main dialog sizer
+        title = "Initial Google Doc Setup" if is_initial_setup else "Update Google Doc"
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+
+        self.is_initial_setup = is_initial_setup
+        self.InitUI()
+
+    def InitUI(self) -> None:
         dialog_sizer = wx.BoxSizer(wx.VERTICAL)
-        
         panel = wx.Panel(self)
         panel_sizer = wx.BoxSizer(wx.VERTICAL)
 
