@@ -175,6 +175,7 @@ XRPL_TESTNET = NetworkConfig(
         "wss://s.altnet.rippletest.net:51233"
     ],
     public_rpc_urls=[
+        "https://clio.altnet.rippletest.net:51234/",
         "https://testnet.xrpl-labs.com/",
         "https://s.altnet.rippletest.net:51234"
     ],

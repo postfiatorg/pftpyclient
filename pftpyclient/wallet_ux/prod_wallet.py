@@ -134,6 +134,7 @@ class XRPLMonitorThread(Thread):
     async def watch_xrpl_account(self, address, wallet=None):
         self.account = address
         self.wallet = wallet
+        timeout = 10
         check_interval = 10
 
         while not self.stopped():
@@ -141,7 +142,7 @@ class XRPLMonitorThread(Thread):
                 async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
                     while True:
                         try: 
-                            response = await asyncio.wait_for(self.on_connected(), timeout=check_interval)
+                            response = await asyncio.wait_for(self.on_connected(), timeout=timeout)
 
                             async for message in self.client:
                                 mtype = message.get("type")
@@ -160,7 +161,7 @@ class XRPLMonitorThread(Thread):
                                                     account=self.account,
                                                     ledger_index="validated"
                                                 )),
-                                                timeout=check_interval
+                                                timeout=timeout
                                             )
                                             wx.CallAfter(self.gui.update_account, response.result["account_data"])
                                             wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))                                       
@@ -178,7 +179,7 @@ class XRPLMonitorThread(Thread):
                                                 account=self.account,
                                                 ledger_index="validated"
                                             )),
-                                            timeout=check_interval
+                                            timeout=timeout
                                         )
                                         wx.CallAfter(self.gui.update_account, response.result["account_data"])
                                         wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))
@@ -188,6 +189,7 @@ class XRPLMonitorThread(Thread):
                                         return
                                     except Exception as e:
                                         logger.error(f"Error processing request: {e}")
+                                await asyncio.sleep(check_interval)
 
                         except asyncio.TimeoutError:
                             logger.warning(f"Node {self.url} timed out. Switching to next node.")
@@ -196,11 +198,10 @@ class XRPLMonitorThread(Thread):
                         except Exception as e:
                             if "actNotFound" in str(e):
                                 logger.debug(f"Account {self.account} not found yet, waiting...")
-                                await asyncio.sleep(check_interval)
                                 continue
                             else:
                                 logger.error(f"Unexpected error in monitoring loop: {e}")
-                                await asyncio.sleep(check_interval)
+                            await asyncio.sleep(check_interval)
 
             except Exception as e:
                 if self.stopped():
@@ -294,7 +295,7 @@ class WalletApp(wx.Frame):
         wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
         self.default_size = (1150, 700)
         self.min_size = (800, 600)
-        self.max_size = (1400, 900)
+        self.max_size = (1600, 1200)
         self.zoom_factor = 1.0
         self.SetMinSize(self.min_size)
         self.SetMaxSize(self.max_size)
@@ -1983,7 +1984,7 @@ class WalletApp(wx.Frame):
         self.auto_size_window()
 
     def on_tab_changed(self, event):
-        self.auto_size_window()
+        # self.auto_size_window()  # NOTE: Users complained about this, so it's disabled for now. Consider deprecating.
         event.Skip()
         
     def on_proposal_selection(self, event):

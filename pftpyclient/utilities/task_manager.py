@@ -275,6 +275,22 @@ class PostFiatTaskManager:
 
         # Check if account exists and is funded before proceeding
         try:
+            # Get server state to determine available ledger range
+            server_state = self.client.request(
+                xrpl.models.requests.ServerState()
+            )
+            if server_state.is_successful():
+                complete_ledgers = server_state.result['state']['complete_ledgers']
+                # complete_ledgers is typically returned as a string like "32570-94329899"
+                if '-' in complete_ledgers:
+                    earliest_ledger, latest_ledger = map(int, complete_ledgers.split('-'))
+                    logger.debug(f"Server ledger range: {earliest_ledger} to {latest_ledger}")
+                else:
+                    logger.debug(f"Unexpected complete_ledgers format: {complete_ledgers}")
+            else:
+                logger.debug("Could not fetch server state")
+                return
+            
             response = self.client.request(
                 xrpl.models.requests.AccountInfo(
                     account=self.user_wallet.classic_address,
@@ -284,6 +300,7 @@ class PostFiatTaskManager:
             if not response.is_successful():
                 logger.debug("Account not found or not funded, skipping transaction sync")
                 return
+
         except Exception as e:
             logger.error(f"Error checking account status: {e}")
             return
@@ -297,9 +314,18 @@ class PostFiatTaskManager:
                     self.transactions = loaded_tx_df
                     self.sync_memo_transactions(loaded_tx_df)
 
+            # Log local ledger index range
+            if not self.transactions.empty:
+                local_min_index = self.transactions['ledger_index'].min()
+                local_max_index = self.transactions['ledger_index'].max()
+                logger.debug(f"Local ledger index range: {local_min_index} to {local_max_index}")
+            else:
+                logger.debug("No local transactions found")
+
             # Choose ledger index to start sync from
             if self.transactions.empty:
                 next_ledger_index = -1
+                logger.debug("Starting fresh sync from earliest available ledger")
             else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
                 next_ledger_index = self.transactions['ledger_index'].max() + 1
                 logger.debug(f"Next ledger index: {next_ledger_index}")
