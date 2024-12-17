@@ -14,8 +14,6 @@ from pftpyclient.utilities.wallet_state import (
     requires_wallet_state,
     FUNDED_STATES,
     TRUSTLINED_STATES,
-    INITIATED_STATES,
-    HANDSHAKED_STATES,
     ACTIVATED_STATES
 )
 from pftpyclient.utilities.task_manager import (
@@ -38,6 +36,7 @@ import pandas as pd
 from enum import Enum, auto
 from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
 import traceback
+import random
 
 from pftpyclient.wallet_ux.dialogs import *
 from pftpyclient.wallet_ux.dialogs import CustomDialog
@@ -72,6 +71,7 @@ class WalletUIState(Enum):
     BUSY = auto()
     SYNCING = auto()
     TRANSACTION_PENDING = auto()
+    ERROR = auto()
 
 class PostFiatWalletApp(wx.App):
     def OnInit(self):
@@ -93,8 +93,18 @@ class XRPLMonitorThread(Thread):
         self.url = self.nodes[self.current_node_index]
         self.loop = asyncio.new_event_loop()
         self.context = None
-        self.expecting_state_change = False
         self._stop_event = Event()
+
+        # Error handling parameters
+        self.reconnect_delay = 1  # Initial delay in seconds
+        self.max_reconnect_delay = 30  # Maximum delay
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5  # Per node
+
+        # Ledger monitoring
+        self.last_ledger_time = None
+        self.LEDGER_TIMEOUT = 30  # seconds
+        self.CHECK_INTERVAL = 4  # match XRPL block time
 
     def run(self):
         """Thread entry point"""
@@ -114,17 +124,53 @@ class XRPLMonitorThread(Thread):
     def stopped(self):
         """Check if the thread has been signaled to stop"""
         return self._stop_event.is_set()
+    
+    def set_ui_state(self, state: WalletUIState, message: str = None):
+        """Helper method to safely update UI state from thread"""
+        wx.CallAfter(self.gui.set_wallet_ui_state, state, message)
+
+    async def handle_connection_error(self, error_msg: str) -> bool:
+        """
+        Connection error handling with exponential backoff
+        Returns True if should retry, False if should switch nodes
+        """
+        logger.error(error_msg)
+        self.set_ui_state(WalletUIState.ERROR, error_msg)
+        
+        self.reconnect_attempts += 1
+        if self.reconnect_attempts >= self.max_reconnect_attempts:
+            logger.warning(f"Max reconnection attempts reached for node {self.url}. Switching to next node.")
+            self.switch_node()
+            self.reconnect_attempts = 0
+            self.reconnect_delay = 1
+            return False
+            
+        # Exponential backoff with jitter
+        jitter = random.uniform(0, 0.1) * self.reconnect_delay
+        delay = min(self.reconnect_delay + jitter, self.max_reconnect_delay)
+        logger.info(f"Reconnecting in {delay:.1f} seconds...")
+        await asyncio.sleep(delay)
+        self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+        return True
 
     async def monitor(self):
-        """Main monitoring coroutine"""
-        try:
-            while not self.stopped():
+        """Main monitoring coroutine with error handling and reconnection logic"""
+        while not self.stopped():
+            try:
                 await self.watch_xrpl_account(self.gui.wallet.classic_address, self.gui.wallet)
-        except asyncio.CancelledError:
-            logger.debug("Monitor task cancelled")
-        except Exception as e:
-            if not self.stopped():
-                logger.error(f"Unexpected error in monitor: {e}")
+                # Reset reconnection parameters on successful connection
+                self.reconnect_delay = 1
+                self.reconnect_attempts = 0
+
+            except asyncio.CancelledError:
+                logger.debug("Monitor task cancelled")
+                break
+
+            except Exception as e:
+                if self.stopped():
+                    break
+
+                await self.handle_connection_error(f"Error in monitor: {e}")
     
     def switch_node(self):
         self.current_node_index = (self.current_node_index + 1) % len(self.nodes)
@@ -134,101 +180,101 @@ class XRPLMonitorThread(Thread):
     async def watch_xrpl_account(self, address, wallet=None):
         self.account = address
         self.wallet = wallet
-        timeout = 10
-        check_interval = 10
+        self.last_ledger_time = time.time()
 
-        while not self.stopped():
+        async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
+            self.set_ui_state(WalletUIState.SYNCING, "Connecting to XRPL websocket...")
+
+            # Subcribe to streams
+            response = await self.client.request(xrpl.models.requests.Subscribe(
+                streams=["ledger"],
+                accounts=[self.account]
+            ))
+
+            if not response.is_successful():
+                self.set_ui_state(WalletUIState.IDLE, "Failed to connect to XRPL websocket.")
+                raise Exception(f"Subscription failed: {response.result}")
+            
+            self.set_ui_state(WalletUIState.IDLE)
+            logger.info(f"Successfully subscribed to account {self.account} updates on node {self.url}")
+
+            # Create task for timeout checking
+            async def check_timeouts():
+                while True:
+                    await asyncio.sleep(self.CHECK_INTERVAL)
+                    if self.last_ledger_time is not None:
+                        time_since_last_ledger = time.time() - self.last_ledger_time
+                        if time_since_last_ledger > self.LEDGER_TIMEOUT:
+                            raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
+            
+            timeout_task = asyncio.create_task(check_timeouts())
+
             try:
-                async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
-                    while True:
-                        try: 
-                            response = await asyncio.wait_for(self.on_connected(), timeout=timeout)
+                async for message in self.client:
+                    if self.stopped():
+                        break
+                        
+                    try:
+                        mtype = message.get("type")
+                        
+                        if mtype == "ledgerClosed":
+                            self.last_ledger_time = time.time()
+                            wx.CallAfter(self.gui.update_ledger, message)
+                        elif mtype == "transaction":
+                            await self.process_transaction(message)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
+                        self.set_ui_state(WalletUIState.ERROR, f"Error processing update: {str(e)}")
+                        continue
 
-                            async for message in self.client:
-                                mtype = message.get("type")
-                                # Message type "ledgerClosed" is received when a new ledger is closed (block added to the ledger)
-                                if mtype == "ledgerClosed":
-                                    wx.CallAfter(self.gui.update_ledger, message)
-                                    # Only check account info if we are expecting a state change.
-                                    # This is necessary because the transaction stream can be delayed significantly.
-                                    # TODO: This is a hack to get around the delay.
-                                    # TODO: The issue might be caused by a logic flaw in the on_connected() method.
-                                    if self.expecting_state_change:
-                                        logger.debug(f"Checking account info because we are expecting a state change.")
-                                        try:
-                                            response = await asyncio.wait_for(
-                                                self.client.request(xrpl.models.requests.AccountInfo(
-                                                    account=self.account,
-                                                    ledger_index="validated"
-                                                )),
-                                                timeout=timeout
-                                            )
-                                            wx.CallAfter(self.gui.update_account, response.result["account_data"])
-                                            wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))                                       
-                                        except asyncio.TimeoutError:
-                                            logger.warning(f"Request to {self.url} timed out. Switching to next node.")
-                                            self.switch_node()
-                                            return
-                                        except Exception as e:
-                                            logger.error(f"Error processing request: {e}")
-                                # Message type "transaction" is received when a transaction is detected
-                                elif mtype == "transaction":
-                                    try:
-                                        response = await asyncio.wait_for(
-                                            self.client.request(xrpl.models.requests.AccountInfo(
-                                                account=self.account,
-                                                ledger_index="validated"
-                                            )),
-                                            timeout=timeout
-                                        )
-                                        wx.CallAfter(self.gui.update_account, response.result["account_data"])
-                                        wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))
-                                    except asyncio.TimeoutError:
-                                        logger.warning(f"Request to {self.url} timed out. Switching to next node.")
-                                        self.switch_node()
-                                        return
-                                    except Exception as e:
-                                        logger.error(f"Error processing request: {e}")
-                                await asyncio.sleep(check_interval)
+            finally:
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
 
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Node {self.url} timed out. Switching to next node.")
-                            self.switch_node()
-                            return
-                        except Exception as e:
-                            if "actNotFound" in str(e):
-                                logger.debug(f"Account {self.account} not found yet, waiting...")
-                                continue
-                            else:
-                                logger.error(f"Unexpected error in monitoring loop: {e}")
-                            await asyncio.sleep(check_interval)
+    async def process_transaction(self, tx_message):
+        """Process a single transaction update from websocket"""
+        try:
+            self.set_ui_state(WalletUIState.BUSY, "Processing new transaction...")
+            logger.debug(f"Full websocket transaction message: {tx_message}")
 
-            except Exception as e:
-                if self.stopped():
-                    break
-                logger.error(f"Error in watch_xrpl_account: {e}")
+            formatted_tx = {
+                "tx_json": tx_message.get("tx_json", {}),
+                "meta": tx_message.get("meta", {}),
+                "hash": tx_message.get("hash"),
+                "ledger_index": tx_message.get("ledger_index"),
+                "validated": tx_message.get("validated", False)
+            }
 
-    async def on_connected(self):
-        logger.debug(f"on_connected: {self.account}")
-        response = await self.client.request(xrpl.models.requests.Subscribe(
-            streams=["ledger"],
-            accounts=[self.account]
-        ))
-        wx.CallAfter(self.gui.update_ledger, response.result)
-        response = await self.client.request(xrpl.models.requests.AccountInfo(
-            account=self.account,
-            ledger_index="validated"
-        ))
-        if response.is_successful():
-            logger.debug(f"on_connected success result: {response.result}")
-            wx.CallAfter(self.gui.update_account, response.result["account_data"])
-            wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens(self.account))
-            return response
-        else:
-            if response.result.get("error") == "actNotFound":
-                raise Exception("actNotFound")
-            logger.error(f"Error in on_connected: {response.result}")
-            raise Exception(str(response.result))
+            # Create DataFrame in same format as sync_transactions expects
+            tx_df = pd.DataFrame([formatted_tx])
+
+            # Process through sync_memo_transactions pipeline
+            if not tx_df.empty:
+                wx.CallAfter(self.gui.task_manager.sync_memo_transactions, tx_df)
+
+                # Update account info
+                response = await self.client.request(xrpl.models.requests.AccountInfo(
+                    account=self.account,
+                    ledger_index="validated"
+                ))
+
+                if response.is_successful():
+                    wx.CallAfter(self.gui.update_account, response.result["account_data"])
+                    wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens)
+                    wx.CallAfter(self.gui.refresh_grids)
+                else:
+                    logger.error(f"Failed to get account info: {response.result}")
+            
+            self.set_ui_state(WalletUIState.IDLE)
+
+        except Exception as e:
+            logger.error(f"Error processing transaction update: {e}")
+            logger.error(traceback.format_exc())
+            self.set_ui_state(WalletUIState.IDLE, f"Error: {str(e)}")
 
 class WalletApp(wx.Frame):
 
@@ -295,7 +341,7 @@ class WalletApp(wx.Frame):
         wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
         self.default_size = (1150, 700)
         self.min_size = (800, 600)
-        self.max_size = (1600, 1200)
+        self.max_size = (1600, 1000)
         self.zoom_factor = 1.0
         self.SetMinSize(self.min_size)
         self.SetMaxSize(self.max_size)
@@ -958,7 +1004,7 @@ class WalletApp(wx.Frame):
                 
             password = dialog.GetValue()
             dialog.Destroy()
-            wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
+            # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
         
             if not self.task_manager.verify_password(password):
                 wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
@@ -1022,7 +1068,7 @@ class WalletApp(wx.Frame):
         
         self.btn_send.Enable()
         self.btn_send.SetLabel("Send")
-        self._sync_and_refresh()
+        # self._sync_and_refresh()
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def populate_username_dropdown(self):
@@ -1303,7 +1349,8 @@ class WalletApp(wx.Frame):
         self.login_panel.Hide()
         self.tabs.Show()
 
-        self.update_account_display(self.username, classic_address)
+        self.update_account_display()
+        self.update_tokens()
 
         # Update layout and ensure correct sizing
         self.panel.Layout()
@@ -1318,8 +1365,8 @@ class WalletApp(wx.Frame):
         self.refresh_grids()
 
         # Start timers
-        self.start_pft_update_timer()
-        self.start_transaction_update_timer()
+        # self.start_pft_update_timer()
+        # self.start_transaction_update_timer()
 
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
@@ -1415,13 +1462,13 @@ class WalletApp(wx.Frame):
         event.Skip()
 
     @PerformanceMonitor.measure('update_account_display')
-    def update_account_display(self, username, classic_address):
+    def update_account_display(self):
         """Update all account-related display elements"""
-        logger.debug(f"Updating account display for {username}")
+        logger.debug(f"Updating account display for {self.username}")
 
         # Update basic account info
-        self.summary_lbl_username.SetLabel(f"Username: {username}")
-        self.summary_lbl_address.SetLabel(f"XRP Address: {classic_address}")
+        self.summary_lbl_username.SetLabel(f"Username: {self.username}")
+        self.summary_lbl_address.SetLabel(f"XRP Address: {self.wallet.address}")
 
         xrp_balance = self.task_manager.get_xrp_balance()
         xrp_balance = xrpl.utils.drops_to_xrp(str(xrp_balance))
@@ -1460,7 +1507,7 @@ class WalletApp(wx.Frame):
                     try:
                         self.worker.expecting_state_change = True
                         self.task_manager.handle_trust_line()
-                        wx.CallAfter(self.update_account_display, self.username, self.task_manager.user_wallet.address)
+                        wx.CallAfter(self.update_account_display)
                         wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
                     except Exception as e:
                         logger.error(f"Error setting trust line: {e}")
@@ -1609,13 +1656,12 @@ class WalletApp(wx.Frame):
 
     @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('update_tokens')
-    def update_tokens(self, account_address):
-        #TODO: refactor this to use the task manager
-        logger.debug(f"Fetching token balances for account: {account_address}")
+    def update_tokens(self):
+        logger.debug(f"Fetching token balances for account: {self.wallet.address}")
         try:
             client = xrpl.clients.JsonRpcClient(self.network_url)
             account_lines = xrpl.models.requests.AccountLines(
-                account=account_address,
+                account=self.wallet.address,
                 ledger_index="validated"
             )
             response = client.request(account_lines)
@@ -1650,15 +1696,15 @@ class WalletApp(wx.Frame):
 
         self.Destroy()
 
-    def start_pft_update_timer(self):
-        self.pft_update_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
-        self.pft_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
+    # def start_pft_update_timer(self):
+    #     self.pft_update_timer = wx.Timer(self)
+    #     self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
+    #     self.pft_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
 
-    def start_transaction_update_timer(self):
-        self.tx_update_timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
-        self.tx_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
+    # def start_transaction_update_timer(self):
+    #     self.tx_update_timer = wx.Timer(self)
+    #     self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
+    #     self.tx_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def _sync_and_refresh(self):
         """Internal method to sync transactions and refresh grids"""
@@ -1675,13 +1721,13 @@ class WalletApp(wx.Frame):
             self.set_wallet_ui_state(WalletUIState.IDLE, f"Sync error: {e}")
             raise
 
-    def on_transaction_update_timer(self, _):
-        """Timer-triggered update"""
-        logger.debug("Transaction update timer triggered")
-        try:
-            self._sync_and_refresh()
-        except Exception as e:
-            logger.error(f"Timer update failed: {e}")
+    # def on_transaction_update_timer(self, _):
+    #     """Timer-triggered update"""
+    #     logger.debug("Transaction update timer triggered")
+    #     try:
+    #         self._sync_and_refresh()
+    #     except Exception as e:
+    #         logger.error(f"Timer update failed: {e}")
     
     def on_force_update(self, _):
         """Handle manual force update requests"""
@@ -1787,13 +1833,6 @@ class WalletApp(wx.Frame):
 
         self.auto_size_window()
 
-    @PerformanceMonitor.measure('on_pft_update_timer')
-    def on_pft_update_timer(self, event):
-        self.set_wallet_ui_state(WalletUIState.SYNCING, "Updating token balance...")
-        if self.wallet:
-            self.update_tokens(self.wallet.classic_address)
-        self.set_wallet_ui_state(WalletUIState.IDLE)
-
     @PerformanceMonitor.measure('populate_grid_generic')
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
         """Generic grid population method that respects zoom settings"""
@@ -1886,15 +1925,16 @@ class WalletApp(wx.Frame):
         self.populate_grid_generic(self.summary_grid, summary_df, 'summary')
 
     def auto_size_window(self):
+        """Adjust window size while maintaining reasonable dimensions"""
         self.rewards_tab.Layout()
         self.tabs.Layout()
         self.panel.Layout()
 
-        size = self.panel.GetBestSize()
-        new_size = (
-            min(max(size.width, self.default_size[0]), self.max_size[0]),
-            min(max(size.height, self.default_size[1]), self.max_size[1])
-        )
+        # Simply use default size with some flexibility for width
+        current_size = self.GetSize()
+        new_width = min(max(current_size.width, self.default_size[0]), self.max_size[0])
+        new_size = (new_width, self.default_size[1])
+        
         self.SetSize(new_size)
 
     def on_key_down(self, event):
@@ -2094,8 +2134,8 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
-            else:
-                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+            # else:
+            #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -2140,8 +2180,8 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error refusing task: {e}")
                 wx.MessageBox(f"Error refusing task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
-            else:
-                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+            # else:
+            #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         dialog.Destroy()
         self.btn_refuse_task.SetLabel("Refuse Task")
@@ -2186,8 +2226,8 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
-            else:
-                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+            # else:
+            #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
@@ -2239,7 +2279,7 @@ class WalletApp(wx.Frame):
                 result_dialog = SelectableMessageDialog(self, "Task Refusal Result", formatted_response)
                 result_dialog.ShowModal()
                 result_dialog.Destroy()
-                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
             except Exception as e:
                 wx.MessageBox(f"Error refusing task: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
@@ -2280,7 +2320,7 @@ class WalletApp(wx.Frame):
                 self.verification_txt_task_id.SetLabel("")
                 self.btn_submit_verification_details.SetLabel("Submit Verification Details")
                 self.btn_submit_verification_details.Update()
-                wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
@@ -2369,7 +2409,7 @@ class WalletApp(wx.Frame):
                                 "Handshake Sent",
                                 wx.YES_NO | wx.ICON_INFORMATION
                             )
-                            self._sync_and_refresh()
+                            # self._sync_and_refresh()
                         self.btn_submit_memo.SetLabel("Submit Memo")
                         self.set_wallet_ui_state(WalletUIState.IDLE)
                         return
@@ -2428,8 +2468,7 @@ class WalletApp(wx.Frame):
             wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
         else:
             self.txt_memo_input.SetValue("")
-            wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
-
+            # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -2484,8 +2523,8 @@ class WalletApp(wx.Frame):
                     logger.error(traceback.format_exc())
                     dialog.show_error(str(e))
                     continue
-                else:
-                    wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
+                # else:
+                #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
             else:
                 break
         dialog.Destroy()

@@ -217,7 +217,76 @@ class ContactsDialog(wx.Dialog):
         else:
             self.EndModal(wx.ID_CANCEL)
 
-
+class EndpointControl:
+    """Helper class to manage endpoint UI controls and logic"""
+    
+    def __init__(
+            self,
+            parent: wx.Window,
+            config: 'ConfigurationManager',
+            label: str,
+            get_current_fn: str,
+            get_recent_fn: str,
+            set_current_fn: str
+        ) -> None:
+        """Initialize endpoint control
+        
+        Args:
+            parent: Parent window
+            config: Configuration manager instance
+            label: Label for the endpoint control
+            get_current_fn: Name of config method to get current endpoint
+            get_recent_fn: Name of config method to get recent endpoints
+            set_current_fn: Name of config method to set current endpoint
+        """
+        self.parent = parent
+        self.config = config
+        self.get_current_fn = get_current_fn
+        self.get_recent_fn = get_recent_fn
+        self.set_current_fn = set_current_fn
+        
+        # Create UI elements
+        self.sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.sizer.Add(wx.StaticText(parent, label=label), 0, wx.CENTER | wx.ALL, 5)
+        self.combo = wx.ComboBox(parent, style=wx.CB_DROPDOWN | wx.TE_PROCESS_ENTER)
+        self.sizer.Add(self.combo, 1, wx.EXPAND | wx.ALL, 5)
+        
+        # Initial update
+        self.update_combo()
+        
+    def update_combo(self) -> None:
+        """Update endpoint combobox with current and recent endpoints"""
+        current = getattr(self.config, self.get_current_fn)()
+        recent = getattr(self.config, self.get_recent_fn)()
+        
+        # Get desired items (current first, then others)
+        desired_items = [current] + [ep for ep in recent if ep != current]
+        
+        # Remove items that shouldn't be there
+        count = self.combo.GetCount()
+        for i in range(count-1, -1, -1):
+            if self.combo.GetString(i) not in desired_items:
+                self.combo.Delete(i)
+                
+        # Add missing items
+        existing_items = [self.combo.GetString(i) for i in range(self.combo.GetCount())]
+        for item in desired_items:
+            if item not in existing_items:
+                self.combo.Append(item)
+                
+        # Set current value
+        self.combo.SetValue(current)
+        self.combo.Refresh()
+        self.combo.Update()
+        
+    def get_value(self) -> str:
+        """Get current endpoint value"""
+        return self.combo.GetValue().strip()
+        
+    def set_value(self, value: str) -> None:
+        """Set current endpoint value"""
+        self.combo.SetValue(value)
+        
 class PreferencesDialog(wx.Dialog):
     """Dialog for managing wallet preferences and settings"""
 
