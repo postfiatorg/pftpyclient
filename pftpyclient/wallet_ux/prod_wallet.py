@@ -40,6 +40,7 @@ import traceback
 import random
 import urllib.parse
 
+
 from pftpyclient.wallet_ux.dialogs import *
 from pftpyclient.wallet_ux.dialogs import CustomDialog
 
@@ -1906,6 +1907,22 @@ class WalletApp(wx.Frame):
             grid.SetColSize(col, int(original_width * column_zoom_factor))
 
         # self.auto_size_window()
+
+        # Restore selection if there was one
+        if selected_row_values:
+            # Find the row with matching values
+            for row in range(grid.GetNumberRows()):
+                current_row_values = [
+                    grid.GetCellValue(row, col) 
+                    for col in range(grid.GetNumberCols())
+                ]
+                if current_row_values == selected_row_values:
+                    grid.SelectRow(row)
+                    break
+        else:
+            grid.ClearSelection()  # Only clear if there wasn't a previous selection
+
+        grid.Refresh()
 
         # Restore selection if there was one
         if selected_row_values:
