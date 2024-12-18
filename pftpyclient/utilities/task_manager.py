@@ -799,8 +799,10 @@ class PostFiatTaskManager:
         - handshake_sent: Whether we've already sent our public key
         - received_key: Their ECDH public key if they've sent it, None otherwise
         """
-        if self.handshake_cache.get(address):
-            return self.handshake_cache[address]
+        # attempt handshake cache first
+        handshake_sent, received_key = self.handshake_cache.get(address, (False, None))
+        if handshake_sent and received_key is not None:
+            return handshake_sent, received_key
 
         if self.system_memos.empty:
             logger.debug("No system memos found")

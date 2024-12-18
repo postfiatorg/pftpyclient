@@ -5,6 +5,7 @@ import wx.grid as gridlib
 import wx.html
 import xrpl
 from xrpl.wallet import Wallet
+from xrpl.asyncio.clients import AsyncWebsocketClient
 import asyncio
 from threading import Thread, Event
 import wx.lib.newevent
@@ -37,6 +38,7 @@ from enum import Enum, auto
 from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
 import traceback
 import random
+import urllib.parse
 
 from pftpyclient.wallet_ux.dialogs import *
 from pftpyclient.wallet_ux.dialogs import CustomDialog
@@ -87,10 +89,11 @@ class XRPLMonitorThread(Thread):
     def __init__(self, gui):
         Thread.__init__(self, daemon=True)
         self.gui: WalletApp = gui
-        self.network_config = get_network_config()
-        self.nodes = self.network_config.websockets
-        self.current_node_index = 0
-        self.url = self.nodes[self.current_node_index]
+        self.config = ConfigurationManager()
+        self.ws_urls = self.config.get_ws_endpoints()
+        self.ws_url_index = 0
+        self.url = self.ws_urls[self.ws_url_index]
+        logger.debug(f"Starting XRPL monitor thread with endpoint: {self.url}")
         self.loop = asyncio.new_event_loop()
         self.context = None
         self._stop_event = Event()
@@ -173,8 +176,8 @@ class XRPLMonitorThread(Thread):
                 await self.handle_connection_error(f"Error in monitor: {e}")
     
     def switch_node(self):
-        self.current_node_index = (self.current_node_index + 1) % len(self.nodes)
-        self.url = self.nodes[self.current_node_index]
+        self.ws_url_index = (self.ws_url_index + 1) % len(self.ws_urls)
+        self.url = self.ws_urls[self.ws_url_index]
         logger.info(f"Switching to next node: {self.url}")
 
     async def watch_xrpl_account(self, address, wallet=None):
@@ -182,7 +185,7 @@ class XRPLMonitorThread(Thread):
         self.wallet = wallet
         self.last_ledger_time = time.time()
 
-        async with xrpl.asyncio.clients.AsyncWebsocketClient(self.url) as self.client:
+        async with AsyncWebsocketClient(self.url) as self.client:
             self.set_ui_state(WalletUIState.SYNCING, "Connecting to XRPL websocket...")
 
             # Subcribe to streams
@@ -366,6 +369,7 @@ class WalletApp(wx.Frame):
         self.config = ConfigurationManager()
         self.network_config = get_network_config()
         self.network_url = self.config.get_current_endpoint()
+        self.ws_url = self.config.get_current_ws_endpoint()
         self.pft_issuer = self.network_config.issuer_address
         
         self.perf_monitor = None
@@ -484,7 +488,8 @@ class WalletApp(wx.Frame):
         # Create Summary tab elements
         username_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.summary_lbl_username = wx.StaticText(self.summary_tab, label="Username: ")
-        self.summary_lbl_endpoint = wx.StaticText(self.summary_tab, label=f"Endpoint: {self.network_url}")
+        self.summary_lbl_endpoint = wx.StaticText(self.summary_tab, label=f"HTTPS: {self.network_url}")
+        self.summary_lbl_ws_endpoint = wx.StaticText(self.summary_tab, label=f"WebSocket: {self.ws_url}")
         network_text = "Testnet" if self.config.get_global_config('use_testnet') else "Mainnet"
         self.summary_lbl_network = wx.StaticText(self.summary_tab, label=f"Network: {network_text}")
         self.summary_lbl_wallet_state = wx.StaticText(self.summary_tab, label="Wallet State: ")
@@ -492,6 +497,7 @@ class WalletApp(wx.Frame):
         username_row_sizer.Add(self.summary_lbl_username, 0, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=5)
         username_row_sizer.AddStretchSpacer()
         username_row_sizer.Add(self.summary_lbl_endpoint, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
+        username_row_sizer.Add(self.summary_lbl_ws_endpoint, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         username_row_sizer.Add(self.summary_lbl_network, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         username_row_sizer.Add(self.summary_lbl_wallet_state, flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=10)
         self.summary_sizer.Add(username_row_sizer, 0, wx.EXPAND)
@@ -1336,7 +1342,6 @@ class WalletApp(wx.Frame):
         self.enable_menus()
         
         self.wallet = self.task_manager.user_wallet
-        classic_address = self.wallet.classic_address
 
         self.update_ui_based_on_wallet_state()
 
@@ -1363,10 +1368,7 @@ class WalletApp(wx.Frame):
         # Populate grids with data.
         # No need to call sync_and_refresh here, since sync_transactions was called by the task manager's instantiation
         self.refresh_grids()
-
-        # Start timers
-        # self.start_pft_update_timer()
-        # self.start_transaction_update_timer()
+        self.auto_size_window()
 
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
@@ -1374,7 +1376,8 @@ class WalletApp(wx.Frame):
 
     def update_network_display(self):
         """Update UI elements that display network information"""
-        self.summary_lbl_endpoint.SetLabel(f"Endpoint: {self.network_url}")
+        self.summary_lbl_endpoint.SetLabel(f"HTTPS: {self.network_url}")
+        self.summary_lbl_ws_endpoint.SetLabel(f"Websocket: {self.ws_url}")
         self.summary_sizer.Layout()
         self.summary_tab.Layout()
 
@@ -1773,6 +1776,7 @@ class WalletApp(wx.Frame):
                     wx.PostEvent(self, UpdateGridEvent(data=data, target=grid_type, caller=f"{self.__class__.__name__}.refresh_grids"))
                 except Exception as e:
                     logger.error(f"Failed updating {grid_type} grid: {e}")
+                    logger.error(traceback.format_exc())
 
         # Proposals, Rewards, and Verification grids (available in PFT_STATES)
         if current_state in ACTIVATED_STATES:
@@ -1786,6 +1790,7 @@ class WalletApp(wx.Frame):
                     wx.PostEvent(self, UpdateGridEvent(data=data, target=grid_type, caller=f"{self.__class__.__name__}.refresh_grids"))
                 except Exception as e:
                     logger.error(f"Failed updating {grid_type} grid: {e}")
+                    logger.error(traceback.format_exc())
 
     @PerformanceMonitor.measure('update_grid')
     def update_grid(self, event):
@@ -1831,7 +1836,7 @@ class WalletApp(wx.Frame):
             case _:
                 logger.error(f"Unknown grid target: {event.target}")
 
-        self.auto_size_window()
+        # self.auto_size_window()
 
     @PerformanceMonitor.measure('populate_grid_generic')
     def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
@@ -1900,7 +1905,7 @@ class WalletApp(wx.Frame):
         for col, original_width in enumerate(self.grid_column_widths[grid_name]):
             grid.SetColSize(col, int(original_width * column_zoom_factor))
 
-        self.auto_size_window()
+        # self.auto_size_window()
 
         # Restore selection if there was one
         if selected_row_values:
@@ -2021,7 +2026,7 @@ class WalletApp(wx.Frame):
         for i in range(self.tabs.GetPageCount()):
             self.tabs.GetPage(i).Layout()
 
-        self.auto_size_window()
+        # self.auto_size_window()
 
     def on_tab_changed(self, event):
         # self.auto_size_window()  # NOTE: Users complained about this, so it's disabled for now. Consider deprecating.
@@ -2903,6 +2908,72 @@ class WalletApp(wx.Frame):
             logger.error(f"Connection test failed for {endpoint}: {e}")
             logger.error(f"Full traceback:\n{traceback.format_exc()}")
             return False
+    
+    async def _test_ws_connection(self, endpoint: str) -> bool:
+        """Test WebSocket connection asynchronously"""
+        try:
+            async with AsyncWebsocketClient(endpoint) as client:
+                response = await client.request(xrpl.models.requests.ServerInfo())
+                return response.is_successful()
+        except Exception as e:
+            logger.error(f"WebSocket connection test failed: {e}")
+            return False
+        
+    def try_connect_ws_endpoint(self, endpoint: str) -> bool:
+        """
+        Attempt to connect to a new WebSocket endpoint.
+        
+        Args:
+            endpoint: The WebSocket endpoint URL to test
+            
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
+        try:
+            # Ensure endpoint uses WebSocket protocol
+            parsed = urllib.parse.urlparse(endpoint)
+            if parsed.scheme not in ['ws', 'wss']:
+                if parsed.scheme in ['http', 'https']:
+                    # Convert HTTP to WS protocol
+                    scheme = 'wss' if parsed.scheme == 'https' else 'ws'
+                    endpoint = endpoint.replace(parsed.scheme, scheme, 1)
+                else:
+                    endpoint = f"ws://{endpoint}"
+
+            logger.debug(f"Attempting to connect to WebSocket endpoint: {endpoint}")
+
+            # Create event loop if needed
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            # Run connection test
+            success = loop.run_until_complete(self._test_ws_connection(endpoint))
+
+            message = f"{'Successful' if success else 'Failed'} connection to {endpoint}"
+            logger.debug(message)
+
+            return success
+
+        except Exception as e:
+            logger.error(f"WebSocket connection test failed for {endpoint}: {e}")
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            return False
+        
+    def restart_xrpl_monitor(self):
+        """Restart the XRPL monitor thread with the new WebSocket endpoint"""
+        if hasattr(self, 'worker') and self.worker:
+            logger.debug("Stopping existing XRPL monitor thread")
+            self.worker.stop()
+            self.worker.join(timeout=2)
+            
+            if self.worker.is_alive():
+                logger.warning("XRPL monitor thread did not stop gracefully")
+            
+            self.worker = XRPLMonitorThread(self)
+            self.worker.start()
 
 def main():
     logger.info("Starting Post Fiat Wallet")

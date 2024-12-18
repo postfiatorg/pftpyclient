@@ -127,6 +127,67 @@ class ConfigurationManager:
         # Reload config
         self.config = self._load_config()
 
+    def get_ws_endpoints(self) -> list:
+        """Get recent WebSocket endpoints for the current network"""
+        is_testnet = self.get_global_config('use_testnet')
+        network = XRPL_TESTNET if is_testnet else XRPL_MAINNET
+        key = 'testnet_ws_endpoints' if is_testnet else 'mainnet_ws_endpoints'
+
+        stored_endpoints = self.config['global'].get(key, [])
+        default_endpoints = network.websockets
+
+        all_endpoints = []
+
+        # Add stored endpoints first
+        for endpoint in stored_endpoints:
+            if endpoint not in all_endpoints:
+                all_endpoints.append(endpoint)
+
+        # Then add default endpoints
+        for endpoint in default_endpoints:
+            if endpoint not in all_endpoints:
+                all_endpoints.append(endpoint)
+
+        return all_endpoints
+    
+    def get_current_ws_endpoint(self) -> str:
+        """Get current WebSocket endpoint for the current network"""
+        is_testnet = self.get_global_config('use_testnet')
+        endpoints = self.get_ws_endpoints()
+
+        # If we have a recent endpoint, use it
+        if endpoints:
+            return endpoints[0]
+
+        # Otherwise use default from constants
+        network = XRPL_TESTNET if is_testnet else XRPL_MAINNET
+        endpoint = network.websockets[0]  # Get first endpoint from list
+        self.set_current_ws_endpoint(endpoint)
+        return endpoint
+    
+    def set_current_ws_endpoint(self, endpoint: str):
+        """Set current WebSocket endpoint for the current network"""
+        is_testnet = self.get_global_config('use_testnet')
+        key = 'testnet_ws_endpoints' if is_testnet else 'mainnet_ws_endpoints'
+        endpoints = self.config['global'].get(key, [])
+        
+        # Remove endpoint if it exists in the queue
+        if endpoint in endpoints:
+            endpoints.remove(endpoint)
+            
+        # Add to front of queue
+        endpoints.insert(0, endpoint)
+
+        # Keep only last 5 endpoints
+        endpoints = endpoints[:5]
+        
+        # Update config
+        self.config['global'][key] = endpoints
+        self._save_config(self.config)
+
+        # Reload config
+        self.config = self._load_config()
+
 @dataclass
 class NetworkConfig:
     """Configuration for an XRPL network (mainnet or testnet)"""
@@ -213,5 +274,7 @@ GLOBAL_CONFIG_DEFAULTS = {
     'require_password_for_payment': True,
     'use_testnet': False,
     'mainnet_rpc_endpoints': Network.XRPL_MAINNET.value.public_rpc_urls,
-    'testnet_rpc_endpoints': Network.XRPL_TESTNET.value.public_rpc_urls
+    'testnet_rpc_endpoints': Network.XRPL_TESTNET.value.public_rpc_urls,
+    'mainnet_ws_endpoints': Network.XRPL_MAINNET.value.websockets,
+    'testnet_ws_endpoints': Network.XRPL_TESTNET.value.websockets
 }

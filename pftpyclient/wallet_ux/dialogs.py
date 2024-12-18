@@ -347,22 +347,50 @@ class PreferencesDialog(wx.Dialog):
         network_sbs.Add(self.testnet_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
         net_sbs.Add(network_sbs, 0, wx.ALL | wx.EXPAND, 5)
 
-        # RPC Endpoint selection
-        endpoint_box = wx.BoxSizer(wx.HORIZONTAL)
-        endpoint_box.Add(wx.StaticText(panel, label="RPC Endpoint:"), 0, wx.CENTER | wx.ALL, 5)
-        self.endpoint_combo = wx.ComboBox(panel, style=wx.CB_DROPDOWN | wx.TE_PROCESS_ENTER)
-        self.update_endpoint_combo()
-        endpoint_box.Add(self.endpoint_combo, 1, wx.EXPAND | wx.ALL, 5)
-        net_sbs.Add(endpoint_box, 0, wx.EXPAND | wx.ALL, 5)
+        # Endpoints box
+        endpoints_box = wx.StaticBox(panel, label="Network Endpoints")
+        endpoints_sbs = wx.StaticBoxSizer(endpoints_box, wx.VERTICAL)
 
-        # Add the static box to the main vertical box
+        # RPC Endpoint selection
+        self.http_endpoint = EndpointControl(
+            parent=panel,
+            config=self.config,
+            label="HTTP Endpoint:",
+            get_current_fn='get_current_endpoint',
+            get_recent_fn='get_network_endpoints',
+            set_current_fn='set_current_endpoint'
+        )
+        endpoints_sbs.Add(self.http_endpoint.sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # WebSocket Endpoint control
+        self.ws_endpoint = EndpointControl(
+            parent=panel,
+            config=self.config,
+            label="WebSocket Endpoint:",
+            get_current_fn='get_current_ws_endpoint',
+            get_recent_fn='get_ws_endpoints',
+            set_current_fn='set_current_ws_endpoint'
+        )
+        endpoints_sbs.Add(self.ws_endpoint.sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        net_sbs.Add(endpoints_sbs, 0, wx.ALL | wx.EXPAND, 5)
         vbox.Add(net_sbs, 0, wx.ALL | wx.EXPAND, 10)
 
-        # Bind events
+        # Network toggle events
         self.mainnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
         self.testnet_radio.Bind(wx.EVT_RADIOBUTTON, self.on_network_changed)
-        self.endpoint_combo.Bind(wx.EVT_COMBOBOX, self.on_endpoint_selected)
-        self.endpoint_combo.Bind(wx.EVT_TEXT_ENTER, self.on_endpoint_text_enter)
+
+        # HTTP endpoint events
+        self.http_endpoint.combo.Bind(wx.EVT_COMBOBOX, 
+            lambda evt: self.on_endpoint_selected(evt, 'http'))
+        self.http_endpoint.combo.Bind(wx.EVT_TEXT_ENTER, 
+            lambda evt: self.on_endpoint_text_enter(evt, 'http'))
+            
+        # WebSocket endpoint events
+        self.ws_endpoint.combo.Bind(wx.EVT_COMBOBOX, 
+            lambda evt: self.on_endpoint_selected(evt, 'ws'))
+        self.ws_endpoint.combo.Bind(wx.EVT_TEXT_ENTER, 
+            lambda evt: self.on_endpoint_text_enter(evt, 'ws'))
 
         # Add OK and Cancel buttons
         button_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -384,85 +412,88 @@ class PreferencesDialog(wx.Dialog):
 
     def update_endpoint_combo(self) -> None:
         """Update endpoint combobox based on selected network"""
-        current = self.config.get_current_endpoint()
-        recent = self.config.get_network_endpoints()
-
-        # Get the desired list of items (current first, then others)
-        desired_items = [current] + [ep for ep in recent if ep != current]
-
-        # Remove any items that shouldn't be there
-        count = self.endpoint_combo.GetCount()
-        for i in range(count-1, -1, -1):  # Iterate backwards to safely remove items
-            if self.endpoint_combo.GetString(i) not in desired_items:
-                self.endpoint_combo.Delete(i)
-
-        # Add any missing items
-        existing_items = [self.endpoint_combo.GetString(i) for i in range(self.endpoint_combo.GetCount())]
-        for item in desired_items:
-            if item not in existing_items:
-                self.endpoint_combo.Append(item)
-
-        # Set the value without clearing first
-        self.endpoint_combo.SetValue(current)
-        self.endpoint_combo.Refresh()
-        self.endpoint_combo.Update()
+        self.http_endpoint.update_combo()
+        self.ws_endpoint.update_combo()
 
     def on_network_changed(self, event: wx.CommandEvent) -> None:
         """Handle network selection change"""
         self.update_endpoint_combo()
 
-    def on_endpoint_selected(self, event: wx.CommandEvent) -> None:
-        """Handle endpoint selection from dropdown"""
-        selected_endpoint = self.endpoint_combo.GetValue()
-        self.endpoint_combo.SetValue(selected_endpoint)
-        self.handle_endpoint_change(selected_endpoint)
+    def on_endpoint_selected(self, event: wx.CommandEvent, endpoint_type: str) -> None:
+        """Handle endpoint selection from dropdown
+        
+        Args:
+            event: The event that triggered this callback
+            endpoint_type: Type of endpoint ('http' or 'ws')
+        """
+        control = self.http_endpoint if endpoint_type == 'http' else self.ws_endpoint
+        selected_endpoint = control.get_value()
+        self.handle_endpoint_change(selected_endpoint, endpoint_type)
 
-    def on_endpoint_text_enter(self, event: wx.CommandEvent) -> None:
-        """Handle endpoint text entry"""
-        self.handle_endpoint_change(self.endpoint_combo.GetValue())
+    def on_endpoint_text_enter(self, event: wx.CommandEvent, endpoint_type: str) -> None:
+        """Handle endpoint text entry
+        
+        Args:
+            event: The event that triggered this callback
+            endpoint_type: Type of endpoint ('http' or 'ws')
+        """
+        control = self.http_endpoint if endpoint_type == 'http' else self.ws_endpoint
+        self.handle_endpoint_change(control.get_value(), endpoint_type)
 
-    def handle_endpoint_change(self, new_endpoint: str) -> None:
+    def handle_endpoint_change(self, new_endpoint: str, endpoint_type: str) -> None:
         """Handle endpoint selection/entry
         
         Args:
             new_endpoint: The new endpoint URL to connect to
+            endpoint_type: Type of endpoint ('http' or 'ws')
         """
         new_endpoint = new_endpoint.strip()
-
         if not new_endpoint:
             return
 
         try:
             # Store current endpoint for fallback
-            current_endpoint = self.config.get_current_endpoint()
+            control = self.http_endpoint if endpoint_type == 'http' else self.ws_endpoint
+            get_current_fn = control.get_current_fn
+            set_current_fn = control.set_current_fn
+            current_endpoint = getattr(self.config, get_current_fn)()
 
             # Attempt to connect with timeout
-            success = self.parent.try_connect_endpoint(new_endpoint)
+            if endpoint_type == 'http':
+                success = self.parent.try_connect_endpoint(new_endpoint)
+            else:  # ws
+                success = self.parent.try_connect_ws_endpoint(new_endpoint)
 
             if success:
-                self.config.set_current_endpoint(new_endpoint)
-                self.update_endpoint_combo()
+                # Update configuration
+                getattr(self.config, set_current_fn)(new_endpoint)
+                control.update_combo()
 
-                # Update the main WalletApp's network_url
-                self.parent.network_url = new_endpoint
+                # Update the main WalletApp's endpoint
+                if endpoint_type == 'http':
+                    self.parent.network_url = new_endpoint
+                else:
+                    self.parent.ws_url = new_endpoint
+                    self.parent.restart_xrpl_monitor()
                 self.parent.update_network_display()
-                logger.debug(f"Updated WalletApp network_url to: {self.parent.network_url}")
+                logger.debug(f"Updated WalletApp {endpoint_type} endpoint to: {new_endpoint}")
+
             else:
                 wx.MessageBox(
-                    "Failed to connect to endpoint. Reverting to previous endpoint.",
+                    f"Failed to connect to {endpoint_type.upper()} endpoint. Reverting to previous endpoint.",
                     "Connection Failed",
                     wx.OK | wx.ICON_ERROR
                 )
                 # Revert to previous endpoint
-                self.config.set_current_endpoint(current_endpoint)
-                self.update_endpoint_combo()
+                getattr(self.config, set_current_fn)(current_endpoint)
+                control.update_combo()
         except Exception as e:
             wx.MessageBox(
-                f"Error connecting to endpoint: {e}",
+                f"Error connecting to {endpoint_type.upper()} endpoint: {e}",
                 "Connection Error",
                 wx.OK | wx.ICON_ERROR
             )
-            self.update_endpoint_combo()
+            control.update_combo()
 
     def on_ok(self, event: wx.CommandEvent) -> None:
         """Save config when OK is clicked"""
