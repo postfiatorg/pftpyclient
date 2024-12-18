@@ -1,9 +1,8 @@
-from pftpyclient.user_login.credentials import CredentialManager
+
 import xrpl
 from xrpl.models.requests import AccountTx
 from xrpl.models.transactions import Memo
 from xrpl.utils import str_to_hex
-from pftpyclient.basic_utilities.settings import *
 import nest_asyncio
 import pandas as pd
 import numpy as np
@@ -14,7 +13,6 @@ import random
 import string
 import datetime
 import os 
-from pftpyclient.basic_utilities.settings import DATADUMP_DIRECTORY_PATH
 from loguru import logger
 import time
 import json
@@ -23,22 +21,30 @@ from decimal import Decimal
 import hashlib
 import base64
 import brotli
-from pftpyclient.task_manager.wallet_state import (
+from typing import Union, Optional
+from pftpyclient.basic_utilities.settings import *
+from pftpyclient.user_login.credentials import CredentialManager
+from pftpyclient.basic_utilities.settings import DATADUMP_DIRECTORY_PATH
+from pftpyclient.utilities.wallet_state import (
     WalletState, 
     requires_wallet_state,
     FUNDED_STATES,
     TRUSTLINED_STATES,
     INITIATED_STATES,
-    GOOGLE_DOC_SENT_STATES,
-    PFT_STATES
+    HANDSHAKED_STATES,
+    ACTIVATED_STATES
 )
 from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
-nest_asyncio.apply()
 from pftpyclient.configuration.constants import *
 from cryptography.fernet import Fernet
 import pftpyclient.configuration.constants as constants
-MAX_CHUNK_SIZE = 760
+from pftpyclient.utilities.transaction_requirements import TransactionRequirementService
+import traceback
+from typing import List
+import math
+
+nest_asyncio.apply()
 
 SAVE_MEMO_TRANSACTIONS = True
 SAVE_TASKS = True
@@ -56,7 +62,6 @@ class PostFiatTaskManager:
         self.pft_issuer = self.network_config.issuer_address
 
         self.user_wallet = self.spawn_user_wallet()
-        self.google_doc_link = self.credential_manager.get_credential('googledoc')
 
         # initialize dataframe filepaths for caching
         use_testnet = self.config.get_global_config('use_testnet')
@@ -83,8 +88,11 @@ class PostFiatTaskManager:
         # Initialize transactions
         self.sync_transactions()
 
+        # Initialize transaction requirement service
+        self.transaction_requirements = TransactionRequirementService(self.network_config)
+
         # Initialize wallet state based on account status
-        self.wallet_state = self.determine_wallet_state()
+        self.determine_wallet_state()
 
     def get_xrp_balance(self):
         return get_xrp_balance(self.network_url, self.user_wallet.classic_address)
@@ -93,7 +101,7 @@ class PostFiatTaskManager:
         """Determine the current state of the wallet based on blockhain"""
         logger.debug(f"Determining wallet state for {self.user_wallet.classic_address}")
         client = xrpl.clients.JsonRpcClient(self.network_url)
-        wallet_state = WalletState.UNFUNDED
+        self.wallet_state = WalletState.UNFUNDED
         try:
             # Check if account exists on XRPL
             response = client.request(
@@ -106,23 +114,20 @@ class PostFiatTaskManager:
             if response.is_successful() and 'account_data' in response.result:
                 balance = int(response.result['account_data']['Balance'])
                 if balance > 0:
-                    wallet_state = WalletState.FUNDED
+                    self.wallet_state = WalletState.FUNDED
                     if self.has_trust_line():
-                        wallet_state = WalletState.TRUSTLINED
+                        self.wallet_state = WalletState.TRUSTLINED
                         if self.initiation_rite_sent():
-                            wallet_state = WalletState.INITIATED
-                            if self.google_doc_sent():
-                                wallet_state = WalletState.GOOGLE_DOC_SENT
-                                if self.genesis_sent():
-                                    wallet_state = WalletState.ACTIVE
+                            self.wallet_state = WalletState.INITIATED
+                            if self.handshake_sent():
+                                self.wallet_state = WalletState.HANDSHAKE_SENT
+                                if self.google_doc_sent():
+                                    self.wallet_state = WalletState.ACTIVE
             else:
                 logger.warning(f"Account {self.user_wallet.classic_address} does not exist on XRPL")
-
-            return wallet_state
         
         except xrpl.clients.XRPLRequestFailureException as e:
             logger.error(f"Error determining wallet state: {e}")
-            return wallet_state
         
     def get_required_action(self):
         """Returns the next required action to take to unlock the wallet"""
@@ -134,9 +139,9 @@ class PostFiatTaskManager:
             case WalletState.TRUSTLINED:
                 return "Send initiation rite"
             case WalletState.INITIATED:
+                return "Send handshake to node"
+            case WalletState.HANDSHAKE_SENT:
                 return "Send google doc link"
-            case WalletState.GOOGLE_DOC_SENT:
-                return "Send genesis"
             case WalletState.ACTIVE:
                 return "No action required, Wallet is fully initialized"
             case _:
@@ -270,6 +275,22 @@ class PostFiatTaskManager:
 
         # Check if account exists and is funded before proceeding
         try:
+            # Get server state to determine available ledger range
+            server_state = self.client.request(
+                xrpl.models.requests.ServerState()
+            )
+            if server_state.is_successful():
+                complete_ledgers = server_state.result['state']['complete_ledgers']
+                # complete_ledgers is typically returned as a string like "32570-94329899"
+                if '-' in complete_ledgers:
+                    earliest_ledger, latest_ledger = map(int, complete_ledgers.split('-'))
+                    logger.debug(f"Server ledger range: {earliest_ledger} to {latest_ledger}")
+                else:
+                    logger.debug(f"Unexpected complete_ledgers format: {complete_ledgers}")
+            else:
+                logger.debug("Could not fetch server state")
+                return
+            
             response = self.client.request(
                 xrpl.models.requests.AccountInfo(
                     account=self.user_wallet.classic_address,
@@ -279,6 +300,7 @@ class PostFiatTaskManager:
             if not response.is_successful():
                 logger.debug("Account not found or not funded, skipping transaction sync")
                 return
+
         except Exception as e:
             logger.error(f"Error checking account status: {e}")
             return
@@ -292,9 +314,18 @@ class PostFiatTaskManager:
                     self.transactions = loaded_tx_df
                     self.sync_memo_transactions(loaded_tx_df)
 
+            # Log local ledger index range
+            if not self.transactions.empty:
+                local_min_index = self.transactions['ledger_index'].min()
+                local_max_index = self.transactions['ledger_index'].max()
+                logger.debug(f"Local ledger index range: {local_min_index} to {local_max_index}")
+            else:
+                logger.debug("No local transactions found")
+
             # Choose ledger index to start sync from
             if self.transactions.empty:
                 next_ledger_index = -1
+                logger.debug("Starting fresh sync from earliest available ledger")
             else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
                 next_ledger_index = self.transactions['ledger_index'].max() + 1
                 logger.debug(f"Next ledger index: {next_ledger_index}")
@@ -347,7 +378,7 @@ class PostFiatTaskManager:
 
         # Extract first memo into a new column, serialize to dict
         # Any additional memos are ignored
-        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.convert_memo_dict(x['Memos'][0]['Memo']))
+        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.decode_memo_fields_to_dict(x['Memos'][0]['Memo']))
         
         # Extract account and destination from tx_json into new columns
         memo_tx_df['account']= memo_tx_df['tx_json'].apply(lambda x: x['Account'])
@@ -563,12 +594,14 @@ class PostFiatTaskManager:
         date_object = datetime.datetime.fromtimestamp(unix_timestamp)
         return date_object
 
-    def hex_to_text(self,hex_string):
+    @staticmethod
+    def hex_to_text(hex_string):
         bytes_object = bytes.fromhex(hex_string)
         ascii_string = bytes_object.decode("utf-8")
         return ascii_string
     
-    def generate_custom_id(self):
+    @staticmethod
+    def generate_custom_id():
         """ These are the custom IDs generated for each task that is generated
         in a Post Fiat Node """ 
         letters = ''.join(random.choices(string.ascii_uppercase, k=2))
@@ -583,8 +616,9 @@ class PostFiatTaskManager:
     def send_xrp(self, amount, destination, memo="", destination_tag=None):
         return send_xrp(self.network_url, self.user_wallet, amount, destination, memo, destination_tag=destination_tag)
 
-    def convert_memo_dict(self, memo_dict):
-        """Constructs a memo object from hex-encoded XRP memo fields.
+    @staticmethod
+    def decode_memo_fields_to_dict(memo: Union[xrpl.models.transactions.Memo, dict]):
+        """Decodes hex-encoded XRP memo fields from a dictionary to a more readable dictionary format.
         
         The mapping from XRP memo fields to our internal format:
         - MemoFormat -> user: The username that sent the memo
@@ -593,14 +627,23 @@ class PostFiatTaskManager:
             b) For system messages: The system message type (e.g., "HANDSHAKE", "INITIATION_RITE")
         - MemoData -> full_output: The actual content/payload of the memo
         """
-        fields = {
-            'user': 'MemoFormat',
-            'task_id': 'MemoType',
-            'full_output': 'MemoData'
-        }
+        # TODO: Remove key changes and rely on MemoFormat, MemoType, MemoData to avoid confusion from context-switching
+        # Handle xrpl.models.transactions.Memo objects
+        if hasattr(memo, 'memo_format'):  # This is a Memo object
+            fields = {
+                'user': memo.memo_format,
+                'task_id': memo.memo_type,
+                'full_output': memo.memo_data
+            }
+        else:  # This is a dictionary from transaction JSON
+            fields = {
+                'user': memo.get('MemoFormat', ''),
+                'task_id': memo.get('MemoType', ''),
+                'full_output': memo.get('MemoData', '')
+            }
         
         return {
-            key: self.hex_to_text(memo_dict.get(value, ''))
+            key: PostFiatTaskManager.hex_to_text(value or '')
             for key, value in fields.items()
         }
 
@@ -622,7 +665,7 @@ class PostFiatTaskManager:
         if isinstance(memo, str) and is_over_1kb(memo):
             response = []
             logger.debug("Memo exceeds 1 KB, splitting into chunks")
-            chunked_memo = self._split_text_into_chunks(memo)
+            chunked_memo = self._chunk_memos(memo)
 
             # Split amount by number of chunks
             amount_per_chunk = amount / len(chunked_memo)
@@ -680,6 +723,12 @@ class PostFiatTaskManager:
             logger.error(response)
 
         return response
+    
+    def handshake_sent(self):
+        """Checks if the user has sent a handshake to the node"""
+        logger.debug(f"Checking if user has sent handshake to the node. Wallet state: {self.wallet_state}")
+        handshake_sent, node_public_key = self.get_handshake_for_address(self.default_node)
+        return handshake_sent and node_public_key
     
     @PerformanceMonitor.measure('get_handshakes')
     def get_handshakes(self):
@@ -791,7 +840,115 @@ class PostFiatTaskManager:
             user=self.credential_manager.postfiat_username,
             ecdh_public_key=ecdh_public_key
         )
-        return self._send_memo_single(destination, handshake)
+        return self.send_memo(destination, handshake, compress=False)
+    
+    @staticmethod
+    def calculate_memo_size(memo_format: str, memo_type: str, memo_data: str) -> dict:
+        return calculate_memo_size(memo_format, memo_type, memo_data)
+
+    @staticmethod
+    def calculate_required_chunks(memo: Memo, max_size: int = constants.MAX_CHUNK_SIZE) -> int:
+        """
+        Calculates how many chunks will be needed to send a memo.
+        
+        Args:
+            memo: Original Memo object to analyze
+            max_size: Maximum size in bytes for each complete Memo object
+            
+        Returns:
+            int: Number of chunks required
+            
+        Raises:
+            ValueError: If the memo cannot be chunked (overhead too large)
+        """
+        # Extract memo components
+        memo_dict = PostFiatTaskManager.decode_memo_fields_to_dict(memo)
+        memo_format = memo_dict['user']
+        memo_type = memo_dict['task_id']
+        memo_data = memo_dict['full_output']
+
+        logger.debug(f"Deconstructed (plaintext) memo sizes: "
+                    f"memo_format: {len(memo_format)}, "
+                    f"memo_type: {len(memo_type)}, "
+                    f"memo_data: {len(memo_data)}")
+
+        # Calculate overhead sizes
+        size_info = PostFiatTaskManager.calculate_memo_size(memo_format, memo_type, "chunk_999__")  # assuming chunk_999__ is worst-case chunk label overhead
+        max_data_size = max_size - size_info['total_size']
+
+        logger.debug(f"Size allocation:")
+        logger.debug(f"  Max size: {max_size}")
+        logger.debug(f"  Total overhead: {size_info['total_size']}")
+        logger.debug(f"  Available for data: {max_size} - {size_info['total_size']} = {max_data_size}")
+
+        if max_data_size <= 0:
+            raise ValueError(
+                f"No space for data: max_size={max_size}, total_overhead={size_info['total_size']}"
+            )
+        
+        # Calculate number of chunks needed
+        data_bytes = memo_data.encode('utf-8')
+        return math.ceil(len(data_bytes) / max_data_size)
+    
+    @staticmethod
+    def _chunk_memos(memo: Memo, max_size: int = constants.MAX_CHUNK_SIZE) -> List[Memo]:
+        """
+        Splits a Memo object into multiple Memo objects, each under MAX_CHUNK_SIZE bytes.
+        Only chunks the memo_data field while preserving memo_format and memo_type.
+        
+        Args:
+            memo: Original Memo object to split
+            max_size: Maximum size in bytes for each complete Memo object
+            
+        Returns:
+            List of Memo objects, each under max_size bytes
+        """
+        logger.debug("Chunking memo...")
+
+        # Extract memo components
+        memo_dict = PostFiatTaskManager.decode_memo_fields_to_dict(memo)
+        memo_format = memo_dict['user']
+        memo_type = memo_dict['task_id']
+        memo_data = memo_dict['full_output']
+
+        # Calculate chunks needed and validate size
+        num_chunks = PostFiatTaskManager.calculate_required_chunks(memo, max_size)
+        chunk_size = len(memo_data.encode('utf-8')) // num_chunks
+                
+        # Split into chunks
+        chunked_memos = []
+        data_bytes = memo_data.encode('utf-8')
+        for chunk_number in range(1, num_chunks + 1):
+            start_idx = (chunk_number - 1) * chunk_size
+            end_idx = start_idx + chunk_size if chunk_number < num_chunks else len(data_bytes)
+            chunk = data_bytes[start_idx:end_idx]
+            chunk_with_label = f"chunk_{chunk_number}__{chunk.decode('utf-8', errors='ignore')}"
+
+            # Debug the sizes
+            test_format = str_to_hex(memo_format)
+            test_type = str_to_hex(memo_type)
+            test_data = str_to_hex(chunk_with_label)
+            
+            logger.debug(f"Chunk {chunk_number} sizes:")
+            logger.debug(f"  Plaintext Format size: {len(memo_format)}")
+            logger.debug(f"  Plaintext Type size: {len(memo_type)}")
+            logger.debug(f"  Plaintext Data size: {len(chunk_with_label)}")
+            logger.debug(f"  Plaintext Total size: {len(memo_format) + len(memo_type) + len(chunk_with_label)}")
+            logger.debug(f"  Hex Format size: {len(test_format)}")
+            logger.debug(f"  Hex Type size: {len(test_type)}")
+            logger.debug(f"  Hex Data size: {len(test_data)}")
+            logger.debug(f"  Hex Total size: {len(test_format) + len(test_type) + len(test_data)}")
+            
+            chunk_memo = construct_memo(
+                memo_format=memo_format,
+                memo_type=memo_type,
+                memo_data=chunk_with_label,
+                validate_size=False  # TODO: The size validation appears too conservative
+            )
+
+            chunked_memos.append(chunk_memo)
+
+        return chunked_memos
 
     @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('encrypt_memo')
@@ -819,16 +976,61 @@ class PostFiatTaskManager:
 
     @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('send_memo')
-    def send_memo(self, destination, memo: str, compress=True, encrypt=False):
-        """ Sends a memo to a destination, chunking by MAX_CHUNK_SIZE, with optional compression and encryption"""
+    def send_memo(
+        self, 
+        destination: str, 
+        memo: Union[str, Memo], 
+        username: Optional[str] = None,
+        message_id: Optional[str] = None,
+        chunk: bool = False,
+        compress: bool = True, 
+        encrypt: bool = False,
+        pft_amount: Optional[Decimal] = None
+    ):
+        """Sends a memo to a destination with optional encryption, compression, and chunking.
+        
+        Args:
+            destination: XRPL destination address
+            memo: Either a string message or pre-constructed Memo object
+            username: Optional user identifier for memo format field
+            message_id: Optional custom ID for memo type field
+            chunk: Whether to chunk the memo data (default False)
+            compress: Whether to compress the memo data (default True)
+            encrypt: Whether to encrypt the memo data (default False)
+            pft_amount: Optional specific PFT amount to send
+        """
         
         message_id = self.generate_custom_id()
+
+        logger.debug(f"Memo getting sent: {memo}")
+
+        # Extract or create memo components
+        if isinstance(memo, Memo):
+            memo_data = self.hex_to_text(memo.memo_data)
+            memo_type = self.hex_to_text(memo.memo_type)
+            memo_format = self.hex_to_text(memo.memo_format)
+        else:
+            memo_data = str(memo)
+            memo_type = message_id or self.generate_custom_id()
+            memo_format = username or self.credential_manager.postfiat_username
+
+        # Get per-tx PFT requirement
+        # TODO: Make this reject if passed pft_amount is too low
+        pft_amount = pft_amount or self.transaction_requirements.get_pft_requirement(
+            address=destination,
+            memo_type=memo_type
+        )
+
+        # Check if this is a system memo type, which requires special handling
+        is_system_memo = any(
+            memo_type == system_type.value
+            for system_type in SystemMemoType
+        )
 
         # Handle encryption if requested
         if encrypt:
             # Check handshake status
             _, received_key = self.get_handshake_for_address(destination)
-
             if not received_key:
                 raise HandshakeRequiredError(destination)
             
@@ -837,71 +1039,67 @@ class PostFiatTaskManager:
             logger.debug(f"Shared secret: {shared_secret[:8]}...")
 
             # Encrypt the memo using the shared secret
-            logger.debug(f"Encrypting memo: {memo[:8]}...")
-            encrypted_memo = self.encrypt_memo(memo, shared_secret)
+            logger.debug(f"Encrypting memo: {memo_data[:8]}...")
+            encrypted_memo = self.encrypt_memo(memo_data, shared_secret)
             logger.debug(f"Encrypted memo: {encrypted_memo[:8]}...")
-            memo = "WHISPER__" + encrypted_memo
+            memo_data = "WHISPER__" + encrypted_memo
 
+        # Handle compression if requested
         if compress:
-            logger.debug(f"Compressing memo of length {len(memo)}")
-            compressed_data = compress_string(memo)
+            logger.debug(f"Compressing memo of length {len(memo_data)}")
+            compressed_data = compress_string(memo_data)
             logger.debug(f"Compressed to length {len(compressed_data)}")
-            memo = "COMPRESSED__" + compressed_data
+            memo_data = "COMPRESSED__" + compressed_data
 
-        memo_chunks = self._split_text_into_chunks(memo)
+        # For system memos, verify size and prevent chunking
+        # construct_memo will raise ValueError if size exceeds limit, since SystemMemoTypes cannot be chunked due to collision risk
+        memo = construct_memo(
+            memo_format=memo_format,
+            memo_type=memo_type,
+            memo_data=memo_data,
+            validate_size=(is_system_memo and chunk) or not chunk
+        )
 
-        response = []
-        for idx, memo_chunk in enumerate(memo_chunks):
-            log_content = memo_chunk
-            if compress and idx == 0:
-                try:
-                    # Only log a preview of the original content
-                    log_content = f"[compressed memo preview] {memo[:100]}..."
-                except Exception as e:
-                    logger.error(f"Error decompressing memo chunk: {e}")
-                    log_content = "[compressed content]"
-                
-            logger.debug(f"Sending chunk {idx+1} of {len(memo_chunks)}: {log_content[:100]}...")
-        
-            memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
-                                                task_id=message_id, 
-                                                full_output=memo_chunk)
+        if is_system_memo and chunk:
+            return self._send_memo_single(destination, memo_data)
 
-            response.append(self._send_memo_single(destination, memo))
+        # Handle chunking for non-system memos if requested
+        if chunk:
+            try:
+                chunk_memos = self._chunk_memos(memo)
+                responses = []
 
-        return response
+                for idx, chunk_memo in enumerate(chunk_memos):
+                    logger.debug(f"Sending chunk {idx+1} of {len(chunk_memos)}: {chunk_memo.memo_data[:100]}...")
+                    responses.append(self._send_memo_single(destination, chunk_memo, pft_amount))
+
+                return responses
+            except Exception as e:
+                logger.error(f"Error chunking memo: {e}")
+                logger.error(f"traceback: {traceback.format_exc()}")
+
+        else:
+            return self._send_memo_single(destination, memo, pft_amount)
     
-    def _send_memo_single(self, destination, memo, pft_amount=0):
+    def _send_memo_single(self, destination: str, memo: Memo, pft_amount: Decimal):
         """ Sends a memo to a destination. """
         client = xrpl.clients.JsonRpcClient(self.network_url)
-
-        # Handle memo 
-        if isinstance(memo, Memo):
-            memos = [memo]
-        elif isinstance(memo, str):
-            memos = [Memo(memo_data=str_to_hex(memo))]
-        else:
-            logger.error("Memo is not a string or a Memo object, raising ValueError")
-            raise ValueError("Memo must be either a string or a Memo object")
-
-        # Get PFT requirement for destination
-        pft_value = self.network_config.get_pft_requirement(destination)
 
         payment_args = {
             "account": self.user_wallet.address,
             "destination": destination,
-            "memos": memos
+            "memos": [memo]
         }
         
-        if pft_value > 0:
+        if pft_amount > 0:
             payment_args["amount"] = xrpl.models.amounts.IssuedCurrencyAmount(
                 currency="PFT",
                 issuer=self.pft_issuer,
-                value=str(pft_value)
+                value=str(pft_amount)
             )
         else:
             # Send minimum XRP amount for memo-only transactions
-            payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(0.00001))  # Minimum XRP amount
+            payment_args["amount"] = xrpl.utils.xrp_to_drops(Decimal(constants.MIN_XRP_PER_TRANSACTION))
 
         payment = xrpl.models.transactions.Payment(**payment_args)
 
@@ -917,45 +1115,197 @@ class PostFiatTaskManager:
 
         return response
 
-    def _split_text_into_chunks(self, text, max_chunk_size=MAX_CHUNK_SIZE):
-        """ Helper method to build a list of Memo objects representing a single memo string split into chunks """
+    def _reconstruct_chunked_message(
+        self,
+        memo_type: str,
+        memos: pd.DataFrame
+    ) -> str:
+        """Reconstruct a message from its chunks.
+        
+        Args:
+            memo_type: Message ID to reconstruct
+            memo_history: DataFrame containing memo history
+            
+        Returns:
+            str: Reconstructed message or None if reconstruction fails
+        """
+        try: 
 
-        chunks = []
+            # Get all chunks with this memo type
+            memo_chunks = memos[
+                (memos['task_id'] == memo_type) &
+                (memos['full_output'].str.match(r'^chunk_\d+__'))  # Only get actual chunks
+            ].copy()
 
-        text_bytes = text.encode('utf-8')
+            if memo_chunks.empty:
+                return None
 
-        for i in range(0, len(text_bytes), max_chunk_size):
-            chunk = text_bytes[i:i+max_chunk_size]
-            chunk_number = i // max_chunk_size + 1
-            chunk_label = f"chunk_{chunk_number}__".encode('utf-8')
-            chunk_with_label = chunk_label + chunk
-            chunks.append(chunk_with_label)
+            # Extract chunk numbers and sort
+            def extract_chunk_number(x):
+                match = re.search(r'chunk_(\d+)__', x)
+                return int(match.group(1)) if match else 0
+            
+            memo_chunks['chunk_number'] = memo_chunks['full_output'].apply(extract_chunk_number)
+            memo_chunks.sort_values(by='datetime', ascending=True, inplace=True)
 
-        return [chunk.decode('utf-8', errors='ignore') for chunk in chunks]
+            # Detect and handle multiple chunk sequences
+            current_sequence = []
+            highest_chunk_num = 0
+
+            for _, chunk in memo_chunks.iterrows():
+                # If we see a chunk_1 and already have chunks, this is a new sequence
+                if chunk['chunk_number'] == 1 and current_sequence:
+                    # Check if previous sequence was complete (no gaps)
+                    expected_chunks = set(range(1, highest_chunk_num + 1))
+                    actual_chunks = set(chunk['chunk_number'] for chunk in current_sequence)
+
+                    if expected_chunks == actual_chunks:
+                        # First sequence is complete, ignore all subsequent chunks
+                        logger.warning(f"Found complete sequence for {memo_type}, ignoring new sequence")
+                        break
+                    else:
+                        # First sequence was incomplete, start fresh with new sequence
+                        logger.warning(f"Previous sequence incomplete for {memo_type}, starting new sequence")
+                        current_sequence = []
+                        highest_chunk_num = 0
+
+                current_sequence.append(chunk)
+                highest_chunk_num = max(highest_chunk_num, chunk['chunk_number'])
+
+            # Verify final sequence is complete
+            expected_chunks = set(range(1, highest_chunk_num + 1))
+            actual_chunks = set(chunk['chunk_number'] for chunk in current_sequence)
+            if expected_chunks != actual_chunks:
+                logger.warning(f"Missing chunks for {memo_type}. Expected {expected_chunks}, got {actual_chunks}")
+                return None
+            
+            # Combine chunks in order
+            current_sequence.sort(key=lambda x: x['chunk_number'])
+            reconstructed_parts = []
+            for chunk in current_sequence:
+                chunk_data = re.sub(r'^chunk_\d+__', '', chunk['full_output'])
+                reconstructed_parts.append(chunk_data)
+
+            return ''.join(reconstructed_parts)
+
+        except Exception as e:
+            logger.error(f"Error reconstructing message {memo_type}: {e}")
+            return None
+        
+    @staticmethod
+    def decrypt_memo(encrypted_content: str, shared_secret: Union[str, bytes]) -> Optional[str]:
+        """
+        Decrypt a memo using a shared secret.
+        
+        Args:
+            encrypted_content: The encrypted memo content (without WHISPER prefix)
+            shared_secret: The shared secret derived from ECDH
+            
+        Returns:
+            Decrypted message or None if decryption fails
+        """
+        try:
+            # Ensure shared_secret is bytes
+            if isinstance(shared_secret, str):
+                shared_secret = shared_secret.encode()
+
+            # Generate a Fernet key from the shared secret
+            key = base64.urlsafe_b64encode(hashlib.sha256(shared_secret).digest())
+            fernet = Fernet(key)
+
+            # Decrypt the message
+            decrypted_bytes = fernet.decrypt(encrypted_content.encode())
+            return decrypted_bytes.decode()
+
+        except Exception as e:
+            logger.error(f"Error decrypting message: {e}")
+            return None
     
-## MEMO FORMATTING AND MEMO CREATION TOOLS
-    
-    def get_account_transactions__limited(self, account_address,
-                                    ledger_index_min=-1,
-                                    ledger_index_max=-1, 
-                                    limit=10):
-            client = xrpl.clients.JsonRpcClient(self.network_url) # Using a public server; adjust as necessary
+    def process_memo_data(
+            self,
+            memo_type: str,
+            memo_data: str,
+            decompress: bool = True,
+            decrypt: bool = True,
+            full_unchunk: bool = False, 
+            memo_history: Optional[pd.DataFrame] = None,
+            channel_counterparty: Optional[str] = None,
+        ) -> str:
+        """Process memo data, handling compression, encryption, and chunking.
         
-            request = AccountTx(
-                account=account_address,
-                ledger_index_min=ledger_index_min,  # Use -1 for the earliest ledger index
-                ledger_index_max=ledger_index_max,  # Use -1 for the latest ledger index
-                limit=limit,                        # Adjust the limit as needed
-                forward=True                        # Set to True to return results in ascending order
-            )
+        For encrypted messages (WHISPER__ prefix), this method handles decryption using ECDH
+        from the perspective of the logged-in user's wallet.
+
+        Args:
+            memo_type: The memo type to identify related chunks
+            memo_data: Initial memo data string
+            decompress: If True, decompresses data if COMPRESSED__ prefix is present
+            decrypt: If True, decrypts data if WHISPER__ prefix is present
+            full_unchunk: If True, will attempt to unchunk by referencing memo history
+            memo_history: Pre-filtered memo history required for chunk lookup
+            channel_counterparty: The other end of the encryption channel
+        """
+        try: 
+            processed_data = memo_data
+
+            # Handle chunking
+            if full_unchunk and memo_history is not None:
+                # Skip chunk processing for SystemMemoType messages
+                is_system_memo = any(
+                    memo_type == system_type.value
+                    for system_type in SystemMemoType
+                )
+
+                # Handle chunking for non-system messages only
+                if not is_system_memo:
+                    # Check if this is a chunked message
+                    chunk_match = re.match(r'^chunk_\d+__', memo_data)
+                    if chunk_match:
+                        reconstructed = self._reconstruct_chunked_message(
+                            memo_type=memo_type,
+                            memos=memo_history
+                        )
+                        if reconstructed:
+                            processed_data = reconstructed
+                        else:
+                            # If reconstruction fails, just clean the prefix from the single message
+                            logger.debug(f"Reconstruction of chunked message {memo_type} failed. Cleaning prefix from single message.")
+                            processed_data = re.sub(r'^chunk_\d+__', '', memo_data)
+
+            elif isinstance(processed_data, str):
+                # Simple chunk prefix removal (no full unchunking)
+                processed_data = re.sub(r'^chunk_\d+__', '', processed_data)
+
+            # Handle decompression
+            if decompress and processed_data.startswith('COMPRESSED__'):
+                processed_data = processed_data.replace('COMPRESSED__', '', 1)
+                # logger.debug(f"Decompressing data of length {len(processed_data)}")
+                processed_data = decompress_string(processed_data)
+
+            # Handle decryption
+            if decrypt and processed_data.startswith('WHISPER__'):
+                if not channel_counterparty:
+                    logger.warning(f"Cannot decrypt message {memo_type} - missing channel_counterparty")
+                    return processed_data
+                
+                # Get handshake status
+                _, received_key = self.get_handshake_for_address(channel_counterparty)
+                if not received_key:
+                    logger.warning(f"Cannot decrypt message {memo_type} - no handshake found")
+                    return processed_data
+                
+                # Get the shared secret
+                shared_secret = self.credential_manager.get_shared_secret(received_key)
+                
+                # Remove the WHISPER__ prefix and decrypt
+                processed_data = processed_data.replace('WHISPER__', '', 1)
+                processed_data = '[DECRYPTED] ' + self.decrypt_memo(processed_data, shared_secret)
+
+            return processed_data
         
-            response = client.request(request)
-            transactions = response.result.get("transactions", [])
-        
-            if "marker" in response.result:  # Check if a marker is present for pagination
-                print("More transactions available. Marker for next batch:", response.result["marker"])
-        
-            return transactions
+        except Exception as e:
+            logger.error(f"Error processing memo data: {e}")
+            return None
     
     def get_account_transactions(self, account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n', 
                                 ledger_index_min=-1, 
@@ -1006,7 +1356,7 @@ class PostFiatTaskManager:
                     logger.debug(f"Retrieved {len(transactions)} transactions")
                     all_transactions.extend(transactions)
                 else:
-                    logger.error(f"Error in XRPL response: {response.status}")
+                    logger.error(f"Error in XRPL response: {response}")
                     break
             except Exception as e:
                 logger.error(f"Error making XRPL request: {e}")
@@ -1028,6 +1378,7 @@ class PostFiatTaskManager:
 
         return all_transactions
     
+    # TODO: Attempt to apply DRY principle with get_account_transactions
     def get_account_transactions__exhaustive(self,account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
                                 ledger_index_min=-1,
                                 ledger_index_max=-1,
@@ -1070,6 +1421,7 @@ class PostFiatTaskManager:
 
         return all_transactions
 
+    # TODO: Not used, deprecate
     def get_account_transactions__retry_version(self, account_address='r3UHe45BzAVB3ENd21X9LeQngr4ofRJo5n',
                                 ledger_index_min=-1,
                                 ledger_index_max=-1,
@@ -1108,13 +1460,11 @@ class PostFiatTaskManager:
 
         logger.debug("Getting latest outgoing context doc link...")
 
-        # Filter for memos that are PFT-related, sent to the default node, outgoing, and are google doc context links
-        redux_tx_list = self.memo_transactions[
-            self.memo_transactions['is_pft'] & 
-            (self.memo_transactions['destination']==self.default_node) &
-            (self.memo_transactions['direction']=='OUTGOING') & 
-            (self.memo_transactions['memo_data'].apply(lambda x: x['task_id']) == SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value)
-            ]
+        # Filter for outgoing google doc context links
+        redux_tx_list = self.system_memos[
+            (self.system_memos['task_id'] == SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value) &
+            (self.system_memos['direction'] == 'OUTGOING')
+        ]
         
         logger.debug(f"Found {len(redux_tx_list)} outgoing context doc links")
         
@@ -1123,11 +1473,21 @@ class PostFiatTaskManager:
             return None
         
         # Get the most recent google doc context link
-        most_recent_context_link = redux_tx_list.tail(1)
+        most_recent_context_link = redux_tx_list.sort_values('datetime', ascending=False).iloc[0]
+        memo_data = most_recent_context_link['full_output']
 
-        link = most_recent_context_link['memo_data'].iloc[0]['full_output']
+        logger.debug(f"Most recent google doc link: {memo_data}")
 
-        logger.debug(f"Most recent context doc link: {link}")
+        # Process the memo data to handle both encrypted and unencrypted links
+        try:
+            link = self.process_memo_data(
+                memo_type=SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value,
+                memo_data=memo_data,
+                channel_counterparty=self.default_node
+            )
+        except Exception as e:
+            logger.error(f"Error processing memo data: {e}")
+            return None
 
         return link
 
@@ -1156,40 +1516,10 @@ class PostFiatTaskManager:
 
         user_initiation_rites_destinations = self.get_user_initiation_rites_destinations()
         return self.default_node in user_initiation_rites_destinations
-
-    # TODO: Deprecate this method
-    def get_user_genesis_destinations(self):
-        """ Returns all the addresses that have received a user genesis transaction"""
-        all_user_genesis = self.memo_transactions[self.memo_transactions['memo_data'].apply(lambda x: 'USER GENESIS __' in str(x))]
-        return list(all_user_genesis['destination'])
-
-    # TODO: Deprecate this method
-    def genesis_sent(self):
-        user_genesis_destinations = self.get_user_genesis_destinations()
-        return self.default_node in user_genesis_destinations
     
-    # TODO: Deprecate this method
-    @requires_wallet_state(INITIATED_STATES)
-    def handle_genesis(self):
-        """ Checks if the user has sent a genesis to the node, and sends one if not """
-        if not self.genesis_sent():
-            logger.debug("Genesis not found amongst outgoing memos.")
-            self.send_genesis()
-        else:
-            logger.debug("User has already sent genesis, skipping...")
-    
-    # TODO: Deprecate this method
-    def send_genesis(self):
-        """ Sends a user genesis transaction to the default node 
-        Currently requires 7 PFT
-        """
-        logger.debug("Sending node genesis transaction...")
-        genesis_memo = construct_genesis_memo(
-            user=self.credential_manager.postfiat_username,
-            task_id=self.generate_custom_id(),
-            full_output=f'USER GENESIS __ user: {self.credential_manager.postfiat_username}'
-        )
-        self.send_pft(amount=7, destination=self.default_node, memo=genesis_memo)
+    def google_doc_sent(self):
+        """Checks if the user has ever sent a google doc context link"""
+        return self.get_latest_outgoing_context_doc_link() is not None
 
     def check_if_google_doc_is_valid(self, google_doc_link):
         """ Checks if the google doc is valid by """
@@ -1208,61 +1538,35 @@ class PostFiatTaskManager:
         if google_doc_text == "Failed to retrieve the document. Status code: 401":
             raise GoogleDocIsNotSharedException(google_doc_link)
         
-        # Check 4: google doc contains the correct XRP address at the top
-        if retrieve_xrp_address_from_google_doc(google_doc_text) != self.user_wallet.classic_address:
-            raise GoogleDocDoesNotContainXrpAddressException(self.user_wallet.classic_address)
+        # # Check 4: google doc contains the correct XRP address at the top
+        # if retrieve_xrp_address_from_google_doc(google_doc_text) != self.user_wallet.classic_address:
+        #     raise GoogleDocDoesNotContainXrpAddressException(self.user_wallet.classic_address)
         
-        # Check 5: XRP address has a balance
-        if self.get_xrp_balance() == 0:
-            raise GoogleDocIsNotFundedException(google_doc_link)    
-    
-    def google_doc_sent(self):
-        """Checks if the user has sent a google doc context link"""
-        return self.get_latest_outgoing_context_doc_link() is not None
+        # # Check 5: XRP address has a balance
+        # if self.get_xrp_balance() == 0:
+        #     raise GoogleDocIsNotFundedException(google_doc_link)    
     
     @requires_wallet_state(INITIATED_STATES)
     def handle_google_doc_setup(self, google_doc_link):
         """Validates, caches, and sends the Google Doc link"""
-        logger.info("Setting up Google Doc...")
-
-        # Validate the Google Doc
+        logger.debug("Checking Google Doc link for validity and sending if valid...")
         self.check_if_google_doc_is_valid(google_doc_link)
-        
-        # Cache the Google Doc link
-        try:
-            self.credential_manager.enter_and_encrypt_credential(
-                credentials_dict={
-                    f'{self.credential_manager.postfiat_username}__googledoc': google_doc_link
-                }
-            )
-            self.google_doc_link = google_doc_link
-        except Exception as e:
-            logger.error(f"Error caching Google Doc link: {e}")
-            return
-        
-        # Send the Google Doc link to the node
-        self.handle_google_doc()
+        return self.send_google_doc(google_doc_link)
     
-    @requires_wallet_state(INITIATED_STATES)
-    def handle_google_doc(self):
-        """Checks for google doc and prompts user to send if not found"""
-        if self.google_doc_link is None:
-            logger.warning("Google Doc link not found in credentials")
-            return
-
-        if not self.google_doc_sent():
-            logger.debug("Google Doc context link not found amongst outgoing memos.")
-            self.send_google_doc()
-        else:
-            logger.debug("User has already sent a Google Doc context link, skipping...")
-    
-    def send_google_doc(self):
+    def send_google_doc(self, google_doc_link: str):
         """ Sends the Google Doc context link to the node """
-        logger.debug(f"Sending Google Doc context link to the node: {self.google_doc_link}")
-        google_doc_memo = construct_google_doc_context_memo(user=self.credential_manager.postfiat_username,
-                                                            google_doc_link=self.google_doc_link)
-        self.send_pft(amount=1, destination=self.default_node, memo=google_doc_memo)
-        logger.debug("Google Doc context link sent.")
+        logger.debug(f"Sending Google Doc context link to the node: {google_doc_link}")
+        google_doc_memo = construct_google_doc_context_memo(
+            user=self.credential_manager.postfiat_username,
+            google_doc_link=google_doc_link
+        )
+        return self.send_memo(
+            destination=self.default_node,
+            memo=google_doc_memo,
+            chunk=False,
+            compress=False,
+            encrypt=True  # Always encrypt Google Doc links
+        )
 
     @requires_wallet_state(WalletState.ACTIVE)
     @PerformanceMonitor.measure('get_proposals_df')
@@ -1478,86 +1782,50 @@ class PostFiatTaskManager:
             logger.debug("No memos or handshakes found")
             return pd.DataFrame()
 
-        def remove_chunks(text):
-            # Use regular expression to remove all occurrences of chunk_1__, chunk_2__, etc.
-            cleaned_text = re.sub(r'chunk_\d+__', '', text)
-            return cleaned_text
-
-        # Filter for only MEMO type messages (excluding handshakes)
-        chunked_memos = self.memos[
+        # Filter for only MEMO type messages 
+        memo_history = self.memos[
             self.memos['full_output'].str.contains(MessageType.MEMO.value, na=False)
         ].copy()
 
-        if chunked_memos.empty:
+        if memo_history.empty:
             logger.debug("No memos found")
             return pd.DataFrame()
-
-        # Remove "chunk_[index]_" prefix from the 'full_output' column
-        chunked_memos['full_output'] = chunked_memos['full_output'].apply(remove_chunks)
-
-        # Rename full_output to memos, and task_id to message_id
-        chunked_memos.rename(columns={'task_id' : 'memo_id', 'full_output': 'memo'}, inplace=True)
-
-        # Replace direction with to/from
-        chunked_memos['direction'] = chunked_memos['direction'].map({'INCOMING': 'From', 'OUTGOING': 'To'})
-
-        # Group by memo_id to combine chunks and get sender info
-        grouped = chunked_memos.groupby('memo_id').agg({
-            'memo': ''.join,
-            'counterparty_address': 'first',  # Get sender address
-            'datetime': 'first',  # Get latest datetime
-            'direction': 'first'  # Get direction (INCOMING/OUTGOING)
-        }).reset_index()
-
-        def process_memo(row):
-            memo = row['memo']
-            sender = row['counterparty_address']
-
-            # First handle compression
-            if memo.startswith("COMPRESSED__"):
-                try:
-                    memo = decompress_string(memo.replace("COMPRESSED__", ""))
-                except ValueError as e:
-                    logger.error(f"Error decompressing memo: {e}")
-                    return f"[Decompression failed: {memo[:100]}...]"
         
-            # Then handle encryption
-            if memo.startswith("WHISPER__"):
-                try:
-                    encrypted_content = memo.replace("WHISPER__", "")
+        processed_messages = []
+        for msg_id in memo_history['task_id'].unique():
+            msg_txns = memo_history[memo_history['task_id'] == msg_id]
+            first_txn = msg_txns.iloc[0]
 
-                    # Get their handshake
-                    _, received_key = self.get_handshake_for_address(sender)
-                    if not received_key:
-                        return "[Encrypted message - handshake not found]"
-                    
-                    # Derive shared secret
-                    shared_secret = self.credential_manager.get_shared_secret(received_key)
+            try:
+                # process the message (chunking, compression, encryption)
+                processed_message = self.process_memo_data(
+                    memo_type=msg_id,
+                    memo_data=first_txn['full_output'],
+                    full_unchunk=True,
+                    memo_history=memo_history,
+                    channel_counterparty=first_txn['counterparty_address']
+                )
+            except Exception as e:
+                logger.error(f"Error processing message {msg_id}: {e}")
+                processed_message = "[PROCESSING FAILED]"
 
-                    # Decrypt
-                    key = base64.urlsafe_b64encode(hashlib.sha256(shared_secret).digest())
-                    fernet = Fernet(key)
-                    decrypted_bytes = fernet.decrypt(encrypted_content.encode())
-                    decrypted_memo = "[Decrypted] " + decrypted_bytes.decode()
-                    return decrypted_memo
+            processed_messages.append({
+                'memo_id': msg_id,
+                'memo': processed_message,
+                'direction': 'From' if first_txn['direction'] == 'INCOMING' else 'To',
+                'counterparty_address': first_txn['counterparty_address'],
+                'datetime': first_txn['datetime']
+            })
 
-                except Exception as e:
-                    logger.error(f"Error decrypting memo: {e}")
-                    return "[Decryption failed]"
-                
-            return memo
-        
-        # Apply processing to each row
-        grouped['memo'] = grouped.apply(process_memo, axis=1)
-
-        # Sort by datetime descending
-        result = grouped.sort_values(by='datetime', ascending=False).reset_index(drop=True)
+        # Create DataFrame and sort by datetime
+        result = pd.DataFrame(processed_messages)
+        result = result.sort_values(by='datetime', ascending=False).reset_index(drop=True)
 
         # Add contact names where available
         contacts = self.credential_manager.get_contacts()
         result['contact_name'] = result['counterparty_address'].map(contacts)
         result['display_address'] = result.apply(
-            lambda x: x['contact_name'] + ' (' + x['counterparty_address'] + ')' 
+            lambda x: f"{x['contact_name']} ({x['counterparty_address']})" 
                 if pd.notna(x['contact_name']) else x['counterparty_address'],
             axis=1
         )
@@ -1570,12 +1838,12 @@ class PostFiatTaskManager:
         task_df = self.get_task(task_id)
         most_recent_status = self.get_task_state(task_df)
 
-        if most_recent_status != 'PROPOSAL':
-            raise WrongTaskStateException('PROPOSAL', most_recent_status)
+        if most_recent_status != TaskType.PROPOSAL.name:
+            raise WrongTaskStateException(TaskType.PROPOSAL.name, most_recent_status)
 
         proposal_source = task_df.iloc[0]['counterparty_address']
-        if 'ACCEPTANCE REASON ___' not in acceptance_string:
-            classified_string='ACCEPTANCE REASON ___ '+acceptance_string
+        if TaskType.ACCEPTANCE.value not in acceptance_string:
+            classified_string=TaskType.ACCEPTANCE.value + acceptance_string
         else:
             classified_string=acceptance_string
         constructed_memo = construct_basic_postfiat_memo(user=self.credential_manager.postfiat_username, 
@@ -1721,25 +1989,15 @@ class PostFiatTaskManager:
     def process_account_info(self):
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
-        # Slicing data based on conditions
-        google_doc_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(
-            lambda x: SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value in str(x)
-        )].copy()
 
-        # TODO: Remove User Genesis
-        genesis_slice = self.memo_transactions[self.memo_transactions['memo_data'].apply(
-            lambda x: TaskType.USER_GENESIS.value in str(x)
-        )].copy()
+        initiation_rite = self.system_memos[
+            self.system_memos['task_id'] == SystemMemoType.INITIATION_RITE.value
+        ]
+
+        if not initiation_rite.empty:
+            initiated_username = initiation_rite.iloc[0]['user']
         
-        # Extract genesis username
-        genesis_username = "Unknown"
-        if not genesis_slice.empty:
-            genesis_username = list(genesis_slice['memo_data'])[0]['full_output'].split(' __')[-1].split('user:')[-1].strip()
-        
-        # Extract Google Doc key
-        key_google_doc = "No Google Doc available."
-        if not google_doc_slice.empty:
-            key_google_doc = list(google_doc_slice['memo_data'])[0]['full_output']
+        google_doc_link = self.get_latest_outgoing_context_doc_link()
 
         # Sorting account info by datetime
         sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
@@ -1789,8 +2047,8 @@ class PostFiatTaskManager:
         user_classic_address = self.user_wallet.classic_address
         # Compiling key display information
         key_display_info = {
-            'Google Doc': key_google_doc,
-            'Genesis Username': genesis_username,
+            'Google Doc': google_doc_link,
+            'Initiated Username': initiated_username,
             'Account Address' : user_classic_address,
             'Default Node': user_default_node,
             'Incoming Message': incoming_message,
@@ -1904,37 +2162,87 @@ class PostFiatTaskManager:
         full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
         return full_post_fiat_holder_df
 
-def is_over_1kb(string):
-    # 1KB = 1024 bytes
-    return len(string.encode('utf-8')) > 1024
+def is_over_1kb(value: Union[str, int, float]) -> bool:
+    if isinstance(value, str):
+        # For strings, convert to bytes and check length
+        return len(value.encode('utf-8')) > 1024
+    elif isinstance(value, (int, float)):
+        # For numbers, compare directly
+        return value > 1024
+    else:
+        raise TypeError(f"Expected string or number, got {type(value)}")
+    
+def calculate_memo_size(memo_format: str, memo_type: str, memo_data: str) -> dict:
+    """
+    Calculates the size components of a memo using consistent logic.
+    
+    Args:
+        memo_format: The format field (usually username)
+        memo_type: The type field (usually task_id)
+        memo_data: The data field (the actual content)
+        
+    Returns:
+        dict: Size breakdown including:
+            - format_size: Size of hex-encoded format
+            - type_size: Size of hex-encoded type
+            - data_size: Size of hex-encoded data
+            - structural_overhead: Fixed overhead for JSON structure
+            - total_size: Total size including all components
+    """
+    format_size = len(str_to_hex(memo_format))
+    type_size = len(str_to_hex(memo_type))
+    data_size = len(str_to_hex(memo_data))
+    structural_overhead = constants.XRP_MEMO_STRUCTURAL_OVERHEAD
+
+    logger.debug(f"Memo size breakdown:")
+    logger.debug(f"  format_size: {format_size}")
+    logger.debug(f"  type_size: {type_size}")
+    logger.debug(f"  data_size: {data_size}")
+    logger.debug(f"  structural_overhead: {structural_overhead}")
+    logger.debug(f"  total_size: {format_size + type_size + data_size + structural_overhead}")
+
+    return {
+        'format_size': format_size,
+        'type_size': type_size,
+        'data_size': data_size,
+        'structural_overhead': structural_overhead,
+        'total_size': format_size + type_size + data_size + structural_overhead
+    }
 
 def to_hex(string):
     return binascii.hexlify(string.encode()).decode()
 
 def construct_handshake_memo(user, ecdh_public_key) -> str:
-    return construct_memo(user=user, memo_type=SystemMemoType.HANDSHAKE.value, memo_data=ecdh_public_key)
+    return construct_memo(memo_format=user, memo_type=SystemMemoType.HANDSHAKE.value, memo_data=ecdh_public_key)
 
 def construct_basic_postfiat_memo(user, task_id, full_output):
-    return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
+    return construct_memo(memo_format=user, memo_type=task_id, memo_data=full_output)
 
 def construct_initiation_rite_memo(user='goodalexander', commitment='I commit to generating massive trading profits using AI and investing them to grow the Post Fiat Network'):
-    return construct_memo(user=user, memo_type=SystemMemoType.INITIATION_RITE.value, memo_data=commitment)
+    return construct_memo(memo_format=user, memo_type=SystemMemoType.INITIATION_RITE.value, memo_data=commitment)
 
 def construct_google_doc_context_memo(user, google_doc_link):                  
-    return construct_memo(user=user, memo_type=SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, memo_data=google_doc_link) 
+    return construct_memo(memo_format=user, memo_type=SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value, memo_data=google_doc_link) 
 
-def construct_genesis_memo(user, task_id, full_output):
-    return construct_memo(user=user, memo_type=task_id, memo_data=full_output)
+def construct_memo(memo_format, memo_type, memo_data, validate_size=False):
+    """Constructs a memo object, checking total size"""
+    # NOTE: This is a hack and appears too conservative
+    # NOTE: We don't know if this is the correct way calculate the XRPL size limits
+    # NOTE: This will raise an error even when a transaction might otherwise succeed
+    if validate_size:
+        size_info = calculate_memo_size(memo_format, memo_type, memo_data)
+        if is_over_1kb(size_info['total_size']):
+            raise ValueError(f"Memo exceeds 1 KB, raising ValueError: {size_info['total_size']}")
 
-def construct_memo(user, memo_type, memo_data):
-
-    if is_over_1kb(memo_data):
-        raise ValueError("Memo exceeds 1 KB, raising ValueError")
+    # Convert to hex
+    hex_format = to_hex(memo_format)
+    hex_type = to_hex(memo_type)
+    hex_data = to_hex(memo_data)
 
     return Memo(
-        memo_data=to_hex(memo_data),
-        memo_type=to_hex(memo_type),
-        memo_format=to_hex(user)
+        memo_data=hex_data,
+        memo_type=hex_type,
+        memo_format=hex_format
     )
 
 def get_xrp_balance(network_url, address):
@@ -2152,17 +2460,17 @@ class InvalidGoogleDocException(Exception):
         self.google_url = google_url
         super().__init__(f"Invalid Google Doc URL: {google_url}")
 
-class GoogleDocDoesNotContainXrpAddressException(Exception):
-    """ This exception is raised when the google doc does not contain the XRP address """
-    def __init__(self, xrp_address):
-        self.xrp_address = xrp_address
-        super().__init__(f"Google Doc does not contain expected XRP address: {xrp_address}")
+# class GoogleDocDoesNotContainXrpAddressException(Exception):
+#     """ This exception is raised when the google doc does not contain the XRP address """
+#     def __init__(self, xrp_address):
+#         self.xrp_address = xrp_address
+#         super().__init__(f"Google Doc does not contain expected XRP address: {xrp_address}")
 
-class GoogleDocIsNotFundedException(Exception):
-    """ This exception is raised when the google doc's XRP address is not funded """
-    def __init__(self, google_url):
-        self.google_url = google_url
-        super().__init__(f"Google Doc's XRP address is not funded: {google_url}")
+# class GoogleDocIsNotFundedException(Exception):
+#     """ This exception is raised when the google doc's XRP address is not funded """
+#     def __init__(self, google_url):
+#         self.google_url = google_url
+#         super().__init__(f"Google Doc's XRP address is not funded: {google_url}")
 
 class GoogleDocIsNotSharedException(Exception):
     """ This exception is raised when the google doc is not shared """

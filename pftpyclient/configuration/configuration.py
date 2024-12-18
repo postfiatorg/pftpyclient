@@ -3,9 +3,7 @@ import json
 from loguru import logger
 from enum import Enum
 from typing import Optional, List
-from pftpyclient.configuration.address_types import AddressType, PFT_REQUIREMENTS
 from dataclasses import dataclass
-from decimal import Decimal
 
 USER_CONFIG = {
     # template for per-user preferences
@@ -118,10 +116,16 @@ class ConfigurationManager:
             
         # Add to front of queue
         endpoints.insert(0, endpoint)
+
+        # Keep only last 5 endpoints
+        endpoints = endpoints[:5]
         
-        # Keep only last 3
+        # Ensure the endpoint is saved
         self.config['global'][key] = endpoints
         self._save_config(self.config)
+
+        # Reload config
+        self.config = self._load_config()
 
 @dataclass
 class NetworkConfig:
@@ -137,21 +141,6 @@ class NetworkConfig:
     explorer_tx_url_mask: str
     explorer_account_url_mask: str
     local_rpc_url: Optional[str] = None
-
-    def get_address_type(self, address: str) -> AddressType:
-        """Get the type of address"""
-        if address == self.node_address:
-            return AddressType.NODE
-        elif address == self.remembrancer_address:
-            return AddressType.REMEMBRANCER
-        elif address == self.issuer_address:
-            return AddressType.ISSUER
-        else:
-            return AddressType.OTHER
-        
-    def get_pft_requirement(self, address: str) -> Decimal:
-        """Get the PFT requirement for an address"""
-        return Decimal(PFT_REQUIREMENTS[self.get_address_type(address)])
 
 XRPL_MAINNET = NetworkConfig(
     name="mainnet",
@@ -186,6 +175,7 @@ XRPL_TESTNET = NetworkConfig(
         "wss://s.altnet.rippletest.net:51233"
     ],
     public_rpc_urls=[
+        "https://clio.altnet.rippletest.net:51234/",
         "https://testnet.xrpl-labs.com/",
         "https://s.altnet.rippletest.net:51234"
     ],
