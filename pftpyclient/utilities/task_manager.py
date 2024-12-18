@@ -395,14 +395,24 @@ class PostFiatTaskManager:
         # Convert ripple timestamp to datetime
         memo_tx_df['datetime']= memo_tx_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
         
-        # Extract ledger index
-        memo_tx_df['ledger_index'] = memo_tx_df['tx_json'].apply(lambda x: x['ledger_index'])
+        # Get ledger_index from either tx_json or root level
+        memo_tx_df['ledger_index'] = memo_tx_df.apply(
+            lambda row: row['tx_json'].get('ledger_index', row.get('ledger_index')), 
+            axis=1
+        )
 
         # Flag rows with PFT
         memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
 
         # Concatenate new memos to existing memos and drop duplicates
-        self.memo_transactions = pd.concat([self.memo_transactions, memo_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
+        if not memo_tx_df.empty:
+            if self.memo_transactions.empty:
+                self.memo_transactions = memo_tx_df
+            else:
+                self.memo_transactions = pd.concat(
+                    [self.memo_transactions, memo_tx_df], 
+                    ignore_index=True
+                ).drop_duplicates(subset=['hash'])
 
         logger.debug(f"Added {len(memo_tx_df)} memos to local memos dataframe")
 
@@ -789,8 +799,11 @@ class PostFiatTaskManager:
         - handshake_sent: Whether we've already sent our public key
         - received_key: Their ECDH public key if they've sent it, None otherwise
         """
-        if self.handshake_cache.get(address):
-            return self.handshake_cache[address]
+        
+        # attempt handshake cache first
+        handshake_sent, received_key = self.handshake_cache.get(address, (False, None))
+        if handshake_sent and received_key is not None:
+            return handshake_sent, received_key
 
         if self.system_memos.empty:
             logger.debug("No system memos found")
@@ -1351,9 +1364,17 @@ class PostFiatTaskManager:
 
             try:
                 response = client.request(request)
+                
+                # debugging
+                logger.debug(f"Full XRPL response: {response}")
+
                 if response.is_successful():
                     transactions = response.result.get("transactions", [])
                     logger.debug(f"Retrieved {len(transactions)} transactions")
+
+                    # debugging
+                    logger.debug(f"Full websocket transaction message: {transactions}")
+
                     all_transactions.extend(transactions)
                 else:
                     logger.error(f"Error in XRPL response: {response}")

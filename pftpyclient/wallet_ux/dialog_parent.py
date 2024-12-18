@@ -6,6 +6,16 @@ class WalletDialogParent(Protocol):
     """Protocol defining the interface that dialogs need from WalletApp"""
 
     @property
+    def ws_url(self) -> str:
+        """Access to the WebSocket URL"""
+        ...
+
+    @property
+    def network_url(self) -> str:
+        """Access to the XRPL network URL"""
+        ...
+
+    @property
     def task_manager(self) -> PostFiatTaskManager:
         """Access to the task manager"""
         ...
@@ -31,13 +41,27 @@ class WalletDialogParent(Protocol):
         ...
     
     def try_connect_endpoint(self, endpoint: str) -> bool:
-        """Try to connect to a new XRPL endpoint
+        """
+        Attempt to connect to a new RPC endpoint with timeout.
         
         Args:
-            endpoint: URL of the endpoint to connect to
+            endpoint: The RPC endpoint URL to test
+            timeout: Maximum time to wait for connection in seconds
             
         Returns:
-            True if connection successful, False otherwise
+            bool: True if connection successful, False otherwise
+        """
+        ...
+
+    def try_connect_ws_endpoint(self, endpoint: str) -> bool:
+        """
+        Attempt to connect to a new WebSocket endpoint.
+        
+        Args:
+            endpoint: The WebSocket endpoint URL to test
+            
+        Returns:
+            bool: True if connection successful, False otherwise
         """
         ...
     
@@ -51,4 +75,8 @@ class WalletDialogParent(Protocol):
 
     def update_all_destination_comboboxes(self) -> None:
         """Update all comboboxes containing destination addresses"""
+        ...
+
+    def restart_xrpl_monitor(self) -> None:
+        """Restart the XRPL monitor thread"""
         ...
