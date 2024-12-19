@@ -591,7 +591,6 @@ class WalletApp(wx.Frame):
         self.proposals_grid.EnableEditing(False)
         self.proposals_grid.SetSelectionMode(gridlib.Grid.SelectRows)
         self.proposals_grid.Bind(gridlib.EVT_GRID_SELECT_CELL, self.on_proposal_selection)  # Bind selection event
-        self.proposals_grid.SetDefaultCellBackgroundColour(wx.WHITE)
         self.proposals_sizer.Add(self.proposals_grid, 1, wx.EXPAND | wx.ALL, 20)
 
         # Store reference to proposals tab page
