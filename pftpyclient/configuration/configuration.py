@@ -211,6 +211,7 @@ XRPL_MAINNET = NetworkConfig(
     remembrancer_address="rJ1mBMhEBKack5uTQvM8vWoAntbufyG9Yn",
     issuer_address="rnQUEEg8yyjrwk9FhyXpKavHyCRJM9BDMW",
     websockets=[
+        "wss://xrpl.postfiat.org:6007",
         "wss://xrplcluster.com", 
         "wss://xrpl.ws/", 
         "wss://s1.ripple.com/", 
