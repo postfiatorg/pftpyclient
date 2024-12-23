@@ -1,15 +1,30 @@
+# Standard library imports
 import time
+import traceback
+import random
+import urllib.parse
+import asyncio
+import os
+import re
+from threading import Thread, Event
+from pathlib import Path
+from enum import Enum, auto
+
+# Third-party imports
 import wx
 import wx.adv
 import wx.grid as gridlib
 import wx.html
+import wx.lib.newevent
 import xrpl
 from xrpl.wallet import Wallet
 from xrpl.asyncio.clients import AsyncWebsocketClient
-import asyncio
-from threading import Thread, Event
-import wx.lib.newevent
+from loguru import logger
+from cryptography.fernet import InvalidToken
+import pandas as pd
 import nest_asyncio
+
+# PftPyclient imports
 from pftpyclient.utilities.wallet_state import (
     WalletState, 
     requires_wallet_state,
@@ -25,24 +40,14 @@ from pftpyclient.utilities.task_manager import (
     construct_memo
 )
 from pftpyclient.user_login.credentials import CredentialManager
-import os
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
 import pftpyclient.configuration.constants as constants
-from loguru import logger
-from pathlib import Path
-from cryptography.fernet import InvalidToken
-import pandas as pd
-from enum import Enum, auto
 from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
-import traceback
-import random
-import urllib.parse
-
-
 from pftpyclient.wallet_ux.dialogs import *
 from pftpyclient.wallet_ux.dialogs import CustomDialog
+from pftpyclient.version import VERSION
 
 # Configure the logger at module level
 wx_sink = configure_logger(
@@ -124,6 +129,32 @@ class XRPLMonitorThread(Thread):
     def stop(self):
         """Signal the thread to stop"""
         self._stop_event.set()
+
+        # Close websocket connection if it exists
+        if hasattr(self, 'client') and self.client:
+            # Use the worker's existing loop to close
+            future = asyncio.run_coroutine_threadsafe(
+                self.client.close(),
+                self.loop
+            )
+            try:
+                # Wait for the websocket to close with a timeout
+                future.result(timeout=2)
+            except Exception:
+                pass  # Ignore timeout or other errors during close
+
+        # Cancel any pending tasks
+        pending_tasks = asyncio.all_tasks(self.loop)
+        for task in pending_tasks:
+            task.cancel()
+
+        # Stop the event loop
+        try:
+            self.loop.call_soon_threadsafe(
+                lambda: self.loop.stop()
+            )
+        except Exception as e:
+            pass  # Ignore any errors during loop stop
 
     def stopped(self):
         """Check if the thread has been signaled to stop"""
@@ -267,9 +298,11 @@ class XRPLMonitorThread(Thread):
                 ))
 
                 if response.is_successful():
-                    wx.CallAfter(self.gui.update_account, response.result["account_data"])
-                    wx.CallAfter(self.gui.run_bg_job, self.gui.update_tokens)
-                    wx.CallAfter(self.gui.refresh_grids)
+                    def update_all():
+                        self.gui.update_account(response.result["account_data"])
+                        self.gui.update_tokens()
+                        self.gui.refresh_grids()
+                    wx.CallAfter(update_all)
                 else:
                     logger.error(f"Failed to get account info: {response.result}")
             
@@ -342,7 +375,7 @@ class WalletApp(wx.Frame):
     }
 
     def __init__(self):
-        wx.Frame.__init__(self, None, title="Post Fiat Client Wallet Beta v.0.1", size=(1150, 700))
+        wx.Frame.__init__(self, None, title=f"PftPyClient v{VERSION}", size=(1150, 700))
         self.default_size = (1150, 700)
         self.min_size = (800, 600)
         self.max_size = (1600, 1000)
@@ -1028,6 +1061,15 @@ class WalletApp(wx.Frame):
             # Manual entry - use raw text value
             destination = self.txt_payment_destination.GetValue()
 
+        try:
+            destination = self.validate_address(destination)
+        except ValueError as e:
+            logger.error(f"Error validating address: {e}")
+            wx.MessageBox(f"Recipient address is invalid: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            self.btn_send.SetLabel("Send")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
+            return
+
         memo = self.txt_payment_memo.GetValue()
         destination_tag = self.txt_destination_tag.GetValue()
 
@@ -1690,24 +1732,11 @@ class WalletApp(wx.Frame):
             logger.exception(f"Exception in update_tokens: {e}")
 
     def on_close(self, event):
-        if self.worker:
-            self.worker.loop.stop()
-
+        self.logout()
         if self.perf_monitor:
             self.perf_monitor.stop()
             self.perf_monitor = None
-
         self.Destroy()
-
-    # def start_pft_update_timer(self):
-    #     self.pft_update_timer = wx.Timer(self)
-    #     self.Bind(wx.EVT_TIMER, self.on_pft_update_timer, self.pft_update_timer)
-    #     self.pft_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
-
-    # def start_transaction_update_timer(self):
-    #     self.tx_update_timer = wx.Timer(self)
-    #     self.Bind(wx.EVT_TIMER, self.on_transaction_update_timer, self.tx_update_timer)
-    #     self.tx_update_timer.Start(constants.UPDATE_TIMER_INTERVAL_SEC * 1000)
 
     def _sync_and_refresh(self):
         """Internal method to sync transactions and refresh grids"""
@@ -1723,14 +1752,6 @@ class WalletApp(wx.Frame):
             logger.error(f"Error during sync and refresh cycle: {e}")
             self.set_wallet_ui_state(WalletUIState.IDLE, f"Sync error: {e}")
             raise
-
-    # def on_transaction_update_timer(self, _):
-    #     """Timer-triggered update"""
-    #     logger.debug("Transaction update timer triggered")
-    #     try:
-    #         self._sync_and_refresh()
-    #     except Exception as e:
-    #         logger.error(f"Timer update failed: {e}")
     
     def on_force_update(self, _):
         """Handle manual force update requests"""
@@ -2374,6 +2395,15 @@ class WalletApp(wx.Frame):
         self.btn_log_pomodoro.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
+    def validate_address(self, address: str) -> Optional[str]:
+        """Validate and clean up the XRP address"""
+        # Match an XRP address: r followed by 24-34 alphanumeric characters
+        xrp_match = re.search(r'r[a-zA-Z0-9]{24,34}', address)
+        if xrp_match:
+            return xrp_match.group()
+        else:
+            raise ValueError(f"Invalid XRP address: {address}")
+
     def on_submit_memo(self, event):
         """Submits a memo."""
         self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Submitting Memo...")
@@ -2385,12 +2415,22 @@ class WalletApp(wx.Frame):
 
         # Get selected recipient data
         recipient_idx = self.memo_recipient.GetSelection()
+        logger.debug(f"Recipient index: {recipient_idx}")
         if recipient_idx != wx.NOT_FOUND:
             recipient = self.memo_recipient.GetClientData(recipient_idx)
+            logger.debug(f"Getting client data for recipient index {recipient_idx}: recipient {recipient}")
         else:
             recipient = self.memo_recipient.GetValue()
+            logger.debug(f"Recipient index not found. Using value: {recipient}")
 
-        logger.debug(f"Selected recipient address: {recipient}")
+        try:
+            recipient = self.validate_address(recipient)
+        except ValueError as e:
+            logger.error(f"Error validating recipient: {e}")
+            wx.MessageBox(f"Recipient address is invalid: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            self.btn_submit_memo.SetLabel("Submit Memo")
+            self.set_wallet_ui_state(WalletUIState.IDLE)
+            return
 
         encrypt = self.memo_chk_encrypt.IsChecked()
 
@@ -2464,7 +2504,10 @@ class WalletApp(wx.Frame):
 
             message = (
                 f"Memo will be {"encrypted, " if encrypt else ""}compressed and sent over {num_chunks} transaction(s) and "
-                f"cost 1 PFT per chunk ({num_chunks} PFT + {num_chunks * constants.MIN_XRP_PER_TRANSACTION} XRP total). Continue?"
+                f"cost 1 PFT per chunk ({num_chunks} PFT + {num_chunks * constants.MIN_XRP_PER_TRANSACTION} XRP total).\n\n"
+                f"Destination XRP Address: {recipient}\n"
+                f"Memo: {memo_text[:20]}{'...' if len(memo_text) > 20 else ''}\n\n"
+                f"Continue?"
             )
             if wx.NO == wx.MessageBox(message, "Confirmation", wx.YES_NO | wx.ICON_QUESTION):
                 self.btn_submit_memo.SetLabel("Submit Memo")
@@ -2793,23 +2836,7 @@ class WalletApp(wx.Frame):
 
             # Stop background processes
             if hasattr(self, 'worker') and self.worker:
-                # Signal the worker to stop
                 self.worker.stop()
-
-                # Cancel any pending tasks
-                pending_tasks = asyncio.all_tasks(self.worker.loop)
-                for task in pending_tasks:
-                    task.cancel()
-
-                # Run the loop one last time to process cancellations
-                if pending_tasks:
-                    try:
-                        self.worker.loop.call_soon_threadsafe(
-                            lambda: self.worker.loop.stop()
-                        )
-                    except Exception as e:
-                        pass  # Ignore any errors during loop stop
-            
                 # Wait for thread to complete (with timeout)
                 self.worker.join(timeout=2)
                 if self.worker.is_alive():
