@@ -1,6 +1,7 @@
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages # type: ignore
 import os
 import sys
+from pftpyclient.version import VERSION
 
 def read(fname):
     return open(os.path.join(os.path.dirname(__file__), fname)).read()
@@ -31,7 +32,7 @@ if sys.platform == 'win32':
 
 setup(
     name='pftpyclient',
-    version='0.1.0',
+    version=VERSION,
     packages=find_packages(),
     install_requires=install_requires,
     author='PFAdmin',
