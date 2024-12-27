@@ -1196,6 +1196,7 @@ class WalletApp(wx.Frame):
         secret_input_sizer.Add(self.create_txt_xrp_secret, 1, wx.EXPAND | wx.RIGHT, 10)
         self.chk_show_secret = wx.CheckBox(content_panel, label="Show Secret")
         secret_input_sizer.Add(self.chk_show_secret, 0, wx.ALIGN_CENTER_VERTICAL)
+        self.chk_show_secret.Bind(wx.EVT_CHECKBOX, self.on_toggle_secret_visibility_user_details)
         
         secret_sizer.Add(secret_input_sizer, 1, wx.EXPAND)
         content_sizer.Add(secret_sizer, 0, wx.ALL | wx.EXPAND, 10)
