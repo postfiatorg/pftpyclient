@@ -1533,7 +1533,7 @@ class WalletApp(wx.Frame):
         match current_state:
             case WalletState.UNFUNDED:
                 message = (
-                    "To activate your wallet, you need \nto send at least 20 XRP to your address. \n\n"
+                    "To activate your wallet, you need \nto send at least 1 XRP to your address. \n\n"
                     f"Your XRP address:\n\n{self.wallet.classic_address}\n\n"
                 )
                 dialog = SelectableMessageDialog(self, "Fund Your Wallet", message)

@@ -15,6 +15,7 @@ from typing import Union, Optional
 import traceback
 from typing import List
 import math
+import traceback
 
 # Third-party imports
 import xrpl
@@ -735,6 +736,7 @@ class PostFiatTaskManager:
         except Exception as e:
             response = f"Unexpected error: {e}"
             logger.error(response)
+            logger.error(traceback.format_exc())
 
         return response
     
@@ -1129,6 +1131,7 @@ class PostFiatTaskManager:
         except Exception as e:
             response = f"Unexpected error: {e}"
             logger.error(response)
+            logger.error(traceback.format_exc())
 
         return response
 
