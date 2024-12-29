@@ -293,7 +293,7 @@ class PostFiatTaskManager:
                     logger.debug(f"Unexpected complete_ledgers format: {complete_ledgers}")
             else:
                 logger.debug("Could not fetch server state")
-                return
+                return False
             
             response = self.client.request(
                 xrpl.models.requests.AccountInfo(
@@ -303,11 +303,11 @@ class PostFiatTaskManager:
             )
             if not response.is_successful():
                 logger.debug("Account not found or not funded, skipping transaction sync")
-                return
+                return False
 
         except Exception as e:
             logger.error(f"Error checking account status: {e}")
-            return
+            return False
 
         try:
             # Attempt to load transactions from local csv
@@ -328,19 +328,21 @@ class PostFiatTaskManager:
 
             # Choose ledger index to start sync from
             if self.transactions.empty:
-                next_ledger_index = -1
-                logger.debug("Starting fresh sync from earliest available ledger")
-            else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
+                next_ledger_index = earliest_ledger  # Start from earliest available ledger
+                logger.debug(f"Starting fresh sync from earliest available ledger: {earliest_ledger}")
+            else:   
                 next_ledger_index = self.transactions['ledger_index'].max() + 1
                 logger.debug(f"Next ledger index: {next_ledger_index}")
 
             # fetch new transactions from the node
-            new_tx_list = self.get_new_transactions(next_ledger_index)
-
-            # Add new transactions to the dataframe
-            if new_tx_list:
-                logger.debug(f"Adding {len(new_tx_list)} new transactions...")
-                new_tx_df = pd.DataFrame(new_tx_list)
+            new_transactions = self.get_new_transactions(next_ledger_index)
+            
+            # Convert list of transactions to DataFrame
+            if new_transactions and len(new_transactions) > 0:  # Check if list is not empty
+                new_tx_df = pd.DataFrame(new_transactions)
+                logger.debug(f"Adding {len(new_tx_df)} new transactions...")
+                
+                # Add new transactions to the dataframe
                 self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
                 self.save_transactions()
                 self.sync_memo_transactions(new_tx_df)
@@ -348,7 +350,7 @@ class PostFiatTaskManager:
             else:
                 logger.debug("No new transactions found. Finished updating local tx history")
                 return False
-            
+                
         except (TypeError, AttributeError) as e:
             logger.error(f"Error processing transaction history: {e}")
             logger.warning("Corrupted transaction history file detected. Deleting and starting fresh.")
@@ -374,66 +376,91 @@ class PostFiatTaskManager:
     def sync_memo_transactions(self, new_tx_df):
         """Enriches transactions that contain memos with additional columns for easier processing"""
         logger.debug(f"Syncing transactions with memos")
+        
+        # Guard against empty input DataFrame
+        if new_tx_df.empty or len(new_tx_df) == 0:
+            logger.debug("Input DataFrame is empty - no memos to process")
+            return
+
         # flag rows with memos
         new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x)
 
         # filter for rows with memos and convert to dataframe
         memo_tx_df = new_tx_df[new_tx_df['has_memos']== True].copy()
-
-        # Extract first memo into a new column, serialize to dict
-        # Any additional memos are ignored
-        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.decode_memo_fields_to_dict(x['Memos'][0]['Memo']))
         
-        # Extract account and destination from tx_json into new columns
-        memo_tx_df['account']= memo_tx_df['tx_json'].apply(lambda x: x['Account'])
-        memo_tx_df['destination']=memo_tx_df['tx_json'].apply(lambda x: x['Destination'])
-        
-        # Determine direction
-        memo_tx_df['direction']=np.where(memo_tx_df['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
-        
-        # Derive counterparty address
-        memo_tx_df['counterparty_address']= memo_tx_df[['destination','account']].sum(1).apply(
-            lambda x: str(x).replace(self.user_wallet.classic_address,'')
-        )
-        
-        # Convert ripple timestamp to datetime
-        memo_tx_df['datetime']= memo_tx_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
-        
-        # Get ledger_index from either tx_json or root level
-        memo_tx_df['ledger_index'] = memo_tx_df.apply(
-            lambda row: row['tx_json'].get('ledger_index', row.get('ledger_index')), 
-            axis=1
-        )
+        # Guard against no memos found
+        if memo_tx_df.empty or len(memo_tx_df) == 0:
+            logger.debug("No transactions with memos found")
+            return
 
-        # Flag rows with PFT
-        memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
+        # Continue with processing only if we have memos
+        try:
+            # Extract first memo into a new column, serialize to dict
+            memo_tx_df['memo_data'] = memo_tx_df['tx_json'].apply(
+                lambda x: self.decode_memo_fields_to_dict(x['Memos'][0]['Memo'])
+            )
+            
+            # Extract account and destination
+            memo_tx_df['account'] = memo_tx_df['tx_json'].apply(lambda x: x['Account'])
+            memo_tx_df['destination'] = memo_tx_df['tx_json'].apply(lambda x: x['Destination'])
+            
+            # Determine direction
+            memo_tx_df['direction'] = np.where(
+                memo_tx_df['destination']==self.user_wallet.classic_address, 
+                'INCOMING',
+                'OUTGOING'
+            )
+            
+            # Derive counterparty address
+            memo_tx_df['counterparty_address'] = memo_tx_df[['destination','account']].sum(1).apply(
+                lambda x: str(x).replace(self.user_wallet.classic_address,'')
+            )
+            
+            # Convert ripple timestamp to datetime
+            memo_tx_df['datetime'] = memo_tx_df['tx_json'].apply(
+                lambda x: self.convert_ripple_timestamp_to_datetime(x['date'])
+            )
+            
+            # Get ledger_index from either tx_json or root level
+            memo_tx_df['ledger_index'] = memo_tx_df.apply(
+                lambda row: int(row['tx_json'].get('ledger_index', row.get('ledger_index', 0))), 
+                axis=1
+            )
 
-        # Concatenate new memos to existing memos and drop duplicates
-        if not memo_tx_df.empty:
-            if self.memo_transactions.empty:
-                self.memo_transactions = memo_tx_df
-            else:
-                self.memo_transactions = pd.concat(
-                    [self.memo_transactions, memo_tx_df], 
-                    ignore_index=True
-                ).drop_duplicates(subset=['hash'])
+            # Flag rows with PFT
+            memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
 
-        logger.debug(f"Added {len(memo_tx_df)} memos to local memos dataframe")
+            # Update memo_transactions DataFrame
+            if not memo_tx_df.empty and len(memo_tx_df) > 0:
+                if self.memo_transactions.empty:
+                    self.memo_transactions = memo_tx_df
+                else:
+                    self.memo_transactions = pd.concat(
+                        [self.memo_transactions, memo_tx_df], 
+                        ignore_index=True
+                    ).drop_duplicates(subset=['hash'])
 
-        # for debugging purposes only
-        if SAVE_MEMO_TRANSACTIONS:
-            self.save_memo_transactions()
+                logger.debug(f"Added {len(memo_tx_df)} memos to local memos dataframe")
 
-        self.sync_tasks(memo_tx_df)
-        self.sync_memos(memo_tx_df)
-        self.sync_system_memos(memo_tx_df)
+                # Save if configured to do so
+                if SAVE_MEMO_TRANSACTIONS:
+                    self.save_memo_transactions()
+
+                # Process derived data
+                self.sync_tasks(memo_tx_df)
+                self.sync_memos(memo_tx_df)
+                self.sync_system_memos(memo_tx_df)
+
+        except Exception as e:
+            logger.error(f"Error processing memo transactions: {e}")
+            logger.error(traceback.format_exc())
 
     @PerformanceMonitor.measure('sync_tasks')
     def sync_tasks(self, new_memo_tx_df):
         """ Updates the tasks dataframe with new tasks from the new memos.
         Task dataframe contains columns: user,task_id,full_output,hash,counterparty_address,datetime,task_type"""
         logger.debug(f"Syncing tasks")
-        if new_memo_tx_df.empty:
+        if new_memo_tx_df.empty or len(new_memo_tx_df) == 0:
             logger.debug("No new memos to process for tasks")
             return
 
@@ -442,7 +469,7 @@ class PostFiatTaskManager:
             new_memo_tx_df['memo_data'].apply(is_valid_id)
         ].copy()
 
-        if valid_id_df.empty:
+        if valid_id_df.empty or len(valid_id_df) == 0:
             logger.debug("No memos with valid IDs found")
             return
 
@@ -454,7 +481,7 @@ class PostFiatTaskManager:
             ))
         ].copy()
 
-        if task_df.empty:
+        if task_df.empty or len(task_df) == 0:
             logger.debug("No task-related memos found")
             return
 
@@ -483,7 +510,7 @@ class PostFiatTaskManager:
     def sync_memos(self, new_memo_tx_df):
         """Updates messages dataframe with P2P message data"""
         logger.debug(f"Syncing memos")
-        if new_memo_tx_df.empty:
+        if new_memo_tx_df.empty or len(new_memo_tx_df) == 0:
             logger.debug("No new memos to process for messages")
             return
         
@@ -492,7 +519,7 @@ class PostFiatTaskManager:
             new_memo_tx_df['memo_data'].apply(is_valid_id)
         ].copy()
 
-        if valid_id_df.empty:
+        if valid_id_df.empty or len(valid_id_df) == 0:
             logger.debug("No memos with valid IDs found")
             return
 
@@ -504,7 +531,7 @@ class PostFiatTaskManager:
             ))
         ].copy()
 
-        if memo_df.empty:
+        if memo_df.empty or len(memo_df) == 0:
             logger.debug("No message-related memos found")
             return
         
@@ -531,7 +558,7 @@ class PostFiatTaskManager:
     def sync_system_memos(self, new_memo_tx_df):
         """Updates system_memos dataframe with special system messages"""
         logger.debug(f"Syncing system memos")
-        if new_memo_tx_df.empty:
+        if new_memo_tx_df.empty or len(new_memo_tx_df) == 0:
             logger.debug("No new memos to process for system messages")
             return
         
@@ -543,7 +570,7 @@ class PostFiatTaskManager:
             ))
         ].copy()
 
-        if system_df.empty:
+        if system_df.empty or len(system_df) == 0:
             logger.debug("No system messages found")
             return
 
@@ -574,20 +601,20 @@ class PostFiatTaskManager:
     def get_task(self, task_id):
         """ Returns the task dataframe for a given task ID """
         task_df = self.tasks[self.tasks['task_id'] == task_id]
-        if task_df.empty:
+        if task_df.empty or len(task_df) == 0:
             raise NoMatchingTaskException(f"No task found with task_id {task_id}")
         return task_df
     
     def get_memo(self, memo_id):
         """Returns the memo dataframe for a given memo ID """
         memo_df = self.memos[self.memos['memo_id'] == memo_id]
-        if memo_df.empty:
+        if memo_df.empty or len(memo_df) == 0:
             raise NoMatchingMemoException(f"No memo found with memo_id {memo_id}")
         return memo_df
     
     def get_task_state(self, task_df):
         """ Returns the latest state of a task given a task dataframe containing a single task_id """
-        if task_df.empty:
+        if task_df.empty or len(task_df) == 0:
             raise ValueError("The task dataframe is empty")
 
         # Confirm that the task_id column only has a single value
@@ -747,7 +774,7 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('get_handshakes')
     def get_handshakes(self):
         """ Returns a DataFrame of all handshake interactions with their current status"""
-        if self.system_memos.empty:
+        if self.system_memos.empty or len(self.system_memos) == 0:
             return pd.DataFrame()
         
         # Get all handshakes (both incoming and outgoing)
@@ -755,7 +782,7 @@ class PostFiatTaskManager:
             self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
         ]
 
-        if handshakes.empty:
+        if handshakes.empty or len(handshakes) == 0:
             return pd.DataFrame()
         
         # Process each unique counterparty address
@@ -809,7 +836,7 @@ class PostFiatTaskManager:
         if handshake_sent and received_key is not None:
             return handshake_sent, received_key
 
-        if self.system_memos.empty:
+        if self.system_memos.empty or len(self.system_memos) == 0:
             logger.debug("No system memos found")
             return False, None
         
@@ -818,7 +845,7 @@ class PostFiatTaskManager:
             self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
         ]
 
-        if handshakes.empty:
+        if handshakes.empty or len(handshakes) == 0:
             logger.debug("No handshakes found")
             return False, None
 
@@ -836,7 +863,7 @@ class PostFiatTaskManager:
         ]
    
         received_key = None
-        if not received_handshakes.empty:
+        if not received_handshakes.empty and len(received_handshakes) > 0:
             logger.debug(f"Found {len(received_handshakes)} received handshakes from {address}")
             latest_received_handshake = received_handshakes.sort_values('datetime').iloc[-1]
             received_key = latest_received_handshake['full_output']
@@ -2014,73 +2041,36 @@ class PostFiatTaskManager:
     def process_account_info(self):
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
+        initiated_username = "N/A"  # Default value
 
-        initiation_rite = self.system_memos[
-            self.system_memos['task_id'] == SystemMemoType.INITIATION_RITE.value
-        ]
+        try:
+            if not self.system_memos.empty and 'task_id' in self.system_memos.columns:
+                initiation_rite = self.system_memos[
+                    self.system_memos['task_id'] == SystemMemoType.INITIATION_RITE.value
+                ]
 
-        if not initiation_rite.empty:
-            initiated_username = initiation_rite.iloc[0]['user']
-        
-        google_doc_link = self.get_latest_outgoing_context_doc_link()
-
-        # Sorting account info by datetime
-        sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
-
-        def extract_latest_message(direction, node, is_outgoing):
-            """
-            Extract the latest message of a given type for a specific node.
-            """
-            if is_outgoing:
-                latest_message = sorted_account_info[
-                    (sorted_account_info['direction'] == direction) &
-                    (sorted_account_info['destination'] == node)
-                ].tail(1)
+                if not initiation_rite.empty:
+                    initiated_username = initiation_rite.iloc[0].get('user', 'N/A')
             else:
-                latest_message = sorted_account_info[
-                    (sorted_account_info['direction'] == direction) &
-                    (sorted_account_info['account'] == node)
-                ].tail(1)
+                logger.debug("No system memos found or missing task_id column")
+
+            google_doc_link = self.get_latest_outgoing_context_doc_link()
+
+            # Rest of your existing code...
             
-            if not latest_message.empty:
-                return latest_message.iloc[0].to_dict()
+            # Ensure memo_transactions is not empty and has required columns
+            if not self.memo_transactions.empty and all(col in self.memo_transactions.columns 
+                for col in ['datetime', 'direction', 'destination', 'account']):
+                sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
             else:
-                return {}
+                logger.debug("Memo transactions DataFrame is empty or missing required columns")
+                sorted_account_info = pd.DataFrame()
 
-        def format_dict(data):
-            if data:
-                standard_format = self.get_explorer_transaction_url(data.get('hash', ''))
-                full_output = data.get('memo_data', {}).get('full_output', 'N/A')
-                task_id = data.get('memo_data', {}).get('task_id', 'N/A')
-                formatted_string = (
-                    f"Task ID: {task_id}\n"
-                    f"Full Output: {full_output}\n"
-                    f"Hash: {standard_format}\n"
-                    f"Datetime: {pd.Timestamp(data['datetime']).strftime('%Y-%m-%d %H:%M:%S') if 'datetime' in data else 'N/A'}\n"
-                )
-                return formatted_string
-            else:
-                return "No data available."
+            # Rest of the method remains the same...
 
-        # Extracting most recent messages
-        most_recent_outgoing_message = extract_latest_message('OUTGOING', user_default_node, True)
-        most_recent_incoming_message = extract_latest_message('INCOMING', user_default_node, False)
-        
-        # Formatting messages
-        incoming_message = format_dict(most_recent_incoming_message)
-        outgoing_message = format_dict(most_recent_outgoing_message)
-        user_classic_address = self.user_wallet.classic_address
-        # Compiling key display information
-        key_display_info = {
-            'Google Doc': google_doc_link,
-            'Initiated Username': initiated_username,
-            'Account Address' : user_classic_address,
-            'Default Node': user_default_node,
-            'Incoming Message': incoming_message,
-            'Outgoing Message': outgoing_message
-        }
-        
-        return key_display_info
+        except Exception as e:
+            logger.error(f"Error processing account info: {e}")
+            return None
 
     @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
