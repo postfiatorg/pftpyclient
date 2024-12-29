@@ -338,7 +338,7 @@ class PostFiatTaskManager:
             new_transactions = self.get_new_transactions(next_ledger_index)
             
             # Convert list of transactions to DataFrame
-            if new_transactions:  # Check if list is not empty
+            if new_transactions and len(new_transactions) > 0:  # Check if list is not empty
                 new_tx_df = pd.DataFrame(new_transactions)
                 logger.debug(f"Adding {len(new_tx_df)} new transactions...")
                 
@@ -378,7 +378,7 @@ class PostFiatTaskManager:
         logger.debug(f"Syncing transactions with memos")
         
         # Guard against empty input DataFrame
-        if new_tx_df.empty:
+        if new_tx_df.empty or len(new_tx_df) == 0:
             logger.debug("Input DataFrame is empty - no memos to process")
             return
 
@@ -389,7 +389,7 @@ class PostFiatTaskManager:
         memo_tx_df = new_tx_df[new_tx_df['has_memos']== True].copy()
         
         # Guard against no memos found
-        if memo_tx_df.empty:
+        if memo_tx_df.empty or len(memo_tx_df) == 0:
             logger.debug("No transactions with memos found")
             return
 
@@ -431,7 +431,7 @@ class PostFiatTaskManager:
             memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
 
             # Update memo_transactions DataFrame
-            if not memo_tx_df.empty:
+            if not memo_tx_df.empty and len(memo_tx_df) > 0:
                 if self.memo_transactions.empty:
                     self.memo_transactions = memo_tx_df
                 else:
@@ -460,7 +460,7 @@ class PostFiatTaskManager:
         """ Updates the tasks dataframe with new tasks from the new memos.
         Task dataframe contains columns: user,task_id,full_output,hash,counterparty_address,datetime,task_type"""
         logger.debug(f"Syncing tasks")
-        if new_memo_tx_df.empty:
+        if new_memo_tx_df.empty or len(new_memo_tx_df) == 0:
             logger.debug("No new memos to process for tasks")
             return
 
@@ -469,7 +469,7 @@ class PostFiatTaskManager:
             new_memo_tx_df['memo_data'].apply(is_valid_id)
         ].copy()
 
-        if valid_id_df.empty:
+        if valid_id_df.empty or len(valid_id_df) == 0:
             logger.debug("No memos with valid IDs found")
             return
 
@@ -481,7 +481,7 @@ class PostFiatTaskManager:
             ))
         ].copy()
 
-        if task_df.empty:
+        if task_df.empty or len(task_df) == 0:
             logger.debug("No task-related memos found")
             return
 
@@ -510,7 +510,7 @@ class PostFiatTaskManager:
     def sync_memos(self, new_memo_tx_df):
         """Updates messages dataframe with P2P message data"""
         logger.debug(f"Syncing memos")
-        if new_memo_tx_df.empty:
+        if new_memo_tx_df.empty or len(new_memo_tx_df) == 0:
             logger.debug("No new memos to process for messages")
             return
         
@@ -519,7 +519,7 @@ class PostFiatTaskManager:
             new_memo_tx_df['memo_data'].apply(is_valid_id)
         ].copy()
 
-        if valid_id_df.empty:
+        if valid_id_df.empty or len(valid_id_df) == 0:
             logger.debug("No memos with valid IDs found")
             return
 
@@ -531,7 +531,7 @@ class PostFiatTaskManager:
             ))
         ].copy()
 
-        if memo_df.empty:
+        if memo_df.empty or len(memo_df) == 0:
             logger.debug("No message-related memos found")
             return
         
@@ -558,7 +558,7 @@ class PostFiatTaskManager:
     def sync_system_memos(self, new_memo_tx_df):
         """Updates system_memos dataframe with special system messages"""
         logger.debug(f"Syncing system memos")
-        if new_memo_tx_df.empty:
+        if new_memo_tx_df.empty or len(new_memo_tx_df) == 0:
             logger.debug("No new memos to process for system messages")
             return
         
@@ -570,7 +570,7 @@ class PostFiatTaskManager:
             ))
         ].copy()
 
-        if system_df.empty:
+        if system_df.empty or len(system_df) == 0:
             logger.debug("No system messages found")
             return
 
@@ -601,20 +601,20 @@ class PostFiatTaskManager:
     def get_task(self, task_id):
         """ Returns the task dataframe for a given task ID """
         task_df = self.tasks[self.tasks['task_id'] == task_id]
-        if task_df.empty:
+        if task_df.empty or len(task_df) == 0:
             raise NoMatchingTaskException(f"No task found with task_id {task_id}")
         return task_df
     
     def get_memo(self, memo_id):
         """Returns the memo dataframe for a given memo ID """
         memo_df = self.memos[self.memos['memo_id'] == memo_id]
-        if memo_df.empty:
+        if memo_df.empty or len(memo_df) == 0:
             raise NoMatchingMemoException(f"No memo found with memo_id {memo_id}")
         return memo_df
     
     def get_task_state(self, task_df):
         """ Returns the latest state of a task given a task dataframe containing a single task_id """
-        if task_df.empty:
+        if task_df.empty or len(task_df) == 0:
             raise ValueError("The task dataframe is empty")
 
         # Confirm that the task_id column only has a single value
@@ -774,7 +774,7 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('get_handshakes')
     def get_handshakes(self):
         """ Returns a DataFrame of all handshake interactions with their current status"""
-        if self.system_memos.empty:
+        if self.system_memos.empty or len(self.system_memos) == 0:
             return pd.DataFrame()
         
         # Get all handshakes (both incoming and outgoing)
@@ -782,7 +782,7 @@ class PostFiatTaskManager:
             self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
         ]
 
-        if handshakes.empty:
+        if handshakes.empty or len(handshakes) == 0:
             return pd.DataFrame()
         
         # Process each unique counterparty address
@@ -836,7 +836,7 @@ class PostFiatTaskManager:
         if handshake_sent and received_key is not None:
             return handshake_sent, received_key
 
-        if self.system_memos.empty:
+        if self.system_memos.empty or len(self.system_memos) == 0:
             logger.debug("No system memos found")
             return False, None
         
@@ -845,7 +845,7 @@ class PostFiatTaskManager:
             self.system_memos['task_id'].str.contains(SystemMemoType.HANDSHAKE.value, na=False)
         ]
 
-        if handshakes.empty:
+        if handshakes.empty or len(handshakes) == 0:
             logger.debug("No handshakes found")
             return False, None
 
@@ -863,7 +863,7 @@ class PostFiatTaskManager:
         ]
    
         received_key = None
-        if not received_handshakes.empty:
+        if not received_handshakes.empty and len(received_handshakes) > 0:
             logger.debug(f"Found {len(received_handshakes)} received handshakes from {address}")
             latest_received_handshake = received_handshakes.sort_values('datetime').iloc[-1]
             received_key = latest_received_handshake['full_output']
