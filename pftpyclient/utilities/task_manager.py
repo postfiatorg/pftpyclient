@@ -2040,74 +2040,80 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('process_account_info')
     def process_account_info(self):
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
-        user_default_node = self.default_node
 
-        initiation_rite = self.system_memos[
-            self.system_memos['task_id'] == SystemMemoType.INITIATION_RITE.value
-        ]
-
-        if not initiation_rite.empty:
-            initiated_username = initiation_rite.iloc[0]['user']
-        
-        google_doc_link = self.get_latest_outgoing_context_doc_link()
-
-        # Sorting account info by datetime
-        sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
-
-        def extract_latest_message(direction, node, is_outgoing):
-            """
-            Extract the latest message of a given type for a specific node.
-            """
-            if is_outgoing:
-                latest_message = sorted_account_info[
-                    (sorted_account_info['direction'] == direction) &
-                    (sorted_account_info['destination'] == node)
-                ].tail(1)
-            else:
-                latest_message = sorted_account_info[
-                    (sorted_account_info['direction'] == direction) &
-                    (sorted_account_info['account'] == node)
-                ].tail(1)
-            
-            if not latest_message.empty:
-                return latest_message.iloc[0].to_dict()
-            else:
-                return {}
-
-        def format_dict(data):
-            if data:
-                standard_format = self.get_explorer_transaction_url(data.get('hash', ''))
-                full_output = data.get('memo_data', {}).get('full_output', 'N/A')
-                task_id = data.get('memo_data', {}).get('task_id', 'N/A')
-                formatted_string = (
-                    f"Task ID: {task_id}\n"
-                    f"Full Output: {full_output}\n"
-                    f"Hash: {standard_format}\n"
-                    f"Datetime: {pd.Timestamp(data['datetime']).strftime('%Y-%m-%d %H:%M:%S') if 'datetime' in data else 'N/A'}\n"
-                )
-                return formatted_string
-            else:
-                return "No data available."
-
-        # Extracting most recent messages
-        most_recent_outgoing_message = extract_latest_message('OUTGOING', user_default_node, True)
-        most_recent_incoming_message = extract_latest_message('INCOMING', user_default_node, False)
-        
-        # Formatting messages
-        incoming_message = format_dict(most_recent_incoming_message)
-        outgoing_message = format_dict(most_recent_outgoing_message)
-        user_classic_address = self.user_wallet.classic_address
-        # Compiling key display information
-        key_display_info = {
-            'Google Doc': google_doc_link,
-            'Initiated Username': initiated_username,
-            'Account Address' : user_classic_address,
-            'Default Node': user_default_node,
-            'Incoming Message': incoming_message,
-            'Outgoing Message': outgoing_message
+        account_info = {
+            'Account Address': self.user_wallet.classic_address,
+            'Default Node': self.default_node
         }
+
+        try:
+
+            # attempt to retrieve the username from the initiation rite transaction
+            if (not self.system_memos.empty and len(self.system_memos) > 0 and 'task_id' in self.system_memos.columns):
+                initiation_rite = self.system_memos[
+                    self.system_memos['task_id'] == SystemMemoType.INITIATION_RITE.value
+                ]
+                if not initiation_rite.empty:
+                    initiated_username = initiation_rite.iloc[0]['user']
+                    if initiated_username:
+                        account_info['Initiated Username'] = initiated_username
+
+            # attempt to retrieve the decrypted google doc link
+            google_doc_link = self.get_latest_outgoing_context_doc_link()
+            if google_doc_link:
+                account_info['Google Doc'] = google_doc_link
+
+            def extract_latest_message(df, direction, node):
+                """
+                Extract the latest message of a given type for a specific node.
+                """
+                is_outgoing = direction == 'OUTGOING'
+                field = 'destination' if is_outgoing else 'account'
+                latest_message = df[
+                    (df['direction'] == direction) &
+                    (df[field] == node)
+                ].tail(1)
+                
+                if not latest_message.empty:
+                    return latest_message.iloc[0].to_dict()
+                else:
+                    return {}
+
+            def format_dict(data):
+                if data:
+                    standard_format = self.get_explorer_transaction_url(data.get('hash', ''))
+                    full_output = data.get('memo_data', {}).get('full_output', 'N/A')
+                    task_id = data.get('memo_data', {}).get('task_id', 'N/A')
+                    formatted_string = (
+                        f"Task ID: {task_id}\n"
+                        f"Full Output: {full_output}\n"
+                        f"Hash: {standard_format}\n"
+                        f"Datetime: {pd.Timestamp(data['datetime']).strftime('%Y-%m-%d %H:%M:%S') if 'datetime' in data else 'N/A'}\n"
+                    )
+                    return formatted_string
+                else:
+                    return "No data available."
+                
+            # Sorting account info by datetime
+            if not self.memo_transactions.empty and len(self.memo_transactions) > 0 and 'datetime' in self.memo_transactions.columns:
+                sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
+
+                # Extracting most recent messages
+                most_recent_outgoing_message = extract_latest_message(sorted_account_info, 'OUTGOING', self.default_node)
+                most_recent_incoming_message = extract_latest_message(sorted_account_info, 'INCOMING', self.default_node)
+                
+                # Formatting messages
+                incoming_message = format_dict(most_recent_incoming_message)
+                outgoing_message = format_dict(most_recent_outgoing_message)
+                account_info['Incoming Message'] = incoming_message
+                account_info['Outgoing Message'] = outgoing_message
+
+        except Exception as e:
+            logger.error(f"Error processing account info: {e}")
+            logger.error(traceback.format_exc())
         
-        return key_display_info
+        finally:
+            return account_info
 
     @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
