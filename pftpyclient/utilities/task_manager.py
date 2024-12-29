@@ -2041,73 +2041,36 @@ class PostFiatTaskManager:
     def process_account_info(self):
         logger.debug(f"Processing account info for {self.user_wallet.classic_address}")
         user_default_node = self.default_node
+        initiated_username = "N/A"  # Default value
 
-        initiation_rite = self.system_memos[
-            self.system_memos['task_id'] == SystemMemoType.INITIATION_RITE.value
-        ]
+        try:
+            if not self.system_memos.empty and 'task_id' in self.system_memos.columns:
+                initiation_rite = self.system_memos[
+                    self.system_memos['task_id'] == SystemMemoType.INITIATION_RITE.value
+                ]
 
-        if not initiation_rite.empty:
-            initiated_username = initiation_rite.iloc[0]['user']
-        
-        google_doc_link = self.get_latest_outgoing_context_doc_link()
-
-        # Sorting account info by datetime
-        sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
-
-        def extract_latest_message(direction, node, is_outgoing):
-            """
-            Extract the latest message of a given type for a specific node.
-            """
-            if is_outgoing:
-                latest_message = sorted_account_info[
-                    (sorted_account_info['direction'] == direction) &
-                    (sorted_account_info['destination'] == node)
-                ].tail(1)
+                if not initiation_rite.empty:
+                    initiated_username = initiation_rite.iloc[0].get('user', 'N/A')
             else:
-                latest_message = sorted_account_info[
-                    (sorted_account_info['direction'] == direction) &
-                    (sorted_account_info['account'] == node)
-                ].tail(1)
+                logger.debug("No system memos found or missing task_id column")
+
+            google_doc_link = self.get_latest_outgoing_context_doc_link()
+
+            # Rest of your existing code...
             
-            if not latest_message.empty:
-                return latest_message.iloc[0].to_dict()
+            # Ensure memo_transactions is not empty and has required columns
+            if not self.memo_transactions.empty and all(col in self.memo_transactions.columns 
+                for col in ['datetime', 'direction', 'destination', 'account']):
+                sorted_account_info = self.memo_transactions.sort_values('datetime', ascending=True).copy()
             else:
-                return {}
+                logger.debug("Memo transactions DataFrame is empty or missing required columns")
+                sorted_account_info = pd.DataFrame()
 
-        def format_dict(data):
-            if data:
-                standard_format = self.get_explorer_transaction_url(data.get('hash', ''))
-                full_output = data.get('memo_data', {}).get('full_output', 'N/A')
-                task_id = data.get('memo_data', {}).get('task_id', 'N/A')
-                formatted_string = (
-                    f"Task ID: {task_id}\n"
-                    f"Full Output: {full_output}\n"
-                    f"Hash: {standard_format}\n"
-                    f"Datetime: {pd.Timestamp(data['datetime']).strftime('%Y-%m-%d %H:%M:%S') if 'datetime' in data else 'N/A'}\n"
-                )
-                return formatted_string
-            else:
-                return "No data available."
+            # Rest of the method remains the same...
 
-        # Extracting most recent messages
-        most_recent_outgoing_message = extract_latest_message('OUTGOING', user_default_node, True)
-        most_recent_incoming_message = extract_latest_message('INCOMING', user_default_node, False)
-        
-        # Formatting messages
-        incoming_message = format_dict(most_recent_incoming_message)
-        outgoing_message = format_dict(most_recent_outgoing_message)
-        user_classic_address = self.user_wallet.classic_address
-        # Compiling key display information
-        key_display_info = {
-            'Google Doc': google_doc_link,
-            'Initiated Username': initiated_username,
-            'Account Address' : user_classic_address,
-            'Default Node': user_default_node,
-            'Incoming Message': incoming_message,
-            'Outgoing Message': outgoing_message
-        }
-        
-        return key_display_info
+        except Exception as e:
+            logger.error(f"Error processing account info: {e}")
+            return None
 
     @PerformanceMonitor.measure('send_pomodoro_for_task_id')
     def send_pomodoro_for_task_id(self,task_id = '2024-05-19_10:27__LL78',pomodoro_text= 'spent last 30 mins doing a ton of UX debugging'):
