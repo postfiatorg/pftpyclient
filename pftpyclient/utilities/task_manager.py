@@ -293,7 +293,7 @@ class PostFiatTaskManager:
                     logger.debug(f"Unexpected complete_ledgers format: {complete_ledgers}")
             else:
                 logger.debug("Could not fetch server state")
-                return
+                return False
             
             response = self.client.request(
                 xrpl.models.requests.AccountInfo(
@@ -303,11 +303,11 @@ class PostFiatTaskManager:
             )
             if not response.is_successful():
                 logger.debug("Account not found or not funded, skipping transaction sync")
-                return
+                return False
 
         except Exception as e:
             logger.error(f"Error checking account status: {e}")
-            return
+            return False
 
         try:
             # Attempt to load transactions from local csv
@@ -328,19 +328,21 @@ class PostFiatTaskManager:
 
             # Choose ledger index to start sync from
             if self.transactions.empty:
-                next_ledger_index = -1
-                logger.debug("Starting fresh sync from earliest available ledger")
-            else:   # otherwise, use the next index after last known ledger index from the transactions dataframe
+                next_ledger_index = earliest_ledger  # Start from earliest available ledger
+                logger.debug(f"Starting fresh sync from earliest available ledger: {earliest_ledger}")
+            else:   
                 next_ledger_index = self.transactions['ledger_index'].max() + 1
                 logger.debug(f"Next ledger index: {next_ledger_index}")
 
             # fetch new transactions from the node
-            new_tx_list = self.get_new_transactions(next_ledger_index)
-
-            # Add new transactions to the dataframe
-            if new_tx_list:
-                logger.debug(f"Adding {len(new_tx_list)} new transactions...")
-                new_tx_df = pd.DataFrame(new_tx_list)
+            new_transactions = self.get_new_transactions(next_ledger_index)
+            
+            # Convert list of transactions to DataFrame
+            if new_transactions:  # Check if list is not empty
+                new_tx_df = pd.DataFrame(new_transactions)
+                logger.debug(f"Adding {len(new_tx_df)} new transactions...")
+                
+                # Add new transactions to the dataframe
                 self.transactions = pd.concat([self.transactions, new_tx_df], ignore_index=True).drop_duplicates(subset=['hash'])
                 self.save_transactions()
                 self.sync_memo_transactions(new_tx_df)
@@ -348,7 +350,7 @@ class PostFiatTaskManager:
             else:
                 logger.debug("No new transactions found. Finished updating local tx history")
                 return False
-            
+                
         except (TypeError, AttributeError) as e:
             logger.error(f"Error processing transaction history: {e}")
             logger.warning("Corrupted transaction history file detected. Deleting and starting fresh.")
@@ -374,59 +376,84 @@ class PostFiatTaskManager:
     def sync_memo_transactions(self, new_tx_df):
         """Enriches transactions that contain memos with additional columns for easier processing"""
         logger.debug(f"Syncing transactions with memos")
+        
+        # Guard against empty input DataFrame
+        if new_tx_df.empty:
+            logger.debug("Input DataFrame is empty - no memos to process")
+            return
+
         # flag rows with memos
         new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x)
 
         # filter for rows with memos and convert to dataframe
         memo_tx_df = new_tx_df[new_tx_df['has_memos']== True].copy()
-
-        # Extract first memo into a new column, serialize to dict
-        # Any additional memos are ignored
-        memo_tx_df['memo_data']=memo_tx_df['tx_json'].apply(lambda x: self.decode_memo_fields_to_dict(x['Memos'][0]['Memo']))
         
-        # Extract account and destination from tx_json into new columns
-        memo_tx_df['account']= memo_tx_df['tx_json'].apply(lambda x: x['Account'])
-        memo_tx_df['destination']=memo_tx_df['tx_json'].apply(lambda x: x['Destination'])
-        
-        # Determine direction
-        memo_tx_df['direction']=np.where(memo_tx_df['destination']==self.user_wallet.classic_address, 'INCOMING','OUTGOING')
-        
-        # Derive counterparty address
-        memo_tx_df['counterparty_address']= memo_tx_df[['destination','account']].sum(1).apply(
-            lambda x: str(x).replace(self.user_wallet.classic_address,'')
-        )
-        
-        # Convert ripple timestamp to datetime
-        memo_tx_df['datetime']= memo_tx_df['tx_json'].apply(lambda x: self.convert_ripple_timestamp_to_datetime(x['date']))
-        
-        # Get ledger_index from either tx_json or root level
-        memo_tx_df['ledger_index'] = memo_tx_df.apply(
-            lambda row: row['tx_json'].get('ledger_index', row.get('ledger_index')), 
-            axis=1
-        )
+        # Guard against no memos found
+        if memo_tx_df.empty:
+            logger.debug("No transactions with memos found")
+            return
 
-        # Flag rows with PFT
-        memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
+        # Continue with processing only if we have memos
+        try:
+            # Extract first memo into a new column, serialize to dict
+            memo_tx_df['memo_data'] = memo_tx_df['tx_json'].apply(
+                lambda x: self.decode_memo_fields_to_dict(x['Memos'][0]['Memo'])
+            )
+            
+            # Extract account and destination
+            memo_tx_df['account'] = memo_tx_df['tx_json'].apply(lambda x: x['Account'])
+            memo_tx_df['destination'] = memo_tx_df['tx_json'].apply(lambda x: x['Destination'])
+            
+            # Determine direction
+            memo_tx_df['direction'] = np.where(
+                memo_tx_df['destination']==self.user_wallet.classic_address, 
+                'INCOMING',
+                'OUTGOING'
+            )
+            
+            # Derive counterparty address
+            memo_tx_df['counterparty_address'] = memo_tx_df[['destination','account']].sum(1).apply(
+                lambda x: str(x).replace(self.user_wallet.classic_address,'')
+            )
+            
+            # Convert ripple timestamp to datetime
+            memo_tx_df['datetime'] = memo_tx_df['tx_json'].apply(
+                lambda x: self.convert_ripple_timestamp_to_datetime(x['date'])
+            )
+            
+            # Get ledger_index from either tx_json or root level
+            memo_tx_df['ledger_index'] = memo_tx_df.apply(
+                lambda row: int(row['tx_json'].get('ledger_index', row.get('ledger_index', 0))), 
+                axis=1
+            )
 
-        # Concatenate new memos to existing memos and drop duplicates
-        if not memo_tx_df.empty:
-            if self.memo_transactions.empty:
-                self.memo_transactions = memo_tx_df
-            else:
-                self.memo_transactions = pd.concat(
-                    [self.memo_transactions, memo_tx_df], 
-                    ignore_index=True
-                ).drop_duplicates(subset=['hash'])
+            # Flag rows with PFT
+            memo_tx_df['is_pft'] = memo_tx_df['tx_json'].apply(is_pft_transaction)
 
-        logger.debug(f"Added {len(memo_tx_df)} memos to local memos dataframe")
+            # Update memo_transactions DataFrame
+            if not memo_tx_df.empty:
+                if self.memo_transactions.empty:
+                    self.memo_transactions = memo_tx_df
+                else:
+                    self.memo_transactions = pd.concat(
+                        [self.memo_transactions, memo_tx_df], 
+                        ignore_index=True
+                    ).drop_duplicates(subset=['hash'])
 
-        # for debugging purposes only
-        if SAVE_MEMO_TRANSACTIONS:
-            self.save_memo_transactions()
+                logger.debug(f"Added {len(memo_tx_df)} memos to local memos dataframe")
 
-        self.sync_tasks(memo_tx_df)
-        self.sync_memos(memo_tx_df)
-        self.sync_system_memos(memo_tx_df)
+                # Save if configured to do so
+                if SAVE_MEMO_TRANSACTIONS:
+                    self.save_memo_transactions()
+
+                # Process derived data
+                self.sync_tasks(memo_tx_df)
+                self.sync_memos(memo_tx_df)
+                self.sync_system_memos(memo_tx_df)
+
+        except Exception as e:
+            logger.error(f"Error processing memo transactions: {e}")
+            logger.error(traceback.format_exc())
 
     @PerformanceMonitor.measure('sync_tasks')
     def sync_tasks(self, new_memo_tx_df):
