@@ -2504,7 +2504,7 @@ class WalletApp(wx.Frame):
             num_chunks = self.task_manager.calculate_required_chunks(compressed_memo)
 
             message = (
-                f"Memo will be {"encrypted, " if encrypt else ""}compressed and sent over {num_chunks} transaction(s) and "
+                f"Memo will be {'encrypted, ' if encrypt else ''}compressed and sent over {num_chunks} transaction(s) and "
                 f"cost 1 PFT per chunk ({num_chunks} PFT + {num_chunks * constants.MIN_XRP_PER_TRANSACTION} XRP total).\n\n"
                 f"Destination XRP Address: {recipient}\n"
                 f"Memo: {memo_text[:20]}{'...' if len(memo_text) > 20 else ''}\n\n"
