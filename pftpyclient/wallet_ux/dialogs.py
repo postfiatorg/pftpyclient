@@ -908,6 +908,107 @@ class GoogleDocSetupDialog(wx.Dialog):
             return
         super().EndModal(retCode)
 
+class UpdateTrustlineDialog(wx.Dialog):
+    """Dialog for updating PFT token trust line limit"""
+
+    def __init__(self, parent: WalletDialogParent) -> None:
+        """Initialize the update trust line dialog
+        
+        Args:
+            parent: Parent window implementing WalletDialogParent protocol
+        """
+        super().__init__(parent, title="Update Trust Line Limit")
+        self.task_manager = parent.task_manager
+        self.InitUI()
+
+    def InitUI(self) -> None:
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Add explanation text
+        help_text = (
+            """The trust line limit determines the maximum amount of PFT tokens
+            that can be sent to your account.
+            Enter a new limit value below:"""
+        )
+        text = wx.StaticText(panel, label=help_text)
+        text.Wrap(400)
+        sizer.Add(text, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Show current limit
+        current_limit = self.task_manager.get_current_trust_limit()
+        current_limit_formatted = "{:,.2f}".format(float(current_limit))
+        current_text = wx.StaticText(panel, label=f"Current limit: {current_limit_formatted} PFT")
+        sizer.Add(current_text, 0, wx.ALL, 10)
+
+        # New limit input
+        limit_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        limit_sizer.Add(wx.StaticText(panel, label="New limit:"), 0, wx.CENTER | wx.RIGHT, 5)
+        self.limit_input = wx.TextCtrl(panel)
+        self.limit_input.Bind(wx.EVT_TEXT, self.on_limit_changed)
+        limit_sizer.Add(self.limit_input, 1)
+        limit_sizer.Add(wx.StaticText(panel, label="PFT"), 0, wx.CENTER | wx.LEFT, 5)
+        sizer.Add(limit_sizer, 0, wx.ALL | wx.EXPAND, 10)
+
+        # Error message (hidden by default)
+        self.error_label = wx.StaticText(panel, label="")
+        self.error_label.SetForegroundColour(wx.RED)
+        sizer.Add(self.error_label, 0, wx.ALL | wx.EXPAND, 5)
+
+        # Buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.update_btn = wx.Button(panel, wx.ID_OK, "Update")
+        self.update_btn.Enable(False)  # Disabled by default until valid input
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        btn_sizer.Add(self.update_btn, 1, wx.RIGHT, 5)
+        btn_sizer.Add(cancel_btn, 1, wx.LEFT, 5)
+        sizer.Add(btn_sizer, 0, wx.ALL | wx.EXPAND, 10)
+
+        panel.SetSizer(sizer)
+        sizer.Fit(panel)
+        self.SetSize((400, 250))
+        self.Center()
+
+    def validate_limit(self, limit_str: str) -> tuple[bool, str]:
+        """Validate the limit value
+        
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not limit_str:
+            return False, "Please enter a limit value"
+        
+        try:
+            limit_float = float(limit_str)
+            if limit_float <= 0:
+                return False, "Limit must be greater than 0"
+            decimal_places = len(limit_str.split('.')[-1]) if '.' in limit_str else 0
+            if decimal_places > 6:
+                return False, "Maximum 6 decimal places allowed"
+            return True, ""
+        except ValueError:
+            return False, "Please enter a valid number"
+
+    def on_limit_changed(self, event):
+        """Handle limit input changes"""
+        limit_str = self.limit_input.GetValue().strip()
+        is_valid, error_msg = self.validate_limit(limit_str)
+        
+        self.update_btn.Enable(is_valid)
+        if error_msg:
+            self.show_error(error_msg)
+        else:
+            self.show_error("")
+
+    def show_error(self, message: str) -> None:
+        """Show error message"""
+        self.error_label.SetLabel(message)
+        self.Layout()
+
+    def get_new_limit(self) -> str:
+        """Return the entered limit value"""
+        return self.limit_input.GetValue().strip()    
+
 class CustomDialog(wx.Dialog):
     """Custom dialog for displaying a form with text inputs"""
 

@@ -1627,6 +1627,9 @@ class PostFiatTaskManager:
     def get_proposals_df(self, include_refused=False):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
+        if self.tasks.empty:
+            return pd.DataFrame()
+
         # Filter tasks with task_type in ['PROPOSAL','ACCEPTANCE']
         filtered_tasks = self.tasks[self.tasks['task_type'].isin([
             TaskType.PROPOSAL.name, 
@@ -1690,6 +1693,9 @@ class PostFiatTaskManager:
     def get_verification_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
+        if self.tasks.empty:
+            return pd.DataFrame()
+
         # Filter tasks with task_type in ['PROPOSAL','VERIFICATION_PROMPT']
         filtered_tasks = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.VERIFICATION_PROMPT.name])]
 
@@ -1724,6 +1730,9 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('get_rewards_df')
     def get_rewards_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
+
+        if self.tasks.empty:
+            return pd.DataFrame()
 
         # Filter for only PROPOSAL and REWARD rows
         filtered_df = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.REWARD.name])]
@@ -2158,6 +2167,18 @@ class PostFiatTaskManager:
         template = self.network_config.explorer_account_url_mask
         return template.format(address=address)
     
+    def get_current_trust_limit(self):
+        """Gets the current trust line limit for PFT token"""
+        try:
+            pft_holders = self.get_pft_holder_df()
+            user_row = pft_holders[pft_holders['account'] == self.user_wallet.address]
+            if not user_row.empty:
+                return user_row['limit_peer'].iloc[0]
+            return "0"
+        except Exception as e:
+            logger.error(f"Error getting trust line limit: {e}")
+            return "0"
+    
     def has_trust_line(self):
         """ Checks if the user has a trust line to the PFT token"""
         try:
@@ -2174,23 +2195,27 @@ class PostFiatTaskManager:
         """ Handles the creation of a trust line to the PFT token if it doesn't exist"""
         logger.debug("Checking if trust line exists...")
         if not self.has_trust_line():
-            _ = self.generate_trust_line_to_pft_token()
+            _ = self.update_trust_line_limit()
             logger.debug("Trust line created")
         else:
             logger.debug("Trust line already exists")
 
-    def generate_trust_line_to_pft_token(self):
-        """ Note this transaction consumes XRP to create a trust
-        line for the PFT Token so the holder DF should be checked 
-        before this is run
-        """ 
+    def update_trust_line_limit(self, new_limit = constants.DEFAULT_PFT_LIMIT):
+        """Updates the trust line limit for PFT token
+        
+        Args:
+            new_limit: New limit value
+        
+        Returns:
+            Transaction response
+        """
         client = xrpl.clients.JsonRpcClient(self.network_url)
         trust_set_tx = xrpl.models.transactions.TrustSet(
             account=self.user_wallet.address,
             limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
                 currency="PFT",
                 issuer=self.pft_issuer,
-                value=constants.DEFAULT_PFT_LIMIT,
+                value=new_limit,
             )
         )
         logger.debug(f"Creating trust line from {self.user_wallet.address} to issuer...")

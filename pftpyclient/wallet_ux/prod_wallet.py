@@ -464,6 +464,7 @@ class WalletApp(wx.Frame):
         self.update_gdoc_item = self.account_menu.Append(wx.ID_ANY, "Update Google Doc")  # New item
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
+        self.update_trustline_item = self.account_menu.Append(wx.ID_ANY, "Update Trustline")
         self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
         self.menubar.Append(self.account_menu, "Account")
 
@@ -472,6 +473,7 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_update_google_doc, self.update_gdoc_item)
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
+        self.Bind(wx.EVT_MENU, self.on_update_trustline, self.update_trustline_item)
         self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
 
         # Extras menu
@@ -2669,6 +2671,34 @@ class WalletApp(wx.Frame):
             else: 
                 break 
         dialog.Destroy()
+
+    def on_update_trustline(self, event):
+        """Handle update trustline request"""
+        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Updating Trust Line Limit...")
+        dialog = UpdateTrustlineDialog(self)
+
+        while True:
+            if dialog.ShowModal() == wx.ID_OK:
+                new_limit = dialog.get_new_limit()
+                try:
+                    # Validate and update the trust line limit
+                    response = self.task_manager.update_trust_line_limit(new_limit)
+                    if response.is_successful():
+                        formatted_response = self.format_response(response)
+                        success_dialog = SelectableMessageDialog(self, "Success", formatted_response)
+                        success_dialog.ShowModal()
+                        success_dialog.Destroy()
+                        break
+                except Exception as e:
+                    logger.error(f"Error updating trust line limit: {e}")
+                    logger.error(traceback.format_exc())
+                    dialog.show_error(str(e))
+                    continue
+            else:
+                break
+                
+        dialog.Destroy()
+        self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def on_delete_credentials(self, event):
         """Handle delete credentials request"""
