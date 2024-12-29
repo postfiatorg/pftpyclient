@@ -9,7 +9,6 @@ import re
 from threading import Thread, Event
 from pathlib import Path
 from enum import Enum, auto
-from datetime import datetime
 
 # Third-party imports
 import wx
@@ -1964,16 +1963,7 @@ class WalletApp(wx.Frame):
     @PerformanceMonitor.measure('populate_summary_grid')
     def populate_summary_grid(self, key_account_details):
         """Convert dictionary to dataframe and use generic grid population method"""
-        if key_account_details is None:
-            logger.debug("No account details available to populate summary grid")
-            # Create an empty DataFrame or one with an error message
-            summary_df = pd.DataFrame([
-                ['Status', 'No account details available'],
-                ['Last Updated', datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
-            ], columns=['Key', 'Value'])
-        else:
-            summary_df = pd.DataFrame(list(key_account_details.items()), columns=['Key', 'Value'])
-        
+        summary_df = pd.DataFrame(list(key_account_details.items()), columns=['Key', 'Value'])
         self.populate_grid_generic(self.summary_grid, summary_df, 'summary')
 
     def auto_size_window(self):
