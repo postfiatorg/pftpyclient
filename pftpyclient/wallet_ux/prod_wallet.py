@@ -45,6 +45,7 @@ from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
 import pftpyclient.configuration.constants as constants
 from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
+from pftpyclient.utilities.updater import check_and_show_update_dialog
 from pftpyclient.wallet_ux.dialogs import *
 from pftpyclient.wallet_ux.dialogs import CustomDialog
 from pftpyclient.version import VERSION
@@ -434,6 +435,9 @@ class WalletApp(wx.Frame):
 
         # Check for migration
         check_and_show_migration_dialog(parent=self)
+
+        # Check for update
+        check_and_show_update_dialog(parent=self)
 
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""

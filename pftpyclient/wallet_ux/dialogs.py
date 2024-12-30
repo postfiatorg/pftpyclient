@@ -307,6 +307,18 @@ class PreferencesDialog(wx.Dialog):
         app_sb = wx.StaticBox(panel, label="Application Settings")
         app_sbs = wx.StaticBoxSizer(app_sb, wx.VERTICAL)
 
+        # Update Branch selection
+        branch_box = wx.StaticBox(panel, label="Update Branch")
+        branch_sbs = wx.StaticBoxSizer(branch_box, wx.HORIZONTAL)
+        self.main_branch = wx.RadioButton(panel, label="Main", style=wx.RB_GROUP)
+        self.dev_branch = wx.RadioButton(panel, label="Development")
+        current_branch = self.config.get_global_config('update_branch')
+        self.main_branch.SetValue(current_branch == 'main')
+        self.dev_branch.SetValue(current_branch == 'dev')
+        branch_sbs.Add(self.main_branch, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        branch_sbs.Add(self.dev_branch, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        app_sbs.Add(branch_sbs, 0, wx.ALL | wx.EXPAND, 5)  
+
         # Require password for payment checkbox
         self.require_password_for_payment = wx.CheckBox(panel, label="Require password for payment")
         self.require_password_for_payment.SetValue(self.config.get_global_config('require_password_for_payment'))
@@ -504,6 +516,7 @@ class PreferencesDialog(wx.Dialog):
         if old_network != new_network:
             wx.MessageBox("Network change requires a restart to take effect", "Restart Required", wx.OK | wx.ICON_WARNING)
 
+        self.config.set_global_config('update_branch', 'main' if self.main_branch.GetValue() else 'dev')
         self.config.set_global_config('use_testnet', new_network)
         self.config.set_global_config('require_password_for_payment', self.require_password_for_payment.GetValue())
         self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
