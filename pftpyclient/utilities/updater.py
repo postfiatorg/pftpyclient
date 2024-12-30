@@ -143,14 +143,15 @@ def update_available(branch: str) -> bool:
 def perform_update(branch: str) -> bool:
     repo_url = REPO_URL
     repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
-    logger.debug(f"repo_path: {repo_path}")
 
     try:
+        # Remove all existing sinks
+        logger.remove()
 
         # First, try to remove the .git directory specifically
         git_dir = repo_path / '.git'
         if git_dir.exists():
-            logger.debug("Removing .git directory...")
+            print("Removing .git directory...")
             shutil.rmtree(git_dir, ignore_errors=True)
 
         # Using shutil instead of rm command for cross-platform compatibility
@@ -161,9 +162,33 @@ def perform_update(branch: str) -> bool:
                 elif item.is_dir():
                     shutil.rmtree(item, ignore_errors=True)
             except PermissionError as e:
-                logger.warning(f"Permission error while removing {item}: {e}")
+                print(f"Permission error while removing {item}: {e}")
                 # Continue with other files even if one fails
                 continue
+
+        # Verify directory is empty except for essential files
+        remaining_items = list(repo_path.iterdir())
+        if remaining_items:
+            print(f"Directory not empty after cleanup. Remaining items: {remaining_items}")
+            # Try one more time with a more aggressive approach
+            for item in remaining_items:
+                try:
+                    if item.is_file():
+                        os.chmod(item, 0o777)  # Make file writable
+                        item.unlink(missing_ok=True)
+                    elif item.is_dir():
+                        for root, dirs, files in os.walk(item):
+                            for d in dirs:
+                                os.chmod(Path(root) / d, 0o777)
+                            for f in files:
+                                os.chmod(Path(root) / f, 0o777)
+                        shutil.rmtree(item, ignore_errors=True)
+                except Exception as e:
+                    print(f"Failed to remove {item}: {e}")
+
+        # Final verification
+        if list(repo_path.iterdir()):
+            raise Exception("Unable to clean directory for update")
 
         # Clone latest version
         subprocess.run(['git', 'clone', '-b', branch, repo_url, str(repo_path)], check=True)
@@ -186,8 +211,8 @@ def perform_update(branch: str) -> bool:
         return True
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"Update failed: {e}")
-        logger.error(traceback.format_exc())
+        print(f"Update failed: {e}")
+        print(traceback.format_exc())
         wx.MessageBox(f"Update failed: {str(e)}",
                      "Update Error",
                      wx.OK | wx.ICON_ERROR)
@@ -223,6 +248,6 @@ def check_and_show_update_dialog(parent: WalletDialogParent) -> bool:
         return True  # User chose to skip update
     
     except Exception as e:
-        logger.error(f"Error during update dialog: {e}", exc_info=True)
-        logger.error(traceback.format_exc())
+        print(f"Error during update dialog: {e}")
+        print(traceback.format_exc())
         return False
