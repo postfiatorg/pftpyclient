@@ -1,8 +1,11 @@
 import shutil
+import stat
 import subprocess
 import wx
+import time
 import sys
 import os
+import platform
 import traceback
 from pathlib import Path
 from loguru import logger
@@ -140,7 +143,120 @@ def update_available(branch: str) -> bool:
     logger.debug(f"Remote commit hash for {branch}: {remote}")
     return current != remote and current is not None and remote is not None
 
-def perform_update(branch: str) -> bool:
+def handle_remove_error(func, path, excinfo):
+    """Error handler for shutil.rmtree that handles readonly files"""
+    try:
+        os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)  # 0777
+        func(path)  # Try again
+    except Exception as e:
+        print(f"Error handling removal of {path}: {e}")
+    
+def remove_with_retry(path: Path) -> bool:
+    """Remove a file or directory with retries and permission fixes"""
+    if not path.exists():
+        return True
+
+    try:
+        if path.is_file():
+            os.chmod(path, 0o777)  # Make file writable
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            # Make all files and directories writable
+            for root, dirs, files in os.walk(path):
+                for d in dirs:
+                    try:
+                        os.chmod(Path(root) / d, 0o777)
+                    except Exception:
+                        pass
+                for f in files:
+                    try:
+                        os.chmod(Path(root) / f, 0o777)
+                    except Exception:
+                        pass
+            
+            # Attempt removal
+            shutil.rmtree(path, onexc=handle_remove_error)
+
+        return not path.exists()
+    except Exception as e:
+        print(f"Failed to remove {path}: {e}")
+        return False
+
+def backup_git_directory(repo_path: Path) -> Path:
+    """
+    Backup .git directory to a temporary location.
+    Returns the backup path.
+    """
+    git_dir = repo_path / '.git'
+    if not git_dir.exists():
+        return None
+    
+    # Create backup in parent directory
+    backup_dir = repo_path.parent / f'.git_backup_{int(time.time())}'
+    print(f"Backing up .git directory to {backup_dir}")
+    shutil.copytree(git_dir, backup_dir)
+    return backup_dir
+
+def restore_git_directory(backup_dir: Path, repo_path: Path) -> bool:
+    """
+    Restore .git directory from backup, skipping files that can't be copied.
+    Returns True if at least some files were restored.
+    """
+    if not backup_dir or not backup_dir.exists():
+        return False
+    
+    try:
+        git_dir = repo_path / '.git'
+        if not git_dir.exists():
+            git_dir.mkdir(exist_ok=True)
+        
+        print(f"Restoring .git directory from {backup_dir}")
+        files_restored = 0
+        errors = []
+
+        # Walk through the backup directory and copy files individually
+        for src_path in backup_dir.rglob('*'):
+            if not src_path.is_file():
+                continue
+                
+            # Calculate destination path
+            rel_path = src_path.relative_to(backup_dir)
+            dst_path = git_dir / rel_path
+            
+            # Create parent directories if they don't exist
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                # Only copy if destination doesn't exist or is writable
+                if not dst_path.exists() or os.access(dst_path, os.W_OK):
+                    shutil.copy2(src_path, dst_path)
+                    files_restored += 1
+            except Exception as e:
+                errors.append(f"{rel_path}: {str(e)}")
+                continue
+
+        # Report results
+        if errors:
+            print(f"Failed to restore {len(errors)} files:")
+            for error in errors:
+                print(f"  {error}")
+        
+        print(f"Successfully restored {files_restored} files")
+        
+        # Clean up backup if we restored at least some files
+        if files_restored > 0:
+            try:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            except Exception as e:
+                print(f"Failed to remove backup directory: {e}")
+        
+        return files_restored > 0
+
+    except Exception as e:
+        print(f"Failed to restore .git directory: {e}")
+        return False
+
+def perform_update(branch: str) -> Optional[bool]:
     repo_url = REPO_URL
     repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
 
@@ -148,46 +264,42 @@ def perform_update(branch: str) -> bool:
         # Remove all existing sinks
         logger.remove()
 
-        # First, try to remove the .git directory specifically
+        # First, try to clean up git
         git_dir = repo_path / '.git'
         if git_dir.exists():
+            print("Cleaning up git...")
+            # Backup .git directory first
+            git_backup = backup_git_directory(repo_path)
+
+            # Force git to release locks
+            subprocess.run(['git', 'gc'], cwd=repo_path, check=False)
+            subprocess.run(['git', 'prune'], cwd=repo_path, check=False)
+            subprocess.run(['git', 'clean', '-fd'], cwd=repo_path, check=False)
+            
+            # Clear git index lock if it exists
+            index_lock = git_dir / 'index.lock'
+            if index_lock.exists():
+                index_lock.unlink(missing_ok=True)
+            
             print("Removing .git directory...")
-            shutil.rmtree(git_dir, ignore_errors=True)
+            if not remove_with_retry(git_dir):
+                raise CannotRemoveGitDirectory(
+                    "Unable to remove .git directory. This usually happens when files are "
+                    "being held open by another program.\n\n"
+                    "Please:\n"
+                    "1. Close any IDEs or text editors that might have project files open\n"
+                    "2. Close any file explorers open to the project directory\n"
+                    "3. Try the update again"
+                )
 
-        # Using shutil instead of rm command for cross-platform compatibility
+        # Remove all other files and directories
         for item in repo_path.iterdir():
-            try:
-                if item.is_file():
-                    item.unlink(missing_ok=True)
-                elif item.is_dir():
-                    shutil.rmtree(item, ignore_errors=True)
-            except PermissionError as e:
-                print(f"Permission error while removing {item}: {e}")
-                # Continue with other files even if one fails
-                continue
-
-        # Verify directory is empty except for essential files
-        remaining_items = list(repo_path.iterdir())
-        if remaining_items:
-            print(f"Directory not empty after cleanup. Remaining items: {remaining_items}")
-            # Try one more time with a more aggressive approach
-            for item in remaining_items:
-                try:
-                    if item.is_file():
-                        os.chmod(item, 0o777)  # Make file writable
-                        item.unlink(missing_ok=True)
-                    elif item.is_dir():
-                        for root, dirs, files in os.walk(item):
-                            for d in dirs:
-                                os.chmod(Path(root) / d, 0o777)
-                            for f in files:
-                                os.chmod(Path(root) / f, 0o777)
-                        shutil.rmtree(item, ignore_errors=True)
-                except Exception as e:
-                    print(f"Failed to remove {item}: {e}")
+            remove_with_retry(item)
 
         # Final verification
-        if list(repo_path.iterdir()):
+        remaining = list(repo_path.iterdir())
+        if remaining:
+            print(f"Failed to remove: {remaining}")
             raise Exception("Unable to clean directory for update")
 
         # Clone latest version
@@ -206,14 +318,48 @@ def perform_update(branch: str) -> bool:
         )
 
         wx.GetApp().ExitMainLoop()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
 
-        return True
+        # Launch using the desktop shortcut
+        desktop_path = get_desktop_path()
+        if os.name == 'nt':  # Windows
+            shortcut_path = desktop_path / "Post Fiat Wallet.lnk"
+            if shortcut_path.exists():
+                subprocess.Popen(f'start "" "{shortcut_path}"', shell=True)
+            else:
+                print(f"Warning: Could not find shortcut at {shortcut_path}")
+        else:  # Unix-like
+            shortcut_path = desktop_path / "Post Fiat Wallet.command"
+            if shortcut_path.exists():
+                subprocess.Popen(['xdg-open', str(shortcut_path)])
+            else:
+                print(f"Warning: Could not find shortcut at {shortcut_path}")
 
+        sys.exit(0)  # Exit current process
+
+    except CannotRemoveGitDirectory as e:
+        if git_backup:
+            restore_git_directory(git_backup, repo_path)
+        print(f"Update failed: {e}")
+        wx.MessageBox(f"Update failed: {str(e)}",
+                     "Update Error",
+                     wx.OK | wx.ICON_ERROR)
+        return False
     except subprocess.CalledProcessError as e:
         print(f"Update failed: {e}")
         print(traceback.format_exc())
         wx.MessageBox(f"Update failed: {str(e)}",
+                     "Update Error",
+                     wx.OK | wx.ICON_ERROR)
+        return False
+    except Exception as e:
+        print(f"Update failed with unexpected error: {e}")
+        print(traceback.format_exc())
+
+        # Attempt to restore .git directory if we have a backup
+        if git_backup:
+            restore_git_directory(git_backup, repo_path)
+
+        wx.MessageBox(f"Update failed with unexpected error: {str(e)}",
                      "Update Error",
                      wx.OK | wx.ICON_ERROR)
         return False
@@ -251,3 +397,35 @@ def check_and_show_update_dialog(parent: WalletDialogParent) -> bool:
         print(f"Error during update dialog: {e}")
         print(traceback.format_exc())
         return False
+    
+def get_desktop_path() -> Path:
+    """Get the correct path to the user's desktop across different OS and configurations"""
+    if platform.system() == "Windows":
+        # On Windows, use the registry to get the correct Desktop path
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
+                           r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as key:
+            desktop = Path(winreg.QueryValueEx(key, "Desktop")[0])
+    else:
+        # On Unix-like systems, use XDG_DESKTOP_DIR if available, else fallback to ~/Desktop
+        desktop_config = Path.home() / ".config/user-dirs.dirs"
+        if desktop_config.exists():
+            with open(desktop_config, 'r') as f:
+                for line in f:
+                    if line.startswith('XDG_DESKTOP_DIR'):
+                        # Parse the XDG config line and expand ~ if present
+                        desktop_path = line.split('=')[1].strip('"').strip("'").strip()
+                        desktop_path = desktop_path.replace('$HOME', str(Path.home()))
+                        desktop = Path(desktop_path)
+                        break
+                else:
+                    desktop = Path.home() / "Desktop"
+        else:
+            desktop = Path.home() / "Desktop"
+    
+    return desktop
+
+class CannotRemoveGitDirectory(Exception):
+    """Exception raised when unable to remove .git directory"""
+    pass
+

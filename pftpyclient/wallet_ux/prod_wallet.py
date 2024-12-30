@@ -454,9 +454,11 @@ class WalletApp(wx.Frame):
 
         # File menu
         file_menu = wx.Menu()
+        updates_item = file_menu.Append(wx.ID_ANY, "Check for Updates", "Check for updates")
         preferences_item = file_menu.Append(wx.ID_ANY, "Preferences", "Configure client settings")
         logout_item = file_menu.Append(wx.ID_ANY, "Logout", "Return to login screen")
         quit_item = file_menu.Append(wx.ID_EXIT, "Quit", "Quit the application")
+        self.Bind(wx.EVT_MENU, self.on_check_for_updates, updates_item)
         self.Bind(wx.EVT_MENU, self.on_preferences, preferences_item)
         self.Bind(wx.EVT_MENU, self.on_logout, logout_item)
         self.Bind(wx.EVT_MENU, self.on_close, quit_item)
@@ -2831,6 +2833,10 @@ class WalletApp(wx.Frame):
                 PerformanceMonitor._instance = None
         
             Thread(target=monitor_thread, daemon=True).start()
+
+    def on_check_for_updates(self, event):
+        """Handle check for updates request"""
+        check_and_show_update_dialog(parent=self)
 
     def on_preferences(self, event):
         """Handle preferences dialog"""
