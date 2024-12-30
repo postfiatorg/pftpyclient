@@ -52,12 +52,13 @@ class UpdateDialog(wx.Dialog):
 
     def setup_ui(self):
         main_sizer = wx.BoxSizer(wx.VERTICAL)
+        version_tag = 'dev ' if self.branch == 'dev' else ''
 
         # Create HTML content
         html_content = f"""
         <html>
         <body>
-        <h3>A new version of PftPyClient is available</h3>
+        <h3>A new {version_tag}version of PftPyClient is available</h3>
         <p>Latest update details:</p>
         <pre>
 Commit: {self.commit_details['hash']}
@@ -110,11 +111,13 @@ Date: {self.commit_details['date']}
 
 def get_current_commit_hash():
     try:
+        repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
         result = subprocess.run(
             ['git', 'rev-parse', 'HEAD'], 
             capture_output=True, 
             text=True, 
-            check=True
+            check=True,
+            cwd=str(repo_path)
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError:
@@ -122,6 +125,7 @@ def get_current_commit_hash():
     
 def get_remote_commit_hash(branch: str) -> Optional[str]:
     try:
+        repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
         # Fetch latest changes without merging
         subprocess.run(['git', 'fetch'], check=True)
 
@@ -130,7 +134,8 @@ def get_remote_commit_hash(branch: str) -> Optional[str]:
             ['git', 'rev-parse', f'origin/{branch}'],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            cwd=str(repo_path)
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError:
@@ -255,12 +260,94 @@ def restore_git_directory(backup_dir: Path, repo_path: Path) -> bool:
     except Exception as e:
         print(f"Failed to restore .git directory: {e}")
         return False
+    
+def get_python_requirement() -> tuple[int, int]:
+    """Get minimum Python version from project configuration"""
+    repo_path = Path(__file__).parent.parent.parent
+    setup_path = repo_path / "setup.py"
+
+    try:
+        if setup_path.exists():
+            # Fall back to parsing setup.py
+            with open(setup_path, 'r') as f:
+                content = f.read()
+                import re
+                if match := re.search(r'python_requires\s*=\s*[\'"]>=\s*(\d+)\.(\d+)[\'"]', content):
+                    return (int(match.group(1)), int(match.group(2)))
+        
+        raise RuntimeError("Could not determine Python version requirement from project files")
+    
+    except Exception as e:
+        logger.error(f"Failed to read Python version requirement: {e}")
+        raise RuntimeError(f"Could not determine Python version requirement: {e}")
+    
+def get_system_python() -> str:
+    """Get the path to the system Python executable"""
+    # Try multiple methods to find Python on all platforms
+    best_version = (0, 0)
+    best_path = None
+
+    try:
+        min_version = get_python_requirement()
+        logger.debug(f"Required Python version: >={min_version[0]}.{min_version[1]}")
+    except Exception as e:
+        logger.error(str(e))
+        raise
+
+    possible_paths = [
+        "python",
+        "python3"
+    ]
+    
+    for path in possible_paths:
+        try:
+            # Test if this Python works and get its version
+            result = subprocess.run(
+                [path, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            major, minor = map(int, result.stdout.strip().split())
+            version = (major, minor)
+            
+            # Update best version if this one is newer
+            if version > best_version:
+                best_version = version
+                best_path = path
+                
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.debug(f"Failed to check {path}: {str(e)}")
+            continue
+    
+    if best_path:
+        if best_version >= min_version:
+            logger.info(f"Selected Python {best_version[0]}.{best_version[1]} at {best_path}")
+            return best_path
+        else:
+            raise RuntimeError(
+                f"Found Python {best_version[0]}.{best_version[1]}, but version "
+                f"{min_version[0]}.{min_version[1]} or higher is required"
+            )
+
+    # Fallback to system paths if PATH-based Python not found
+    if platform.system() == "Darwin":  # macOS
+        return "/usr/bin/python3"
+    elif platform.system() == "Windows":
+        raise RuntimeError(
+            "Could not find Python installation. Please ensure Python 3 is installed "
+            "and either in PATH or in a standard installation location."
+        )
+    else:  # Linux
+        return "/usr/bin/python3"
 
 def perform_update(branch: str) -> Optional[bool]:
     repo_url = REPO_URL
     repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
-
+    
     try:
+        system_python = get_system_python()
+
         # Remove all existing sinks
         logger.remove()
 
@@ -291,6 +378,7 @@ def perform_update(branch: str) -> Optional[bool]:
                     "2. Close any file explorers open to the project directory\n"
                     "3. Try the update again"
                 )
+        print("Removed .git directory")
 
         # Remove all other files and directories
         for item in repo_path.iterdir():
@@ -301,21 +389,25 @@ def perform_update(branch: str) -> Optional[bool]:
         if remaining:
             print(f"Failed to remove: {remaining}")
             raise Exception("Unable to clean directory for update")
+        
+        print("Removed all PftPyClient files and directories")
 
         # Clone latest version
         subprocess.run(['git', 'clone', '-b', branch, repo_url, str(repo_path)], check=True)
 
+        print("Cloned latest version. Running install script...")
+
         # Run install script
         subprocess.run(
-            [sys.executable, 'install_wallet.py'],
+            [system_python, 'install_wallet.py'],
             cwd=str(repo_path),
             check=True
         )
 
-        wx.MessageBox("Update completed successfully. The application will now restart.",
-                      "Update Complete",
-                      wx.OK | wx.ICON_INFORMATION
-        )
+        # Clean up git backup on success
+        if git_backup and git_backup.exists():
+            print(f"Removing git backup directory: {git_backup}")
+            shutil.rmtree(git_backup, ignore_errors=True)
 
         wx.GetApp().ExitMainLoop()
 
@@ -330,7 +422,10 @@ def perform_update(branch: str) -> Optional[bool]:
         else:  # Unix-like
             shortcut_path = desktop_path / "Post Fiat Wallet.command"
             if shortcut_path.exists():
-                subprocess.Popen(['xdg-open', str(shortcut_path)])
+                if platform.system() == "Darwin":  # macOS
+                    subprocess.Popen(['open', str(shortcut_path)])
+                else:  # Linux
+                    subprocess.Popen(['xdg-open', str(shortcut_path)])
             else:
                 print(f"Warning: Could not find shortcut at {shortcut_path}")
 
@@ -390,7 +485,23 @@ def check_and_show_update_dialog(parent: WalletDialogParent) -> bool:
         dlg.Destroy()
 
         if result == wx.ID_YES:
-            return perform_update(branch)
+            # Create and show progress dialog
+            progress_dlg = wx.ProgressDialog(
+                "Updating PftPyClient",
+                "Please wait while updating PftPyClient...",
+                maximum=100,
+                parent=parent,
+                style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE
+            )
+            progress_dlg.Pulse()  # Show indeterminate progress
+            
+            try:
+                perform_update(branch)
+            except Exception as e:
+                raise e
+            finally:
+                progress_dlg.Destroy()
+    
         return True  # User chose to skip update
     
     except Exception as e:

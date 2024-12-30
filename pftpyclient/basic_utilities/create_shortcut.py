@@ -61,6 +61,9 @@ activate_venv() {{
 
 echo "Starting Post Fiat Wallet..."
 
+# Change to the repository root directory
+cd "{os.path.dirname(current_location)}"
+
 # Try to activate virtual environment
 activate_venv
 

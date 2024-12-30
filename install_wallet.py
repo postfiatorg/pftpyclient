@@ -10,6 +10,86 @@ from datetime import datetime
 
 REPO_URL = "https://github.com/postfiatorg/pftpyclient.git"
 
+def get_python_requirement() -> tuple[int, int]:
+    """Get minimum Python version from project configuration"""
+    repo_path = Path(__file__).parent
+    setup_path = repo_path / "setup.py"
+
+    try:
+        if setup_path.exists():
+            # Fall back to parsing setup.py
+            with open(setup_path, 'r') as f:
+                content = f.read()
+                import re
+                if match := re.search(r'python_requires\s*=\s*[\'"]>=\s*(\d+)\.(\d+)[\'"]', content):
+                    return (int(match.group(1)), int(match.group(2)))
+        
+        raise RuntimeError("Could not determine Python version requirement from project files")
+    
+    except Exception as e:
+        print(f"Failed to read Python version requirement: {e}")
+        raise RuntimeError(f"Could not determine Python version requirement: {e}")
+
+def get_system_python() -> str:
+    """Get the path to the system Python executable that meets version requirements"""
+    # Try multiple methods to find Python on all platforms
+    best_version = (0, 0)
+    best_path = None
+
+    try:
+        min_version = get_python_requirement()
+        logging.debug(f"Required Python version: >={min_version[0]}.{min_version[1]}")
+    except Exception as e:
+        logging.error(str(e))
+        raise
+
+    possible_paths = [
+        "python",
+        "python3"
+    ]
+    
+    for path in possible_paths:
+        try:
+            # Test if this Python works and get its version
+            result = subprocess.run(
+                [path, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            major, minor = map(int, result.stdout.strip().split())
+            version = (major, minor)
+            
+            # Update best version if this one is newer
+            if version > best_version:
+                best_version = version
+                best_path = path
+                
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logging.debug(f"Failed to check {path}: {str(e)}")
+            continue
+    
+    if best_path:
+        if best_version >= min_version:
+            logging.info(f"Selected Python {best_version[0]}.{best_version[1]} at {best_path}")
+            return best_path
+        else:
+            raise RuntimeError(
+                f"Found Python {best_version[0]}.{best_version[1]}, but version "
+                f"{min_version[0]}.{min_version[1]} or higher is required"
+            )
+
+    # Fallback to system paths if PATH-based Python not found
+    if platform.system() == "Darwin":  # macOS
+        return "/usr/bin/python3"
+    elif platform.system() == "Windows":
+        raise RuntimeError(
+            "Could not find Python installation. Please ensure Python 3.11+ is installed "
+            "and either in PATH or in a standard installation location."
+        )
+    else:  # Linux
+        return "/usr/bin/python3"
+
 def configure_logging(level: str = "INFO"):
     """Configure logging for installation using standard library"""
     logging.basicConfig(
@@ -150,7 +230,8 @@ def destroy_virtual_environment(env_name):
 
 def create_virtual_environment(env_name):
     try:
-        subprocess.check_call([sys.executable, "-m", "venv", env_name])
+        python_path = get_system_python()
+        subprocess.check_call([python_path, "-m", "venv", env_name])
         logging.info(f"Virtual environment {env_name} created")
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to create virtual environment: {e}")
