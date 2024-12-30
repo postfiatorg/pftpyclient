@@ -250,15 +250,49 @@ def restore_git_directory(backup_dir: Path, repo_path: Path) -> bool:
         
         # Clean up backup if we restored at least some files
         if files_restored > 0:
-            try:
-                shutil.rmtree(backup_dir, ignore_errors=True)
-            except Exception as e:
-                print(f"Failed to remove backup directory: {e}")
+            if not remove_with_retry(backup_dir):
+                print(f"Warning: Failed to remove backup directory: {backup_dir}")
         
         return files_restored > 0
 
     except Exception as e:
         print(f"Failed to restore .git directory: {e}")
+        return False
+    
+def move_venv_directory(repo_path: Path) -> Path:
+    """
+    Move venv directory to a temporary location.
+    Returns the backup path.
+    """
+    venv_dir = repo_path / 'venv'
+    if not venv_dir.exists():
+        return None
+    
+    # Create backup in parent directory
+    backup_dir = repo_path.parent / f'venv_backup_{int(time.time())}'
+    print(f"Moving venv directory to {backup_dir}")
+    shutil.move(str(venv_dir), str(backup_dir))  # Use str() for Windows compatibility
+    return backup_dir
+
+def restore_venv_directory(backup_dir: Path, repo_path: Path) -> bool:
+    """
+    Move venv directory back from backup.
+    Returns True if successful.
+    """
+    if not backup_dir or not backup_dir.exists():
+        return False
+    
+    try:
+        venv_dir = repo_path / 'venv'
+        print(f"Moving venv directory back from {backup_dir}")
+        if venv_dir.exists():
+            print("Warning: venv directory already exists at destination")
+            return False
+            
+        shutil.move(str(backup_dir), str(venv_dir))  # Use str() for Windows compatibility
+        return True
+    except Exception as e:
+        print(f"Failed to restore venv directory: {e}")
         return False
     
 def get_python_requirement() -> tuple[int, int]:
@@ -294,10 +328,18 @@ def get_system_python() -> str:
         logger.error(str(e))
         raise
 
-    possible_paths = [
-        "python",
-        "python3"
-    ]
+    # Different paths to try based on platform
+    if platform.system() == "Windows":
+        possible_paths = [
+            "python",
+            sys.executable  # Current Python interpreter path
+        ]
+    else:
+        possible_paths = [
+            "python3",
+            "python",
+            sys.executable
+        ]
     
     for path in possible_paths:
         try:
@@ -316,7 +358,7 @@ def get_system_python() -> str:
                 best_version = version
                 best_path = path
                 
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
             logger.debug(f"Failed to check {path}: {str(e)}")
             continue
     
@@ -344,6 +386,8 @@ def get_system_python() -> str:
 def perform_update(branch: str) -> Optional[bool]:
     repo_url = REPO_URL
     repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
+    git_backup = None
+    venv_backup = None
     
     try:
         system_python = get_system_python()
@@ -351,17 +395,21 @@ def perform_update(branch: str) -> Optional[bool]:
         # Remove all existing sinks
         logger.remove()
 
-        # First, try to clean up git
+        # Try to clean up git
         git_dir = repo_path / '.git'
         if git_dir.exists():
             print("Cleaning up git...")
             # Backup .git directory first
             git_backup = backup_git_directory(repo_path)
+            
+            # Set Git environment to avoid prompts
+            git_env = os.environ.copy()
+            git_env['GIT_ASK_YESNO'] = 'false'
 
             # Force git to release locks
-            subprocess.run(['git', 'gc'], cwd=repo_path, check=False)
-            subprocess.run(['git', 'prune'], cwd=repo_path, check=False)
-            subprocess.run(['git', 'clean', '-fd'], cwd=repo_path, check=False)
+            subprocess.run(['git', 'gc'], cwd=repo_path, check=False, env=git_env)
+            subprocess.run(['git', 'prune'], cwd=repo_path, check=False, env=git_env)
+            subprocess.run(['git', 'clean', '-fd'], cwd=repo_path, check=False, env=git_env)
             
             # Clear git index lock if it exists
             index_lock = git_dir / 'index.lock'
@@ -380,55 +428,49 @@ def perform_update(branch: str) -> Optional[bool]:
                 )
         print("Removed .git directory")
 
+        # Move venv if it exists. It can't be deleted because it's being used by the current process.
+        # But we need the root directory to be empty for the git clone to work.
+        venv_dir = repo_path / 'venv'
+        if venv_dir.exists():
+            venv_backup = move_venv_directory(repo_path)
+            if not venv_backup:
+                raise Exception("Failed to backup venv directory")
+        
         # Remove all other files and directories
         for item in repo_path.iterdir():
-            remove_with_retry(item)
+            if item != git_dir:
+                remove_with_retry(item)
 
         # Final verification
         remaining = list(repo_path.iterdir())
         if remaining:
             print(f"Failed to remove: {remaining}")
+            # If failed to remove, restore git and venv
+            if git_backup:
+                restore_git_directory(git_backup, repo_path)
+            if venv_backup:
+                restore_venv_directory(venv_backup, repo_path)
             raise Exception("Unable to clean directory for update")
-        
-        print("Removed all PftPyClient files and directories")
 
         # Clone latest version
+        print("Cloning new version...")
         subprocess.run(['git', 'clone', '-b', branch, repo_url, str(repo_path)], check=True)
 
-        print("Cloned latest version. Running install script...")
+        # Restore venv if we had a backup
+        if venv_backup:
+            if not restore_venv_directory(venv_backup, repo_path):
+                raise Exception("Failed to restore virtual environment")
 
         # Run install script
-        subprocess.run(
-            [system_python, 'install_wallet.py'],
-            cwd=str(repo_path),
-            check=True
+        print("Running install script...")
+
+        # Run install_wallet.py with launch option after exit
+        subprocess.Popen(
+            [system_python, 'install_wallet.py', '--launch'],
+            cwd=str(repo_path)
         )
 
-        # Clean up git backup on success
-        if git_backup and git_backup.exists():
-            print(f"Removing git backup directory: {git_backup}")
-            shutil.rmtree(git_backup, ignore_errors=True)
-
         wx.GetApp().ExitMainLoop()
-
-        # Launch using the desktop shortcut
-        desktop_path = get_desktop_path()
-        if os.name == 'nt':  # Windows
-            shortcut_path = desktop_path / "Post Fiat Wallet.lnk"
-            if shortcut_path.exists():
-                subprocess.Popen(f'start "" "{shortcut_path}"', shell=True)
-            else:
-                print(f"Warning: Could not find shortcut at {shortcut_path}")
-        else:  # Unix-like
-            shortcut_path = desktop_path / "Post Fiat Wallet.command"
-            if shortcut_path.exists():
-                if platform.system() == "Darwin":  # macOS
-                    subprocess.Popen(['open', str(shortcut_path)])
-                else:  # Linux
-                    subprocess.Popen(['xdg-open', str(shortcut_path)])
-            else:
-                print(f"Warning: Could not find shortcut at {shortcut_path}")
-
         sys.exit(0)  # Exit current process
 
     except CannotRemoveGitDirectory as e:
@@ -453,6 +495,8 @@ def perform_update(branch: str) -> Optional[bool]:
         # Attempt to restore .git directory if we have a backup
         if git_backup:
             restore_git_directory(git_backup, repo_path)
+        if venv_backup:
+            restore_venv_directory(venv_backup, repo_path)
 
         wx.MessageBox(f"Update failed with unexpected error: {str(e)}",
                      "Update Error",

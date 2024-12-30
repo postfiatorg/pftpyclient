@@ -43,10 +43,18 @@ def get_system_python() -> str:
         logging.error(str(e))
         raise
 
-    possible_paths = [
-        "python",
-        "python3"
-    ]
+    # Different paths to try based on platform
+    if platform.system() == "Windows":
+        possible_paths = [
+            "python",
+            sys.executable  # Current Python interpreter path
+        ]
+    else:
+        possible_paths = [
+            "python3",
+            "python",
+            sys.executable
+        ]
     
     for path in possible_paths:
         try:
@@ -141,30 +149,45 @@ def get_package_root(local_path: Path = None) -> Path:
     logging.warning("Failed to determine package root, using current working directory")
     return Path.cwd()
 
-def activate_virtual_environment_and_install(env_name):
+def get_activation_command(env_name: str) -> tuple[str, dict]:
+    """Get the appropriate virtual environment activation command and shell settings for the current platform
+    
+    Returns:
+        tuple[str, dict]: Activation command and subprocess kwargs
+    """
     os_type = platform.system()
-    venv_activate = None
+    
+    if os_type == "Windows":
+        venv_activate = Path(env_name) / "Scripts" / "activate"
+        return (f'"{venv_activate}"', {"shell": True})
+    else:
+        venv_activate = Path(env_name) / "bin" / "activate"
+        return (f"source {venv_activate}", {
+            "shell": True,
+            "executable": "/bin/bash"
+        })
 
+def activate_virtual_environment_and_install(env_name):
+    """Activate virtual environment and install package"""
     project_root = get_package_root()
     logging.info(f"Installing package from {project_root}")
 
-    extras = "[windows]" if os_type == "Windows" else ""
-
+    extras = "[windows]" if platform.system() == "Windows" else ""
+    
     try:
-        if os_type == "Darwin" or os_type == "Linux":
-            venv_activate = Path(env_name) / "bin" / "activate"
-            command = f"source {venv_activate} && pip install -e {project_root}"
-            subprocess.check_call(command, shell=True, executable="/bin/bash")
-
-        elif os_type == "Windows":
-            venv_activate = Path(env_name) / "Scripts" / "activate"
-            command = f"{venv_activate} && pip install -e {project_root}{extras}"
-            subprocess.check_call(command, shell=True)
-
-        logging.info(f"Virtual environment {env_name} activated on {os_type} and installed {project_root}")
+        activate_cmd, shell_settings = get_activation_command(env_name)
+        command = f"{activate_cmd} && pip install -e {project_root}{extras}"
+        subprocess.check_call(command, **shell_settings)
+        logging.info(f"Virtual environment {env_name} activated and installed {project_root}")
     except subprocess.CalledProcessError as e:
         logging.error(f"Installation failed: {e}")
         raise
+
+def run_in_venv(env_name: str, command: str):
+    """Run a command in the virtual environment"""
+    activate_cmd, shell_settings = get_activation_command(env_name)
+    full_command = f"{activate_cmd} && {command}"
+    return subprocess.Popen(full_command, **shell_settings)
 
 def get_desktop_path() -> Path:
     """Get the correct path to the user's desktop across different OS and configurations"""
@@ -261,6 +284,7 @@ def create_shortcut(env_name):
 
 def main():
     parser = argparse.ArgumentParser(description="Install Post Fiat Wallet")
+    parser.add_argument('--launch', action='store_true', help='Launch wallet after installation')
     args = parser.parse_args()
 
     logger = configure_logging(level="DEBUG")
@@ -282,6 +306,16 @@ def main():
         move_shortcut_to_desktop(root)
         
         logging.info("Installation completed successfully!")
+
+        # Launch if requested
+        if args.launch:
+            desktop_path = get_desktop_path()
+            if platform.system() == "Windows":
+                launch_cmd = f'start "" "{desktop_path / "Post Fiat Wallet.lnk"}"'
+            else:
+                launch_cmd = f'{"open" if platform.system() == "Darwin" else "xdg-open"} "{desktop_path / "Post Fiat Wallet.command"}"'
+            
+            run_in_venv(env_name, launch_cmd)
         
     except Exception as e:
         logging.error(f"Installation failed: {e}")
