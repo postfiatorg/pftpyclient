@@ -277,5 +277,6 @@ GLOBAL_CONFIG_DEFAULTS = {
     'mainnet_rpc_endpoints': Network.XRPL_MAINNET.value.public_rpc_urls,
     'testnet_rpc_endpoints': Network.XRPL_TESTNET.value.public_rpc_urls,
     'mainnet_ws_endpoints': Network.XRPL_MAINNET.value.websockets,
-    'testnet_ws_endpoints': Network.XRPL_TESTNET.value.websockets
+    'testnet_ws_endpoints': Network.XRPL_TESTNET.value.websockets,
+    'update_branch': 'main'  # or 'dev'
 }

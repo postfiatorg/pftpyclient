@@ -45,6 +45,7 @@ from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
 import pftpyclient.configuration.constants as constants
 from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
+from pftpyclient.utilities.updater import check_and_show_update_dialog
 from pftpyclient.wallet_ux.dialogs import *
 from pftpyclient.wallet_ux.dialogs import CustomDialog
 from pftpyclient.version import VERSION
@@ -435,6 +436,9 @@ class WalletApp(wx.Frame):
         # Check for migration
         check_and_show_migration_dialog(parent=self)
 
+        # Check for update
+        check_and_show_update_dialog(parent=self)
+
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""
         columns = self.GRID_CONFIGS[grid_name]['columns']
@@ -450,9 +454,11 @@ class WalletApp(wx.Frame):
 
         # File menu
         file_menu = wx.Menu()
+        updates_item = file_menu.Append(wx.ID_ANY, "Check for Updates", "Check for updates")
         preferences_item = file_menu.Append(wx.ID_ANY, "Preferences", "Configure client settings")
         logout_item = file_menu.Append(wx.ID_ANY, "Logout", "Return to login screen")
         quit_item = file_menu.Append(wx.ID_EXIT, "Quit", "Quit the application")
+        self.Bind(wx.EVT_MENU, self.on_check_for_updates, updates_item)
         self.Bind(wx.EVT_MENU, self.on_preferences, preferences_item)
         self.Bind(wx.EVT_MENU, self.on_logout, logout_item)
         self.Bind(wx.EVT_MENU, self.on_close, quit_item)
@@ -2827,6 +2833,10 @@ class WalletApp(wx.Frame):
                 PerformanceMonitor._instance = None
         
             Thread(target=monitor_thread, daemon=True).start()
+
+    def on_check_for_updates(self, event):
+        """Handle check for updates request"""
+        check_and_show_update_dialog(parent=self)
 
     def on_preferences(self, event):
         """Handle preferences dialog"""
