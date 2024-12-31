@@ -308,7 +308,7 @@ class PreferencesDialog(wx.Dialog):
         app_sbs = wx.StaticBoxSizer(app_sb, wx.VERTICAL)
 
         # Update Branch selection
-        branch_box = wx.StaticBox(panel, label="Update Branch")
+        branch_box = wx.StaticBox(panel, label="Check for Updates")
         branch_sbs = wx.StaticBoxSizer(branch_box, wx.HORIZONTAL)
         self.main_branch = wx.RadioButton(panel, label="Main", style=wx.RB_GROUP)
         self.dev_branch = wx.RadioButton(panel, label="Development")

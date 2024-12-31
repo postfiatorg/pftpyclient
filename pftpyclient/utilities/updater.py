@@ -109,6 +109,20 @@ Date: {self.commit_details['date']}
         """Handle window close button (X)"""
         self.EndModal(wx.ID_NO)
 
+def get_current_branch() -> Optional[str]:
+    try:
+        repo_path = Path(__file__).parent.parent.parent
+        result = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(repo_path)
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+
 def get_current_commit_hash():
     try:
         repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
@@ -142,6 +156,11 @@ def get_remote_commit_hash(branch: str) -> Optional[str]:
         return None
     
 def update_available(branch: str) -> bool:
+    current_branch = get_current_branch()
+    # If we're on a different branch than the selected update branch, skip update check
+    if current_branch and current_branch != branch:
+        logger.debug(f"Current branch '{current_branch}' differs from update branch '{branch}'. Skipping update check.")
+        return False
     current = get_current_commit_hash()
     logger.debug(f"Current commit hash: {current}")
     remote = get_remote_commit_hash(branch)
