@@ -157,9 +157,9 @@ def get_remote_commit_hash(branch: str) -> Optional[str]:
     
 def update_available(branch: str) -> bool:
     current_branch = get_current_branch()
-    # If we're on a different branch than the selected update branch, skip update check
-    if current_branch and current_branch != branch:
-        logger.debug(f"Current branch '{current_branch}' differs from update branch '{branch}'. Skipping update check.")
+    # If we're on a branch other than main or dev, assume it's a developer branch and skip update check
+    if current_branch and current_branch not in ['main', 'dev']:
+        logger.debug(f"Current branch '{current_branch}' is a development branch. Skipping update check.")
         return False
     current = get_current_commit_hash()
     logger.debug(f"Current commit hash: {current}")

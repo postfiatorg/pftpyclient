@@ -322,6 +322,7 @@ class WalletApp(wx.Frame):
         WalletState.TRUSTLINED: ["Summary", "Payments", "Memos", "Log"],
         WalletState.INITIATED: ["Summary", "Payments", "Memos", "Log"],
         WalletState.HANDSHAKE_SENT: ["Summary", "Payments", "Memos", "Log"],
+        WalletState.HANDSHAKE_RECEIVED: ["Summary", "Payments", "Memos", "Log"],
         WalletState.ACTIVE: ["Summary", "Proposals", "Verification", "Rewards", "Payments", "Memos", "Log"]
     }
 
@@ -1447,6 +1448,12 @@ class WalletApp(wx.Frame):
         self.summary_sizer.Layout()
         self.summary_tab.Layout()
 
+    def check_wallet_state(self, is_state_transition=False):
+        """Check the wallet state and update the UI accordingly"""
+        if hasattr(self, 'task_manager'):
+            self.task_manager.determine_wallet_state()
+            self.update_ui_based_on_wallet_state(is_state_transition=is_state_transition)
+
     @PerformanceMonitor.measure('update_ui_based_on_wallet_state')
     def update_ui_based_on_wallet_state(self, is_state_transition=False):
         """Update UI elements based on wallet state. Only hides PFT tabs if wallet is not active."""
@@ -1574,10 +1581,9 @@ class WalletApp(wx.Frame):
                 )
                 if wx.YES == wx.MessageBox(message, "Set Trust Line", wx.YES_NO | wx.ICON_QUESTION):
                     try:
-                        self.worker.expecting_state_change = True
                         self.task_manager.handle_trust_line()
                         wx.CallAfter(self.update_account_display)
-                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                        wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
                     except Exception as e:
                         logger.error(f"Error setting trust line: {e}")
                         wx.MessageBox(f"Error setting trust line: {e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1592,13 +1598,12 @@ class WalletApp(wx.Frame):
                 if dialog.ShowModal() == wx.ID_OK:
                     commitment = dialog.GetValues()["Commitment"]
                     try:
-                        self.worker.expecting_state_change = True
                         response = self.task_manager.send_initiation_rite(commitment)
                         formatted_response = self.format_response(response)
                         dialog = SelectableMessageDialog(self, "Initiation Rite Result", formatted_response)
                         dialog.ShowModal()
                         dialog.Destroy()
-                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                        wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
                     except Exception as e:
                         logger.error(f"Error sending initiation rite: {e}")
                         wx.MessageBox(f"Error sending initiation rite: {e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1616,21 +1621,26 @@ class WalletApp(wx.Frame):
                 )
                 if wx.YES == wx.MessageBox(message, "Send Handshake", wx.YES_NO | wx.ICON_QUESTION):
                     try:
-                        self.worker.expecting_state_change = True
                         response = self.task_manager.send_handshake(self.network_config.node_address)
                         formatted_response = self.format_response(response)
                         dialog = SelectableMessageDialog(self, "Handshake Result", formatted_response)
                         dialog.ShowModal()
                         dialog.Destroy()
-                        wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                        wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
                     except Exception as e:
                         logger.error(f"Error sending handshake: {e}")
                         wx.MessageBox(f"Error sending handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
             case WalletState.HANDSHAKE_SENT:
+                message = (
+                    "Waiting for handshake response from node to establish encrypted channel.\n\n"
+                    "This will only take a moment."
+                )
+                wx.MessageBox(message, "Waiting for Handshake", wx.OK | wx.ICON_INFORMATION)
+
+            case WalletState.HANDSHAKE_RECEIVED:
                 if self.show_google_doc_template(is_initial_setup=True):
                     self.handle_google_doc_submission(event, is_initial_setup=True)
-                    self.worker.expecting_state_change = True
 
             case _:
                 logger.error(f"Unknown wallet state: {current_state}")
@@ -1657,71 +1667,67 @@ class WalletApp(wx.Frame):
             if (current_state == WalletState.UNFUNDED and float(xrp_balance) > 0):
                 logger.info("Account now funded. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.FUNDED
-                if hasattr(self, 'worker'):
-                    self.worker.expecting_state_change = False
                 message = (
                     "Your wallet is now funded!\n\n"
                     "You can now proceed with setting up a trust line for PFT tokens.\n"
                     "Click the 'Take Action' button to continue."
                 )
                 wx.CallAfter(lambda: wx.MessageBox(message, "XRP Received!", wx.OK | wx.ICON_INFORMATION))
-                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
 
             # If trust line is detected and current state is FUNDED
             elif (current_state == WalletState.FUNDED and self.task_manager.has_trust_line()):
                 logger.info("Trust line detected. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.TRUSTLINED
-                if hasattr(self, 'worker'):
-                    self.worker.expecting_state_change = False
                 message = (
                     "Trust line successfully established!\n\n"
                     "You can now proceed with the initiation rite.\n"
                     "Click the 'Take Action' button to continue."                    
                 )
                 wx.CallAfter(lambda: wx.MessageBox(message, "Trust Line Set!", wx.OK | wx.ICON_INFORMATION))
-                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
 
             # If initiation rite is detected and current state is TRUSTLINED
             elif (current_state == WalletState.TRUSTLINED and self.task_manager.initiation_rite_sent()):
                 logger.info("Initiation rite detected. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.INITIATED
-                if hasattr(self, 'worker'):
-                    self.worker.expecting_state_change = False
                 message = (
                     "Initiation rite successfully sent!\n\n"
-                    "You can now proceed with setting up your Google Doc.\n"
+                    "You can now proceed with setting up an encryption channel with the node.\n"
                     "Click the 'Take Action' button to continue."
                 )
                 wx.CallAfter(lambda: wx.MessageBox(message, "Initiation Complete!", wx.OK | wx.ICON_INFORMATION))
-                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
 
-            # If Handshake is detected and current state is INITIATED
+            # If sent handshake is detected and current state is INITIATED
             elif (current_state == WalletState.INITIATED and self.task_manager.handshake_sent()):
                 logger.info("Handshake detected. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.HANDSHAKE_SENT
-                if hasattr(self, 'worker'):
-                    self.worker.expecting_state_change = False
+                wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
+
+            # If received handshake is detected and current state is HANDSHAKE_SENT
+            elif (current_state == WalletState.HANDSHAKE_SENT and self.task_manager.handshake_received()):
+                logger.info("Handshake detected. Updating wallet state.")
+                self.task_manager.wallet_state = WalletState.HANDSHAKE_RECEIVED
                 message = (
-                    "Handshake successfully sent!\n\n"
+                    "Handshake protocol complete!\n\n"
                     "You can now proceed with setting up your Google Doc.\n"
                     "Click the 'Take Action' button to continue."
                 )
                 wx.CallAfter(lambda: wx.MessageBox(message, "Handshake Sent!", wx.OK | wx.ICON_INFORMATION))
-                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
 
-            # TIf Google Doc is detected and current state is HANDSHAKE_SENT
-            elif (current_state == WalletState.HANDSHAKE_SENT and self.task_manager.google_doc_sent()):
+            # If Google Doc is detected and current state is HANDSHAKE_RECEIVED
+            elif (current_state == WalletState.HANDSHAKE_RECEIVED and self.task_manager.google_doc_sent()):
                 logger.info("Google Doc detected. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.ACTIVE
-                if hasattr(self, 'worker'):
-                    self.worker.expecting_state_change = False
                 message = (
                     "Google Doc successfully set up!\n\n"
                     "Your wallet is now fully initialized and ready to use.\n"
                     "You can now start accepting tasks."
                 )
                 wx.CallAfter(lambda: wx.MessageBox(message, "Google Doc Ready!", wx.OK | wx.ICON_INFORMATION))
-                wx.CallAfter(lambda: self.update_ui_based_on_wallet_state(is_state_transition=True))
+                wx.CallAfter(lambda: self.check_wallet_state(is_state_transition=True))
 
     @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('update_tokens')

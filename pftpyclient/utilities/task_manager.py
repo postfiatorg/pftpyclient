@@ -145,6 +145,8 @@ class PostFiatTaskManager:
             case WalletState.INITIATED:
                 return "Send handshake to node"
             case WalletState.HANDSHAKE_SENT:
+                return "Await handshake response from node"
+            case WalletState.HANDSHAKE_RECEIVED:
                 return "Send google doc link"
             case WalletState.ACTIVE:
                 return "No action required, Wallet is fully initialized"
@@ -769,8 +771,14 @@ class PostFiatTaskManager:
     def handshake_sent(self):
         """Checks if the user has sent a handshake to the node"""
         logger.debug(f"Checking if user has sent handshake to the node. Wallet state: {self.wallet_state}")
-        handshake_sent, node_public_key = self.get_handshake_for_address(self.default_node)
-        return handshake_sent and node_public_key
+        handshake_sent, _ = self.get_handshake_for_address(self.default_node)
+        return handshake_sent
+    
+    def handshake_received(self):
+        """Checks if the user has received a handshake from the node"""
+        logger.debug(f"Checking if user has received handshake from the node. Wallet state: {self.wallet_state}")
+        _, received_key = self.get_handshake_for_address(self.default_node)
+        return received_key is not None
     
     @PerformanceMonitor.measure('get_handshakes')
     def get_handshakes(self):

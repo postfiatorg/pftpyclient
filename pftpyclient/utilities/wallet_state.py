@@ -3,21 +3,24 @@ from functools import wraps
 from loguru import logger
 
 class WalletState(Enum):
-    UNFUNDED = "unfunded"               # XRP address exists but not activated on XRPL
-    FUNDED = "funded"                   # XRP address activated on XRPL
-    TRUSTLINED = "trustlined"           # Trust line to PFT established
-    INITIATED = "initiated"             # Initiation rite sent
-    HANDSHAKE_SENT = "handshake_sent"   # Handshake sent
-    ACTIVE = "active"                   # Fully initialized, ready to accept tasks
+    UNFUNDED = "unfunded"                       # XRP address exists but not activated on XRPL
+    FUNDED = "funded"                           # XRP address activated on XRPL
+    TRUSTLINED = "trustlined"                   # Trust line to PFT established
+    INITIATED = "initiated"                     # Initiation rite sent
+    HANDSHAKE_SENT = "handshake_sent"           # Handshake sent, awaiting response from node
+    HANDSHAKE_RECEIVED = "handshake_received"   # Handshake received from node, awaiting google doc link from user
+    ACTIVE = "active"                           # Fully initialized, ready to accept tasks
 
 # states where account exists on blockchain
 FUNDED_STATES = [state for state in WalletState if state != WalletState.UNFUNDED]
 # states where trust line is established
-TRUSTLINED_STATES = [WalletState.TRUSTLINED, WalletState.INITIATED, WalletState.HANDSHAKE_SENT, WalletState.ACTIVE]
+TRUSTLINED_STATES = [WalletState.TRUSTLINED, WalletState.INITIATED, WalletState.HANDSHAKE_SENT, WalletState.HANDSHAKE_RECEIVED, WalletState.ACTIVE]
 # states where initiation rite is sent
-INITIATED_STATES = [WalletState.INITIATED, WalletState.HANDSHAKE_SENT, WalletState.ACTIVE]
+INITIATED_STATES = [WalletState.INITIATED, WalletState.HANDSHAKE_SENT, WalletState.HANDSHAKE_RECEIVED, WalletState.ACTIVE]
 # states where handshake is sent
-HANDSHAKED_STATES = [WalletState.HANDSHAKE_SENT, WalletState.ACTIVE]
+HANDSHAKED_STATES = [WalletState.HANDSHAKE_SENT, WalletState.HANDSHAKE_RECEIVED, WalletState.ACTIVE]
+# states where google doc link is sent
+GOOGLE_DOC_SENT_STATES = [WalletState.HANDSHAKE_RECEIVED, WalletState.ACTIVE]
 # states where PFT features are available, after encrypted google doc link is sent
 ACTIVATED_STATES = [WalletState.ACTIVE]
 
