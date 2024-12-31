@@ -741,32 +741,47 @@ class WalletApp(wx.Frame):
 
         # Add checkboxes
         self.memo_chk_encrypt = wx.CheckBox(self.memos_tab, label="Encrypt")
-
         recipient_sizer.Add(self.memo_chk_encrypt, flag=wx.ALIGN_CENTER_VERTICAL, border=5)
-
         self.memos_sizer.Add(recipient_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Create splitter window
+        self.memos_splitter = wx.SplitterWindow(self.memos_tab, style=wx.SP_3D | wx.SP_LIVE_UPDATE)
+        top_panel = wx.Panel(self.memos_splitter)
+        top_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Add memo input box section with encryption requests button
         memo_header_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.lbl_memo = wx.StaticText(self.memos_tab, label="Enter your memo:")
+        self.lbl_memo = wx.StaticText(top_panel, label="Enter your memo:")
         memo_header_sizer.Add(self.lbl_memo, 1, wx.ALIGN_CENTER_VERTICAL)
 
-        self.btn_encryption_requests = wx.Button(self.memos_tab, label="Encryption Requests")
+        self.btn_encryption_requests = wx.Button(top_panel, label="Encryption Requests")
         self.btn_encryption_requests.Bind(wx.EVT_BUTTON, self.on_encryption_requests)
         memo_header_sizer.Add(self.btn_encryption_requests, 0, wx.LEFT | wx.ALIGN_CENTER_VERTICAL, 5)
 
-        self.memos_sizer.Add(memo_header_sizer, 0, wx.EXPAND | wx.ALL, border=5)
-        self.txt_memo_input = wx.TextCtrl(self.memos_tab, style=wx.TE_MULTILINE, size=(-1, 200))
-        self.memos_sizer.Add(self.txt_memo_input, 1, wx.EXPAND | wx.ALL, border=5)
+        top_sizer.Add(memo_header_sizer, 0, wx.EXPAND | wx.ALL, border=5)
+        self.txt_memo_input = wx.TextCtrl(top_panel, style=wx.TE_MULTILINE, size=(-1, 200))
+        top_sizer.Add(self.txt_memo_input, 1, wx.EXPAND | wx.ALL, border=5)
 
         # Add submit button
-        self.btn_submit_memo = wx.Button(self.memos_tab, label="Submit Memo")
-        self.memos_sizer.Add(self.btn_submit_memo, flag=wx.ALL | wx.EXPAND, border=5)
-        self.btn_submit_memo.Bind(wx.EVT_BUTTON, self.on_submit_memo)        
+        self.btn_submit_memo = wx.Button(top_panel, label="Submit Memo")
+        top_sizer.Add(self.btn_submit_memo, flag=wx.ALL | wx.EXPAND, border=5)
+        self.btn_submit_memo.Bind(wx.EVT_BUTTON, self.on_submit_memo)
+
+        top_panel.SetSizer(top_sizer)
 
         # Add grid to Memos tab
-        self.memos_grid = self.setup_grid(gridlib.Grid(self.memos_tab), 'memos')
-        self.memos_sizer.Add(self.memos_grid, 1, wx.EXPAND | wx.ALL, 20)
+        bottom_panel = wx.Panel(self.memos_splitter)
+        bottom_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.memos_grid = self.setup_grid(gridlib.Grid(bottom_panel), 'memos')
+        bottom_sizer.Add(self.memos_grid, 1, wx.EXPAND | wx.ALL, 20)
+        bottom_panel.SetSizer(bottom_sizer)
+
+        # Initialize splitter
+        self.memos_splitter.SplitHorizontally(top_panel, bottom_panel)
+        self.memos_splitter.SetMinimumPaneSize(100)
+        self.memos_splitter.SetSashGravity(0.4)
+
+        self.memos_sizer.Add(self.memos_splitter, 1, wx.EXPAND)
 
         # Store reference to memos tab page
         self.tab_pages["Memos"] = self.memos_tab
