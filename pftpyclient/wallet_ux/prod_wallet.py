@@ -1410,7 +1410,11 @@ class WalletApp(wx.Frame):
         
         self.wallet = self.task_manager.user_wallet
 
+        self.wallet_state_in_transition = False
+        self.take_action_dialog_shown = False
         self.update_ui_based_on_wallet_state()
+        self.wallet_state_monitor_timer = None
+        self.state_check_interval = 10000  # 10 seconds
 
         logger.info(f"Logged in as {self.username}")
 
@@ -1441,10 +1445,6 @@ class WalletApp(wx.Frame):
 
         self.update_all_destination_comboboxes()
 
-        self.wallet_state_in_transition = False
-        self.wallet_state_monitor_timer = None
-        self.state_check_interval = 10000  # 10 seconds
-
     def update_network_display(self):
         """Update UI elements that display network information"""
         self.summary_lbl_endpoint.SetLabel(f"HTTPS: {self.network_url}")
@@ -1456,6 +1456,7 @@ class WalletApp(wx.Frame):
         """Check the wallet state and update the UI accordingly"""
         if hasattr(self, 'task_manager'):
             self.task_manager.determine_wallet_state()
+            self.update_account_display()
             self.update_ui_based_on_wallet_state()
 
     def start_wallet_state_monitoring(self):
@@ -1527,7 +1528,7 @@ class WalletApp(wx.Frame):
         self.panel.Layout()
 
         # Only show message box if not a state transition
-        if not self.wallet_state_in_transition:
+        if not self.take_action_dialog_shown:
             if current_state != WalletState.ACTIVE:
                 required_action = self.task_manager.get_required_action()
                 message = (
@@ -1536,6 +1537,7 @@ class WalletApp(wx.Frame):
                     f"All features will be unlocked once wallet reaches '{WalletState.ACTIVE.value}' state."
                 )
                 wx.MessageBox(message, "Wallet Features Limited", wx.OK | wx.ICON_INFORMATION)
+                self.take_action_dialog_shown = True
 
     def on_create_new_user(self, event):
         self.login_panel.Hide()
@@ -1612,7 +1614,6 @@ class WalletApp(wx.Frame):
                 if wx.YES == wx.MessageBox(message, "Set Trust Line", wx.YES_NO | wx.ICON_QUESTION):
                     try:
                         self.task_manager.handle_trust_line()
-                        wx.CallAfter(self.update_account_display)
                         self.start_wallet_state_monitoring()
                     except Exception as e:
                         logger.error(f"Error setting trust line: {e}")
@@ -1736,14 +1737,12 @@ class WalletApp(wx.Frame):
 
             # If sent handshake is detected and current state is INITIATED
             elif (current_state == WalletState.INITIATED and self.task_manager.handshake_sent()):
-                logger.info("Handshake detected. Updating wallet state.")
+                logger.info("Sent handshake. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.HANDSHAKE_SENT
-                wx.CallAfter(lambda: self.check_wallet_state())
-                # no need to set wallet_state_in_transition to false, since we expect node to respond to handshake
 
             # If received handshake is detected and current state is HANDSHAKE_SENT
             elif (current_state == WalletState.HANDSHAKE_SENT and self.task_manager.handshake_received()):
-                logger.info("Handshake detected. Updating wallet state.")
+                logger.info("Received handshake. Updating wallet state.")
                 self.task_manager.wallet_state = WalletState.HANDSHAKE_RECEIVED
                 message = (
                     "Handshake protocol complete!\n\n"
@@ -2943,14 +2942,7 @@ class WalletApp(wx.Frame):
                     logger.error("Worker thread did not stop gracefully")
                 self.worker = None
 
-            # Stop timers
-            if hasattr(self, 'pft_update_timer'):
-                logger.debug("Stopping PFT update timer")
-                self.pft_update_timer.Stop()
-
-            if hasattr(self, 'tx_update_timer'):
-                logger.debug("Stopping TX update timer")
-                self.tx_update_timer.Stop()
+            self.stop_wallet_state_monitoring()
 
             # Clear sensitive data
             if hasattr(self, 'task_manager'):

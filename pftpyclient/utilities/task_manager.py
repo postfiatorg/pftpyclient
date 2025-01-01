@@ -125,8 +125,10 @@ class PostFiatTaskManager:
                             self.wallet_state = WalletState.INITIATED
                             if self.handshake_sent():
                                 self.wallet_state = WalletState.HANDSHAKE_SENT
-                                if self.google_doc_sent():
-                                    self.wallet_state = WalletState.ACTIVE
+                                if self.handshake_received():
+                                    self.wallet_state = WalletState.HANDSHAKE_RECEIVED
+                                    if self.google_doc_sent():
+                                        self.wallet_state = WalletState.ACTIVE
             else:
                 logger.warning(f"Account {self.user_wallet.classic_address} does not exist on XRPL")
         
@@ -1521,6 +1523,9 @@ class PostFiatTaskManager:
         """ This function gets the most recent google doc context link for a given account address """
 
         logger.debug("Getting latest outgoing context doc link...")
+        if self.system_memos.empty or len(self.system_memos) == 0:
+            logger.warning("System memos dataframe is empty. No context doc link found.")
+            return None
 
         # Filter for outgoing google doc context links
         redux_tx_list = self.system_memos[
@@ -2110,8 +2115,6 @@ class PostFiatTaskManager:
                         f"Datetime: {pd.Timestamp(data['datetime']).strftime('%Y-%m-%d %H:%M:%S') if 'datetime' in data else 'N/A'}\n"
                     )
                     return formatted_string
-                else:
-                    return "No data available."
                 
             # Sorting account info by datetime
             if not self.memo_transactions.empty and len(self.memo_transactions) > 0 and 'datetime' in self.memo_transactions.columns:
@@ -2124,8 +2127,10 @@ class PostFiatTaskManager:
                 # Formatting messages
                 incoming_message = format_dict(most_recent_incoming_message)
                 outgoing_message = format_dict(most_recent_outgoing_message)
-                account_info['Incoming Message'] = incoming_message
-                account_info['Outgoing Message'] = outgoing_message
+                if incoming_message:
+                    account_info['Incoming Message'] = incoming_message
+                if outgoing_message:
+                    account_info['Outgoing Message'] = outgoing_message
 
         except Exception as e:
             logger.error(f"Error processing account info: {e}")
