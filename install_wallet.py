@@ -10,6 +10,92 @@ from datetime import datetime
 
 REPO_URL = "https://github.com/postfiatorg/pftpyclient.git"
 
+def get_python_requirement() -> tuple[int, int]:
+    """Get minimum Python version from project configuration"""
+    repo_path = Path(__file__).parent
+    setup_path = repo_path / "setup.py"
+
+    try:
+        if setup_path.exists():
+            # Fall back to parsing setup.py
+            with open(setup_path, 'r') as f:
+                content = f.read()
+                import re
+                if match := re.search(r'python_requires\s*=\s*[\'"]>=\s*(\d+)\.(\d+)[\'"]', content):
+                    return (int(match.group(1)), int(match.group(2)))
+        
+        raise RuntimeError("Could not determine Python version requirement from project files")
+    
+    except Exception as e:
+        print(f"Failed to read Python version requirement: {e}")
+        raise RuntimeError(f"Could not determine Python version requirement: {e}")
+
+def get_system_python() -> str:
+    """Get the path to the system Python executable that meets version requirements"""
+    # Try multiple methods to find Python on all platforms
+    best_version = (0, 0)
+    best_path = None
+
+    try:
+        min_version = get_python_requirement()
+        logging.debug(f"Required Python version: >={min_version[0]}.{min_version[1]}")
+    except Exception as e:
+        logging.error(str(e))
+        raise
+
+    # Different paths to try based on platform
+    if platform.system() == "Windows":
+        possible_paths = [
+            "python"
+        ]
+    else:
+        possible_paths = [
+            "python3",
+            "python"
+        ]
+    
+    for path in possible_paths:
+        try:
+            # Test if this Python works and get its version
+            result = subprocess.run(
+                [path, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            major, minor = map(int, result.stdout.strip().split())
+            version = (major, minor)
+            
+            # Update best version if this one is newer
+            if version > best_version:
+                best_version = version
+                best_path = path
+                
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logging.debug(f"Failed to check {path}: {str(e)}")
+            continue
+    
+    if best_path:
+        if best_version >= min_version:
+            logging.info(f"Selected Python {best_version[0]}.{best_version[1]} at {best_path}")
+            return best_path
+        else:
+            raise RuntimeError(
+                f"Found Python {best_version[0]}.{best_version[1]}, but version "
+                f"{min_version[0]}.{min_version[1]} or higher is required"
+            )
+
+    # Fallback to system paths if PATH-based Python not found
+    if platform.system() == "Darwin":  # macOS
+        return "/usr/bin/python3"
+    elif platform.system() == "Windows":
+        raise RuntimeError(
+            "Could not find Python installation. Please ensure Python 3.11+ is installed "
+            "and either in PATH or in a standard installation location."
+        )
+    else:  # Linux
+        return "/usr/bin/python3"
+
 def configure_logging(level: str = "INFO"):
     """Configure logging for installation using standard library"""
     logging.basicConfig(
@@ -61,30 +147,45 @@ def get_package_root(local_path: Path = None) -> Path:
     logging.warning("Failed to determine package root, using current working directory")
     return Path.cwd()
 
-def activate_virtual_environment_and_install(env_name):
+def get_activation_command(env_name: str) -> tuple[str, dict]:
+    """Get the appropriate virtual environment activation command and shell settings for the current platform
+    
+    Returns:
+        tuple[str, dict]: Activation command and subprocess kwargs
+    """
     os_type = platform.system()
-    venv_activate = None
+    
+    if os_type == "Windows":
+        venv_activate = Path(env_name) / "Scripts" / "activate"
+        return (f'"{venv_activate}"', {"shell": True})
+    else:
+        venv_activate = Path(env_name) / "bin" / "activate"
+        return (f"source {venv_activate}", {
+            "shell": True,
+            "executable": "/bin/bash"
+        })
 
+def activate_virtual_environment_and_install(env_name):
+    """Activate virtual environment and install package"""
     project_root = get_package_root()
     logging.info(f"Installing package from {project_root}")
 
-    extras = "[windows]" if os_type == "Windows" else ""
-
+    extras = "[windows]" if platform.system() == "Windows" else ""
+    
     try:
-        if os_type == "Darwin" or os_type == "Linux":
-            venv_activate = Path(env_name) / "bin" / "activate"
-            command = f"source {venv_activate} && pip install -e {project_root}"
-            subprocess.check_call(command, shell=True, executable="/bin/bash")
-
-        elif os_type == "Windows":
-            venv_activate = Path(env_name) / "Scripts" / "activate"
-            command = f"{venv_activate} && pip install -e {project_root}{extras}"
-            subprocess.check_call(command, shell=True)
-
-        logging.info(f"Virtual environment {env_name} activated on {os_type} and installed {project_root}")
+        activate_cmd, shell_settings = get_activation_command(env_name)
+        command = f"{activate_cmd} && pip install -e {project_root}{extras}"
+        subprocess.check_call(command, **shell_settings)
+        logging.info(f"Virtual environment {env_name} activated and installed {project_root}")
     except subprocess.CalledProcessError as e:
         logging.error(f"Installation failed: {e}")
         raise
+
+def run_in_venv(env_name: str, command: str):
+    """Run a command in the virtual environment"""
+    activate_cmd, shell_settings = get_activation_command(env_name)
+    full_command = f"{activate_cmd} && {command}"
+    return subprocess.Popen(full_command, **shell_settings)
 
 def get_desktop_path() -> Path:
     """Get the correct path to the user's desktop across different OS and configurations"""
@@ -147,10 +248,12 @@ def destroy_virtual_environment(env_name):
         logging.info(f"Virtual environment {env_name} destroyed")
     except Exception as e:
         logging.error(f"Failed to destroy virtual environment: {e}")
+        raise RuntimeError(f"Failed to destroy virtual environment: {e}")
 
 def create_virtual_environment(env_name):
     try:
-        subprocess.check_call([sys.executable, "-m", "venv", env_name])
+        python_path = get_system_python()
+        subprocess.check_call([python_path, "-m", "venv", env_name])
         logging.info(f"Virtual environment {env_name} created")
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to create virtual environment: {e}")
@@ -180,6 +283,7 @@ def create_shortcut(env_name):
 
 def main():
     parser = argparse.ArgumentParser(description="Install Post Fiat Wallet")
+    parser.add_argument('--launch', action='store_true', help='Launch wallet after installation')
     args = parser.parse_args()
 
     logger = configure_logging(level="DEBUG")
@@ -201,6 +305,16 @@ def main():
         move_shortcut_to_desktop(root)
         
         logging.info("Installation completed successfully!")
+
+        # Launch if requested
+        if args.launch:
+            desktop_path = get_desktop_path()
+            if platform.system() == "Windows":
+                launch_cmd = f'start "" "{desktop_path / "Post Fiat Wallet.lnk"}"'
+            else:
+                launch_cmd = f'{"open" if platform.system() == "Darwin" else "xdg-open"} "{desktop_path / "Post Fiat Wallet.command"}"'
+            
+            run_in_venv(env_name, launch_cmd)
         
     except Exception as e:
         logging.error(f"Installation failed: {e}")

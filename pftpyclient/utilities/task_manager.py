@@ -125,8 +125,10 @@ class PostFiatTaskManager:
                             self.wallet_state = WalletState.INITIATED
                             if self.handshake_sent():
                                 self.wallet_state = WalletState.HANDSHAKE_SENT
-                                if self.google_doc_sent():
-                                    self.wallet_state = WalletState.ACTIVE
+                                if self.handshake_received():
+                                    self.wallet_state = WalletState.HANDSHAKE_RECEIVED
+                                    if self.google_doc_sent():
+                                        self.wallet_state = WalletState.ACTIVE
             else:
                 logger.warning(f"Account {self.user_wallet.classic_address} does not exist on XRPL")
         
@@ -145,6 +147,8 @@ class PostFiatTaskManager:
             case WalletState.INITIATED:
                 return "Send handshake to node"
             case WalletState.HANDSHAKE_SENT:
+                return "Await handshake response from node"
+            case WalletState.HANDSHAKE_RECEIVED:
                 return "Send google doc link"
             case WalletState.ACTIVE:
                 return "No action required, Wallet is fully initialized"
@@ -769,8 +773,14 @@ class PostFiatTaskManager:
     def handshake_sent(self):
         """Checks if the user has sent a handshake to the node"""
         logger.debug(f"Checking if user has sent handshake to the node. Wallet state: {self.wallet_state}")
-        handshake_sent, node_public_key = self.get_handshake_for_address(self.default_node)
-        return handshake_sent and node_public_key
+        handshake_sent, _ = self.get_handshake_for_address(self.default_node)
+        return handshake_sent
+    
+    def handshake_received(self):
+        """Checks if the user has received a handshake from the node"""
+        logger.debug(f"Checking if user has received handshake from the node. Wallet state: {self.wallet_state}")
+        _, received_key = self.get_handshake_for_address(self.default_node)
+        return received_key is not None
     
     @PerformanceMonitor.measure('get_handshakes')
     def get_handshakes(self):
@@ -1513,6 +1523,9 @@ class PostFiatTaskManager:
         """ This function gets the most recent google doc context link for a given account address """
 
         logger.debug("Getting latest outgoing context doc link...")
+        if self.system_memos.empty or len(self.system_memos) == 0:
+            logger.warning("System memos dataframe is empty. No context doc link found.")
+            return None
 
         # Filter for outgoing google doc context links
         redux_tx_list = self.system_memos[
@@ -1627,6 +1640,9 @@ class PostFiatTaskManager:
     def get_proposals_df(self, include_refused=False):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and acceptance""" 
 
+        if self.tasks.empty:
+            return pd.DataFrame()
+
         # Filter tasks with task_type in ['PROPOSAL','ACCEPTANCE']
         filtered_tasks = self.tasks[self.tasks['task_type'].isin([
             TaskType.PROPOSAL.name, 
@@ -1690,6 +1706,9 @@ class PostFiatTaskManager:
     def get_verification_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, original_task, and verification""" 
 
+        if self.tasks.empty:
+            return pd.DataFrame()
+
         # Filter tasks with task_type in ['PROPOSAL','VERIFICATION_PROMPT']
         filtered_tasks = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.VERIFICATION_PROMPT.name])]
 
@@ -1724,6 +1743,9 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('get_rewards_df')
     def get_rewards_df(self):
         """ This reduces tasks dataframe into a dataframe containing the columns task_id, proposal, and reward""" 
+
+        if self.tasks.empty:
+            return pd.DataFrame()
 
         # Filter for only PROPOSAL and REWARD rows
         filtered_df = self.tasks[self.tasks['task_type'].isin([TaskType.PROPOSAL.name, TaskType.REWARD.name])]
@@ -2093,8 +2115,6 @@ class PostFiatTaskManager:
                         f"Datetime: {pd.Timestamp(data['datetime']).strftime('%Y-%m-%d %H:%M:%S') if 'datetime' in data else 'N/A'}\n"
                     )
                     return formatted_string
-                else:
-                    return "No data available."
                 
             # Sorting account info by datetime
             if not self.memo_transactions.empty and len(self.memo_transactions) > 0 and 'datetime' in self.memo_transactions.columns:
@@ -2107,8 +2127,10 @@ class PostFiatTaskManager:
                 # Formatting messages
                 incoming_message = format_dict(most_recent_incoming_message)
                 outgoing_message = format_dict(most_recent_outgoing_message)
-                account_info['Incoming Message'] = incoming_message
-                account_info['Outgoing Message'] = outgoing_message
+                if incoming_message:
+                    account_info['Incoming Message'] = incoming_message
+                if outgoing_message:
+                    account_info['Outgoing Message'] = outgoing_message
 
         except Exception as e:
             logger.error(f"Error processing account info: {e}")
@@ -2158,6 +2180,18 @@ class PostFiatTaskManager:
         template = self.network_config.explorer_account_url_mask
         return template.format(address=address)
     
+    def get_current_trust_limit(self):
+        """Gets the current trust line limit for PFT token"""
+        try:
+            pft_holders = self.get_pft_holder_df()
+            user_row = pft_holders[pft_holders['account'] == self.user_wallet.address]
+            if not user_row.empty:
+                return user_row['limit_peer'].iloc[0]
+            return "0"
+        except Exception as e:
+            logger.error(f"Error getting trust line limit: {e}")
+            return "0"
+    
     def has_trust_line(self):
         """ Checks if the user has a trust line to the PFT token"""
         try:
@@ -2174,23 +2208,27 @@ class PostFiatTaskManager:
         """ Handles the creation of a trust line to the PFT token if it doesn't exist"""
         logger.debug("Checking if trust line exists...")
         if not self.has_trust_line():
-            _ = self.generate_trust_line_to_pft_token()
+            _ = self.update_trust_line_limit()
             logger.debug("Trust line created")
         else:
             logger.debug("Trust line already exists")
 
-    def generate_trust_line_to_pft_token(self):
-        """ Note this transaction consumes XRP to create a trust
-        line for the PFT Token so the holder DF should be checked 
-        before this is run
-        """ 
+    def update_trust_line_limit(self, new_limit = constants.DEFAULT_PFT_LIMIT):
+        """Updates the trust line limit for PFT token
+        
+        Args:
+            new_limit: New limit value
+        
+        Returns:
+            Transaction response
+        """
         client = xrpl.clients.JsonRpcClient(self.network_url)
         trust_set_tx = xrpl.models.transactions.TrustSet(
             account=self.user_wallet.address,
             limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
                 currency="PFT",
                 issuer=self.pft_issuer,
-                value=constants.DEFAULT_PFT_LIMIT,
+                value=new_limit,
             )
         )
         logger.debug(f"Creating trust line from {self.user_wallet.address} to issuer...")

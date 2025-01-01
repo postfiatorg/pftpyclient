@@ -23,8 +23,7 @@ install_requires = [
     'psutil',
     'pyqtgraph',    # used for performance monitoring, #TODO: make this optional
     'PyQt5',         # used for performance monitoring, #TODO: make this optional
-    'PyNaCl',
-    'pip-system-certs'
+    'PyNaCl'
 ]
 
 if sys.platform == 'win32':
