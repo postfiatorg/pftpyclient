@@ -434,6 +434,11 @@ class WalletApp(wx.Frame):
 
         self.username = None
 
+        self.wallet_state_in_transition = None
+        self.take_action_dialog_shown = False
+        self.wallet_state_monitor_timer = None
+        self.state_check_interval = 10000  # 10 seconds
+
         # Check for migration
         check_and_show_migration_dialog(parent=self)
 
@@ -1410,10 +1415,6 @@ class WalletApp(wx.Frame):
         
         self.wallet = self.task_manager.user_wallet
 
-        self.wallet_state_in_transition = None
-        self.take_action_dialog_shown = False
-        self.wallet_state_monitor_timer = None
-        self.state_check_interval = 10000  # 10 seconds
         self.start_wallet_state_monitoring()
 
         logger.info(f"Logged in as {self.username}")
