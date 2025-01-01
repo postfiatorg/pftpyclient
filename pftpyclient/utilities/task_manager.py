@@ -1409,7 +1409,7 @@ class PostFiatTaskManager:
                 response = client.request(request)
                 
                 # debugging
-                logger.debug(f"Full XRPL response: {response}")
+                # logger.debug(f"Full XRPL response: {response}")
 
                 if response.is_successful():
                     transactions = response.result.get("transactions", [])
@@ -2183,11 +2183,25 @@ class PostFiatTaskManager:
     def get_current_trust_limit(self):
         """Gets the current trust line limit for PFT token"""
         try:
-            pft_holders = self.get_pft_holder_df()
-            user_row = pft_holders[pft_holders['account'] == self.user_wallet.address]
-            if not user_row.empty:
-                return user_row['limit_peer'].iloc[0]
+            client = xrpl.clients.JsonRpcClient(self.network_url)
+            request = xrpl.models.requests.AccountLines(
+                account=self.user_wallet.address,
+                peer=self.pft_issuer
+            )
+            
+            response = client.request(request)
+            if not response.is_successful():
+                logger.error(f"Failed to get account lines: {response}")
+                return "0"
+                
+            # Find the PFT trust line
+            for line in response.result.get('lines', []):
+                if line.get('currency') == 'PFT':
+                    return line.get('limit', "0")
+            
+            logger.debug(f"No PFT trust line found for {self.user_wallet.address}")
             return "0"
+
         except Exception as e:
             logger.error(f"Error getting trust line limit: {e}")
             return "0"
@@ -2195,12 +2209,30 @@ class PostFiatTaskManager:
     def has_trust_line(self):
         """ Checks if the user has a trust line to the PFT token"""
         try:
-            pft_holders = self.get_pft_holder_df()
-            existing_pft_accounts = list(pft_holders['account'])
-            user_is_in_pft_accounts = self.user_wallet.address in existing_pft_accounts
-            return user_is_in_pft_accounts
+            client = xrpl.clients.JsonRpcClient(self.network_url)
+            request = xrpl.models.requests.AccountLines(
+                account=self.user_wallet.address,
+                peer=self.pft_issuer  # Only get trust lines with PFT issuer
+            )
+            
+            response = client.request(request)
+            if not response.is_successful():
+                logger.error(f"Failed to get account lines: {response}")
+                return False
+                
+            # Check if any of the lines are for PFT
+            lines = response.result.get('lines', [])
+            has_pft = any(
+                line.get('currency') == 'PFT' 
+                for line in lines
+            )
+            
+            logger.debug(f"Trust line check for {self.user_wallet.address}: {'Found' if has_pft else 'Not found'}")
+            return has_pft
+
         except Exception as e:
-            logger.error(f"Error checking if user has a trust line: {e}")
+            logger.error(f"Error checking trust line: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     @requires_wallet_state(FUNDED_STATES)
@@ -2238,27 +2270,6 @@ class PostFiatTaskManager:
             response = f"Submit failed: {e}"
             logger.error(f"Trust line creation failed: {response}")
         return response
-    
-    def get_pft_holder_df(self):
-        """ This function outputs a detail of all accounts holding PFT tokens
-        with a float of their balances as pft_holdings. note this is from
-        the view of the issuer account so balances appear negative so the pft_holdings 
-        are reverse signed.
-        """
-        client = xrpl.clients.JsonRpcClient(self.network_url)
-        logger.debug("Getting dataframe of all accounts holding PFT tokens...")
-        response = client.request(xrpl.models.requests.AccountLines(
-            account=self.pft_issuer,
-            ledger_index="validated",
-            peer=None,
-            limit=None))
-        if not response.is_successful():
-            raise Exception(f"Error fetching PFT holders: {response.result.get('error')}")
-        full_post_fiat_holder_df = pd.DataFrame(response.result)
-        for xfield in ['account','balance','currency','limit_peer']:
-            full_post_fiat_holder_df[xfield] = full_post_fiat_holder_df['lines'].apply(lambda x: x[xfield])
-        full_post_fiat_holder_df['pft_holdings']=full_post_fiat_holder_df['balance'].astype(float)*-1
-        return full_post_fiat_holder_df
 
 def is_over_1kb(value: Union[str, int, float]) -> bool:
     if isinstance(value, str):
