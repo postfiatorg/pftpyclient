@@ -1410,11 +1410,11 @@ class WalletApp(wx.Frame):
         
         self.wallet = self.task_manager.user_wallet
 
-        self.wallet_state_in_transition = False
+        self.wallet_state_in_transition = None
         self.take_action_dialog_shown = False
-        self.update_ui_based_on_wallet_state()
         self.wallet_state_monitor_timer = None
         self.state_check_interval = 10000  # 10 seconds
+        self.start_wallet_state_monitoring()
 
         logger.info(f"Logged in as {self.username}")
 
@@ -1527,7 +1527,7 @@ class WalletApp(wx.Frame):
         self.summary_tab.Layout()
         self.panel.Layout()
 
-        # Only show message box if not a state transition
+        # Only show message box once
         if not self.take_action_dialog_shown:
             if current_state != WalletState.ACTIVE:
                 required_action = self.task_manager.get_required_action()
