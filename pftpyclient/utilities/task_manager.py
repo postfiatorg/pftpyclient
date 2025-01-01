@@ -125,8 +125,10 @@ class PostFiatTaskManager:
                             self.wallet_state = WalletState.INITIATED
                             if self.handshake_sent():
                                 self.wallet_state = WalletState.HANDSHAKE_SENT
-                                if self.google_doc_sent():
-                                    self.wallet_state = WalletState.ACTIVE
+                                if self.handshake_received():
+                                    self.wallet_state = WalletState.HANDSHAKE_RECEIVED
+                                    if self.google_doc_sent():
+                                        self.wallet_state = WalletState.ACTIVE
             else:
                 logger.warning(f"Account {self.user_wallet.classic_address} does not exist on XRPL")
         
@@ -145,6 +147,8 @@ class PostFiatTaskManager:
             case WalletState.INITIATED:
                 return "Send handshake to node"
             case WalletState.HANDSHAKE_SENT:
+                return "Await handshake response from node"
+            case WalletState.HANDSHAKE_RECEIVED:
                 return "Send google doc link"
             case WalletState.ACTIVE:
                 return "No action required, Wallet is fully initialized"
@@ -769,8 +773,14 @@ class PostFiatTaskManager:
     def handshake_sent(self):
         """Checks if the user has sent a handshake to the node"""
         logger.debug(f"Checking if user has sent handshake to the node. Wallet state: {self.wallet_state}")
-        handshake_sent, node_public_key = self.get_handshake_for_address(self.default_node)
-        return handshake_sent and node_public_key
+        handshake_sent, _ = self.get_handshake_for_address(self.default_node)
+        return handshake_sent
+    
+    def handshake_received(self):
+        """Checks if the user has received a handshake from the node"""
+        logger.debug(f"Checking if user has received handshake from the node. Wallet state: {self.wallet_state}")
+        _, received_key = self.get_handshake_for_address(self.default_node)
+        return received_key is not None
     
     @PerformanceMonitor.measure('get_handshakes')
     def get_handshakes(self):
@@ -1513,6 +1523,9 @@ class PostFiatTaskManager:
         """ This function gets the most recent google doc context link for a given account address """
 
         logger.debug("Getting latest outgoing context doc link...")
+        if self.system_memos.empty or len(self.system_memos) == 0:
+            logger.warning("System memos dataframe is empty. No context doc link found.")
+            return None
 
         # Filter for outgoing google doc context links
         redux_tx_list = self.system_memos[
@@ -2102,8 +2115,6 @@ class PostFiatTaskManager:
                         f"Datetime: {pd.Timestamp(data['datetime']).strftime('%Y-%m-%d %H:%M:%S') if 'datetime' in data else 'N/A'}\n"
                     )
                     return formatted_string
-                else:
-                    return "No data available."
                 
             # Sorting account info by datetime
             if not self.memo_transactions.empty and len(self.memo_transactions) > 0 and 'datetime' in self.memo_transactions.columns:
@@ -2116,8 +2127,10 @@ class PostFiatTaskManager:
                 # Formatting messages
                 incoming_message = format_dict(most_recent_incoming_message)
                 outgoing_message = format_dict(most_recent_outgoing_message)
-                account_info['Incoming Message'] = incoming_message
-                account_info['Outgoing Message'] = outgoing_message
+                if incoming_message:
+                    account_info['Incoming Message'] = incoming_message
+                if outgoing_message:
+                    account_info['Outgoing Message'] = outgoing_message
 
         except Exception as e:
             logger.error(f"Error processing account info: {e}")

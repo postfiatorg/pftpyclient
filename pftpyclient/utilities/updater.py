@@ -109,6 +109,55 @@ Date: {self.commit_details['date']}
         """Handle window close button (X)"""
         self.EndModal(wx.ID_NO)
 
+def get_current_branch() -> Optional[str]:
+    try:
+        repo_path = Path(__file__).parent.parent.parent
+        result = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(repo_path)
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+    
+def branch_exists_locally(branch: str) -> bool:
+    try:
+        repo_path = Path(__file__).parent.parent.parent
+        result = subprocess.run(
+            ['git', 'rev-parse', '--verify', branch],
+            capture_output=True,
+            text=True,
+            cwd=str(repo_path),
+            # Don't use check=True here as we're checking existence
+        )
+        return result.returncode == 0
+    except subprocess.CalledProcessError:
+        return False
+
+def switch_to_branch(branch: str) -> bool:
+    try:
+        repo_path = Path(__file__).parent.parent.parent
+        # First ensure we have the latest refs
+        subprocess.run(['git', 'fetch'], check=True, cwd=str(repo_path))
+        
+        if branch_exists_locally(branch):
+            # If branch exists locally, just checkout
+            subprocess.run(['git', 'checkout', branch], check=True, cwd=str(repo_path))
+        else:
+            # If branch doesn't exist locally, create it tracking the remote
+            subprocess.run(
+                ['git', 'checkout', '-b', branch, f'origin/{branch}'],
+                check=True,
+                cwd=str(repo_path)
+            )
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to switch to branch {branch}: {str(e)}")
+        return False
+
 def get_current_commit_hash():
     try:
         repo_path = Path(__file__).parent.parent.parent  # Gets the root directory
@@ -142,6 +191,21 @@ def get_remote_commit_hash(branch: str) -> Optional[str]:
         return None
     
 def update_available(branch: str) -> bool:
+    current_branch = get_current_branch()
+
+    # If we're on a branch other than main or dev, assume it's a developer branch and skip update check
+    if current_branch and current_branch not in ['main', 'dev']:
+        logger.debug(f"Current branch '{current_branch}' is a development branch. Skipping update check.")
+        return False
+    
+    # If we're not on the target branch, try to switch
+    if current_branch != branch:
+        logger.debug(f"Currently on {current_branch}, attempting to switch to {branch}")
+        if not switch_to_branch(branch):
+            logger.error(f"Failed to switch to branch {branch}")
+            return False
+
+    # Now check for updates on the current branch
     current = get_current_commit_hash()
     logger.debug(f"Current commit hash: {current}")
     remote = get_remote_commit_hash(branch)
