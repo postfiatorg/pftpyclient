@@ -10,6 +10,56 @@ from datetime import datetime
 
 REPO_URL = "https://github.com/postfiatorg/pftpyclient.git"
 
+def configure_macos_certificates():
+    """
+    Configure SSL certificates for Python.org installations on macOS.
+    This addresses SSL verification errors that can occur when Python is installed
+    as a standalone package and isn't properly linked to the system certificate store.
+    """
+    if platform.system() != "Darwin":
+        return
+    
+    logging.info("Checking SSL certificate configuration for macOS...")
+    
+    # Try to find the Install Certificates.command script in Python.org installation
+    python_apps = Path("/Applications").glob("Python 3*.app")
+    cert_scripts = []
+    
+    for app in python_apps:
+        cert_script = app / "Contents/Resources/Install Certificates.command"
+        if cert_script.exists():
+            cert_scripts.append(cert_script)
+    
+    if not cert_scripts:
+        logging.debug("No Python.org certificate installation scripts found")
+        return
+    
+    # Try to run the most recent Python version's certificate script
+    latest_script = sorted(cert_scripts)[-1]
+    logging.info(f"Found certificate installation script: {latest_script}")
+    
+    try:
+        # Make sure the script is executable
+        os.chmod(latest_script, 0o755)
+        
+        # Run the certificate installation script
+        result = subprocess.run(
+            ["/bin/bash", str(latest_script)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        logging.info("Successfully configured SSL certificates")
+        logging.debug(f"Certificate installation output: {result.stdout}")
+    
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to configure SSL certificates: {e}")
+        logging.error(f"Certificate installation error output: {e.stderr}")
+        # Don't raise an exception - this is not critical enough to fail installation
+    except Exception as e:
+        logging.error(f"Unexpected error configuring SSL certificates: {e}")
+        # Don't raise an exception - this is not critical enough to fail installation
+
 def get_python_requirement() -> tuple[int, int]:
     """Get minimum Python version from project configuration"""
     repo_path = Path(__file__).parent
@@ -292,6 +342,9 @@ def main():
     root = get_package_root()
 
     try:
+        # Configure SSL certificates on macOS before any network operations
+        configure_macos_certificates()
+
         # Remove existing environment if present
         if Path(env_name).exists():
             destroy_virtual_environment(env_name)
