@@ -2,6 +2,8 @@ import os
 import sys
 import platform
 import subprocess
+import tempfile
+from pathlib import Path
 
 def create_shortcut():
     print("Creating shortcut...")
@@ -9,11 +11,12 @@ def create_shortcut():
     python_executable = sys.executable
     save_location = os.path.dirname(current_location)
     ico_location = os.path.join(current_location, 'images', 'simple_pf_logo.ico')
+    png_location = os.path.join(current_location, 'images', 'simple_pf_logo.png')
 
     if platform.system() == 'Windows':
         create_windows_shortcut(current_location, python_executable, save_location, ico_location)
     elif platform.system() == 'Darwin':
-        create_macos_shortcut(current_location, python_executable, save_location, ico_location)
+        create_macos_shortcut(current_location, python_executable, save_location, png_location)
     else:
         print("Unsupported operating system. Cannot create shortcut.")
 
@@ -84,55 +87,87 @@ read -p "Press Enter to exit..."
 
     add_icon_to_macos_shortcut(command_file_path, ico_location)
 
-def add_icon_to_macos_shortcut(command_file_path, ico_location):
-
-    def check_and_install_fileicon():
-        try:
-            # Check if fileicon is installed
-            subprocess.run(['fileicon', '--version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            print("fileicon is already installed.")
-            return True
-        except FileNotFoundError:
-            print("fileicon not found. It's required to set custom icons.")
-            user_input = input("Would you like to install Homebrew and fileicon? (y/n): ").lower()
-            if user_input == 'y':
-                try:
-                    print("Installing Homebrew...")
-                    subprocess.run('/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"', shell=True, check=True)
-                    print("Installing fileicon...")
-                    subprocess.run(['brew', 'install', 'fileicon'], check=True)
-                    print("fileicon installed successfully.")
-                    return True
-                except subprocess.CalledProcessError as e:
-                    print(f"Failed to install fileicon: {e}")
-            print("Continuing without setting the icon.")
-            return False
+def set_macos_custom_icon(file_path: str, png_path: str) -> bool:
+    """
+    Set custom icon for a file on macOS using a PNG file.
+    
+    Args:
+        file_path: Path to the file that needs a custom icon
+        png_path: Path to the PNG icon file
         
-    if not os.path.exists(ico_location):
-        print(f"Warning: Icon file does not exist: {ico_location}")
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    
+    if not os.path.exists(file_path) or not os.path.exists(png_path):
+        print(f"Either file {file_path} or icon {png_path} does not exist")
+        return False
+    
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            
+            # Use sips to directly work with the PNG
+            subprocess.run([
+                '/usr/bin/sips', 
+                '-i', 
+                png_path
+            ], check=True)
+            
+            # Extract icon resource
+            subprocess.run([
+                '/usr/bin/DeRez', 
+                '-only', 
+                'icns', 
+                png_path
+            ], stdout=open(tmp_path / 'icon.rsrc', 'w'), check=True)
+            
+            # Apply the resource to the target file
+            subprocess.run([
+                '/usr/bin/Rez', 
+                '-append', 
+                tmp_path / 'icon.rsrc', 
+                '-o', 
+                file_path
+            ], check=True)
+            
+            # Set custom icon bit
+            subprocess.run([
+                '/usr/bin/SetFile', 
+                '-a', 
+                'C', 
+                file_path
+            ], check=True)
+            
+        return True
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error setting custom icon: {e}")
+        if hasattr(e, 'stderr') and e.stderr:
+            print(f"Error details: {e.stderr}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return False
+
+def add_icon_to_macos_shortcut(command_file_path, icon_location):
+    """
+    Add custom icon to a macOS shortcut file.
+    
+    Args:
+        command_file_path: Path to the .command file
+        icon_location: Path to the icon file (PNG)
+    """
+    if not os.path.exists(icon_location):
+        print(f"Warning: Icon file does not exist: {icon_location}")
         print("Continuing without setting the icon.")
         return
-    
-    # Check and install fileicon if necessary
-    fileicon_installed = check_and_install_fileicon()
-
-    if fileicon_installed:
-        try:
-            icns_location = ico_location.rsplit('.', 1)[0] + '.icns'
-            # Convert .ico to .icns using sips
-            subprocess.run(['sips', '-s', 'format', 'icns', ico_location, '--out', icns_location], check=True)
-
-            # Use fileicon to set the icon
-            subprocess.run(['fileicon', 'set', command_file_path, icns_location], check=True)
-            print("Icon setting process completed.")
-
-            # Clean up the temporary .icns file
-            os.remove(icns_location)
-        except subprocess.CalledProcessError as e:
-            print(f"Error during icon processing: {e}")
-            print("Icon setting failed. The shortcut will use the default icon.")
+        
+    success = set_macos_custom_icon(command_file_path, icon_location)
+    if success:
+        print(f"Successfully set custom icon for {command_file_path}")
     else:
-        print("fileicon is not installed. Skipping icon setting process.")
+        print("Failed to set custom icon. Continuing without icon.")
 
 if __name__ == "__main__":
     create_shortcut()
