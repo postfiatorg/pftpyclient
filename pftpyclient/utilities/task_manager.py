@@ -96,16 +96,19 @@ class PostFiatTaskManager:
         self.transaction_requirements = TransactionRequirementService(self.network_config)
 
         # Initialize wallet state based on account status
+        # By default, the wallet is considered UNFUNDED
+        self.wallet_state = WalletState.UNFUNDED
         self.determine_wallet_state()
 
     def get_xrp_balance(self):
         return get_xrp_balance(self.network_url, self.user_wallet.classic_address)
     
-    def determine_wallet_state(self):
+    def determine_wallet_state(self) -> bool:
         """Determine the current state of the wallet based on blockhain"""
         logger.debug(f"Determining wallet state for {self.user_wallet.classic_address}")
         client = xrpl.clients.JsonRpcClient(self.network_url)
-        self.wallet_state = WalletState.UNFUNDED
+        new_state = self.wallet_state
+
         try:
             # Check if account exists on XRPL
             response = client.request(
@@ -118,22 +121,30 @@ class PostFiatTaskManager:
             if response.is_successful() and 'account_data' in response.result:
                 balance = int(response.result['account_data']['Balance'])
                 if balance > 0:
-                    self.wallet_state = WalletState.FUNDED
+                    new_state = WalletState.FUNDED
                     if self.has_trust_line():
-                        self.wallet_state = WalletState.TRUSTLINED
+                        new_state = WalletState.TRUSTLINED
                         if self.initiation_rite_sent():
-                            self.wallet_state = WalletState.INITIATED
+                            new_state = WalletState.INITIATED
                             if self.handshake_sent():
-                                self.wallet_state = WalletState.HANDSHAKE_SENT
+                                new_state = WalletState.HANDSHAKE_SENT
                                 if self.handshake_received():
-                                    self.wallet_state = WalletState.HANDSHAKE_RECEIVED
+                                    new_state = WalletState.HANDSHAKE_RECEIVED
                                     if self.google_doc_sent():
-                                        self.wallet_state = WalletState.ACTIVE
+                                        new_state = WalletState.ACTIVE
+            
             else:
                 logger.warning(f"Account {self.user_wallet.classic_address} does not exist on XRPL")
         
         except xrpl.clients.XRPLRequestFailureException as e:
             logger.error(f"Error determining wallet state: {e}")
+
+        if new_state != self.wallet_state:
+            logger.info(f"Wallet state changed from {self.wallet_state} to {new_state}")
+            self.wallet_state = new_state
+            return True
+        else:
+            return False
         
     def get_required_action(self):
         """Returns the next required action to take to unlock the wallet"""
@@ -834,7 +845,6 @@ class PostFiatTaskManager:
 
         return df
 
-    @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_handshake_for_address')
     def get_handshake_for_address(self, address: str) -> tuple[bool, str]:
         """Returns (handshake_sent, their_public_key) tuple where:
@@ -884,7 +894,6 @@ class PostFiatTaskManager:
         self.handshake_cache[address] = result
         return result
     
-    @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('send_handshake')
     def send_handshake(self, destination):
         """Sends a handshake memo to establish encrypted communication"""
@@ -1005,7 +1014,6 @@ class PostFiatTaskManager:
 
         return chunked_memos
 
-    @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('encrypt_memo')
     def encrypt_memo(self, memo: str, shared_secret: str) -> str:
         """ Encrypts a memo using a shared secret """
@@ -1029,7 +1037,6 @@ class PostFiatTaskManager:
         encrypted_bytes = fernet.encrypt(memo)
         return encrypted_bytes.decode()
 
-    @requires_wallet_state(FUNDED_STATES)
     @PerformanceMonitor.measure('send_memo')
     def send_memo(
         self, 
@@ -1613,7 +1620,6 @@ class PostFiatTaskManager:
         # if self.get_xrp_balance() == 0:
         #     raise GoogleDocIsNotFundedException(google_doc_link)    
     
-    @requires_wallet_state(INITIATED_STATES)
     def handle_google_doc_setup(self, google_doc_link):
         """Validates, caches, and sends the Google Doc link"""
         logger.debug("Checking Google Doc link for validity and sending if valid...")

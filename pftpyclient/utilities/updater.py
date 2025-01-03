@@ -520,13 +520,17 @@ def perform_update(branch: str) -> Optional[bool]:
         print("Cloning new version...")
         subprocess.run(['git', 'clone', '-b', branch, repo_url, str(repo_path)], check=True)
 
-        # Restore venv if we had a backup
+        # Move venv back
         if venv_backup:
             if not restore_venv_directory(venv_backup, repo_path):
                 raise Exception("Failed to restore virtual environment")
 
         # Run install script
         print("Running install script...")
+
+        # Delete backup git directory
+        if git_backup:
+            remove_with_retry(git_backup)
 
         if platform.system() == "Windows":
             # Create a batch file for Windows

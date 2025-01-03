@@ -1415,7 +1415,7 @@ class WalletApp(wx.Frame):
         
         self.wallet = self.task_manager.user_wallet
 
-        self.start_wallet_state_monitoring()
+        self.update_ui_based_on_wallet_state()
 
         logger.info(f"Logged in as {self.username}")
 
@@ -1456,9 +1456,9 @@ class WalletApp(wx.Frame):
     def check_wallet_state(self):
         """Check the wallet state and update the UI accordingly"""
         if hasattr(self, 'task_manager'):
-            self.task_manager.determine_wallet_state()
-            self.update_account_display()
-            self.update_ui_based_on_wallet_state()
+            if self.task_manager.determine_wallet_state():
+                self.update_account_display()
+                self.update_ui_based_on_wallet_state()
 
     def start_wallet_state_monitoring(self):
         """Start monitoring wallet state transitions"""
@@ -2946,9 +2946,10 @@ class WalletApp(wx.Frame):
             self.stop_wallet_state_monitoring()
 
             # Clear sensitive data
-            if hasattr(self, 'task_manager'):
+            task_manager: PostFiatTaskManager = getattr(self, 'task_manager', None)
+            if task_manager is not None:
                 logger.debug("Clearing credentials")
-                self.task_manager.credential_manager.clear_credentials()
+                task_manager.credential_manager.clear_credentials()
                 self.task_manager = None
 
             if hasattr(self, 'wallet'):
