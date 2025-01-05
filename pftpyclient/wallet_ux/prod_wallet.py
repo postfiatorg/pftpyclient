@@ -115,6 +115,8 @@ class XRPLMonitorThread(Thread):
         self.last_ledger_time = None
         self.LEDGER_TIMEOUT = 30  # seconds
         self.CHECK_INTERVAL = 4  # match XRPL block time
+        self.PING_INTERVAL = 60  # Send ping every 60 seconds
+        self.PING_TIMEOUT = 10   # Wait up to 10 seconds for pong
 
     def run(self):
         """Thread entry point"""
@@ -160,6 +162,47 @@ class XRPLMonitorThread(Thread):
     def stopped(self):
         """Check if the thread has been signaled to stop"""
         return self._stop_event.is_set()
+    
+    async def ping_server(self):
+        """Send ping and wait for response"""
+        try:
+            # Use server_info as a lightweight ping
+            response = await self.client.request(xrpl.models.requests.ServerInfo())
+            return response.is_successful()
+        except Exception as e:
+            logger.error(f"Ping failed: {e}")
+            return False
+        
+    async def check_timeouts(self):
+        """Check for ledger timeouts"""
+        last_ping_time = time.time()
+
+        while True:
+            await asyncio.sleep(self.CHECK_INTERVAL)
+
+            current_time = time.time()
+
+            # Check ledger updates
+            if self.last_ledger_time is not None:
+                time_since_last_ledger = time.time() - self.last_ledger_time
+                if time_since_last_ledger > self.LEDGER_TIMEOUT:
+                    logger.warning(f"No ledger updates for {time_since_last_ledger:.1f} seconds")
+                    raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
+                
+            # Check if it's time for a ping
+            time_since_last_ping = current_time - last_ping_time
+            if time_since_last_ping >= self.PING_INTERVAL:
+                try:
+                    async with asyncio.timeout(self.PING_TIMEOUT):
+                        is_alive = await self.ping_server()
+                        if is_alive:
+                            logger.debug(f"Pinged websocket...")
+                        else:
+                            raise Exception("Ping failed - no valid response")
+                    last_ping_time = current_time
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Connection check failed: {e}")
+                    raise Exception(f"Connection check failed: {e}")
     
     def set_ui_state(self, state: WalletUIState, message: str = None):
         """Helper method to safely update UI state from thread"""
@@ -234,16 +277,8 @@ class XRPLMonitorThread(Thread):
             self.set_ui_state(WalletUIState.IDLE)
             logger.info(f"Successfully subscribed to account {self.account} updates on node {self.url}")
 
-            # Create task for timeout checking
-            async def check_timeouts():
-                while True:
-                    await asyncio.sleep(self.CHECK_INTERVAL)
-                    if self.last_ledger_time is not None:
-                        time_since_last_ledger = time.time() - self.last_ledger_time
-                        if time_since_last_ledger > self.LEDGER_TIMEOUT:
-                            raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
-            
-            timeout_task = asyncio.create_task(check_timeouts())
+            # Create task for timeout checking     
+            timeout_task = asyncio.create_task(self.check_timeouts())
 
             try:
                 async for message in self.client:
