@@ -813,6 +813,16 @@ class WalletApp(wx.Frame):
         # Add grid to Memos tab
         bottom_panel = wx.Panel(self.memos_splitter)
         bottom_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Add decrypt checkbox control
+        decrypt_controls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        decrypt_controls_sizer.AddStretchSpacer()
+        self.chk_decrypt_memos = wx.CheckBox(bottom_panel, label="Decrypt Messages")
+        self.chk_decrypt_memos.SetValue(True)  # Set checked by default
+        self.chk_decrypt_memos.Bind(wx.EVT_CHECKBOX, self.on_toggle_decrypt_memos)
+        decrypt_controls_sizer.Add(self.chk_decrypt_memos, 0, wx.ALL, 2)
+        bottom_sizer.Add(decrypt_controls_sizer, 0, wx.EXPAND | wx.ALL, 2)
+
         self.memos_grid = self.setup_grid(gridlib.Grid(bottom_panel), 'memos')
         bottom_sizer.Add(self.memos_grid, 1, wx.EXPAND | wx.ALL, 20)
         bottom_panel.SetSizer(bottom_sizer)
@@ -1039,6 +1049,18 @@ class WalletApp(wx.Frame):
         except Exception as e:
             logger.error(f"Error updating proposals grid: {e}")
             wx.MessageBox(f"Error updating proposals grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_toggle_decrypt_memos(self, event):
+        """Handle toggling of the decrypt memos checkbox"""
+        try:
+            decrypt = self.chk_decrypt_memos.IsChecked()
+            # Get memos data with the new decrypt setting
+            memos_df = self.task_manager.get_memos_df(decrypt=decrypt)
+            # Update only the memos grid
+            wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos", caller=f"{self.__class__.__name__}.on_toggle_decrypt_memos"))
+        except Exception as e:
+            logger.error(f"Error updating memos grid: {e}")
+            wx.MessageBox(f"Error updating memos grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
     def update_all_destination_comboboxes(self):
         """Update all destination comboboxes"""
