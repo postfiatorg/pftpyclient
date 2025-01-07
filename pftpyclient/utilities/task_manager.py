@@ -1858,7 +1858,7 @@ class PostFiatTaskManager:
     
     @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_memos_df')
-    def get_memos_df(self):
+    def get_memos_df(self, decrypt=True):
         """Returns a dataframe containing only P2P messages (excluding handshakes)"""
         if self.memos.empty:
             logger.debug("No memos or handshakes found")
@@ -1884,6 +1884,7 @@ class PostFiatTaskManager:
                     memo_type=msg_id,
                     memo_data=first_txn['full_output'],
                     full_unchunk=True,
+                    decrypt=decrypt,
                     memo_history=memo_history,
                     channel_counterparty=first_txn['counterparty_address']
                 )

@@ -115,6 +115,8 @@ class XRPLMonitorThread(Thread):
         self.last_ledger_time = None
         self.LEDGER_TIMEOUT = 30  # seconds
         self.CHECK_INTERVAL = 4  # match XRPL block time
+        self.PING_INTERVAL = 60  # Send ping every 60 seconds
+        self.PING_TIMEOUT = 10   # Wait up to 10 seconds for pong
 
     def run(self):
         """Thread entry point"""
@@ -160,6 +162,47 @@ class XRPLMonitorThread(Thread):
     def stopped(self):
         """Check if the thread has been signaled to stop"""
         return self._stop_event.is_set()
+    
+    async def ping_server(self):
+        """Send ping and wait for response"""
+        try:
+            # Use server_info as a lightweight ping
+            response = await self.client.request(xrpl.models.requests.ServerInfo())
+            return response.is_successful()
+        except Exception as e:
+            logger.error(f"Ping failed: {e}")
+            return False
+        
+    async def check_timeouts(self):
+        """Check for ledger timeouts"""
+        last_ping_time = time.time()
+
+        while True:
+            await asyncio.sleep(self.CHECK_INTERVAL)
+
+            current_time = time.time()
+
+            # Check ledger updates
+            if self.last_ledger_time is not None:
+                time_since_last_ledger = time.time() - self.last_ledger_time
+                if time_since_last_ledger > self.LEDGER_TIMEOUT:
+                    logger.warning(f"No ledger updates for {time_since_last_ledger:.1f} seconds")
+                    raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
+                
+            # Check if it's time for a ping
+            time_since_last_ping = current_time - last_ping_time
+            if time_since_last_ping >= self.PING_INTERVAL:
+                try:
+                    async with asyncio.timeout(self.PING_TIMEOUT):
+                        is_alive = await self.ping_server()
+                        if is_alive:
+                            logger.debug(f"Pinged websocket...")
+                        else:
+                            raise Exception("Ping failed - no valid response")
+                    last_ping_time = current_time
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Connection check failed: {e}")
+                    raise Exception(f"Connection check failed: {e}")
     
     def set_ui_state(self, state: WalletUIState, message: str = None):
         """Helper method to safely update UI state from thread"""
@@ -234,16 +277,8 @@ class XRPLMonitorThread(Thread):
             self.set_ui_state(WalletUIState.IDLE)
             logger.info(f"Successfully subscribed to account {self.account} updates on node {self.url}")
 
-            # Create task for timeout checking
-            async def check_timeouts():
-                while True:
-                    await asyncio.sleep(self.CHECK_INTERVAL)
-                    if self.last_ledger_time is not None:
-                        time_since_last_ledger = time.time() - self.last_ledger_time
-                        if time_since_last_ledger > self.LEDGER_TIMEOUT:
-                            raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
-            
-            timeout_task = asyncio.create_task(check_timeouts())
+            # Create task for timeout checking     
+            timeout_task = asyncio.create_task(self.check_timeouts())
 
             try:
                 async for message in self.client:
@@ -778,6 +813,16 @@ class WalletApp(wx.Frame):
         # Add grid to Memos tab
         bottom_panel = wx.Panel(self.memos_splitter)
         bottom_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Add decrypt checkbox control
+        decrypt_controls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        decrypt_controls_sizer.AddStretchSpacer()
+        self.chk_decrypt_memos = wx.CheckBox(bottom_panel, label="Decrypt Messages")
+        self.chk_decrypt_memos.SetValue(True)  # Set checked by default
+        self.chk_decrypt_memos.Bind(wx.EVT_CHECKBOX, self.on_toggle_decrypt_memos)
+        decrypt_controls_sizer.Add(self.chk_decrypt_memos, 0, wx.ALL, 2)
+        bottom_sizer.Add(decrypt_controls_sizer, 0, wx.EXPAND | wx.ALL, 2)
+
         self.memos_grid = self.setup_grid(gridlib.Grid(bottom_panel), 'memos')
         bottom_sizer.Add(self.memos_grid, 1, wx.EXPAND | wx.ALL, 20)
         bottom_panel.SetSizer(bottom_sizer)
@@ -1004,6 +1049,18 @@ class WalletApp(wx.Frame):
         except Exception as e:
             logger.error(f"Error updating proposals grid: {e}")
             wx.MessageBox(f"Error updating proposals grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_toggle_decrypt_memos(self, event):
+        """Handle toggling of the decrypt memos checkbox"""
+        try:
+            decrypt = self.chk_decrypt_memos.IsChecked()
+            # Get memos data with the new decrypt setting
+            memos_df = self.task_manager.get_memos_df(decrypt=decrypt)
+            # Update only the memos grid
+            wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos", caller=f"{self.__class__.__name__}.on_toggle_decrypt_memos"))
+        except Exception as e:
+            logger.error(f"Error updating memos grid: {e}")
+            wx.MessageBox(f"Error updating memos grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
     def update_all_destination_comboboxes(self):
         """Update all destination comboboxes"""
