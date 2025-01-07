@@ -2461,8 +2461,10 @@ class WalletApp(wx.Frame):
         task_id = self.verification_txt_task_id.GetLabel()
         response_string = self.verification_txt_details.GetValue()
 
-        if not task_id or not response_string:
-            wx.MessageBox("Please enter verification details", "Error", wx.OK | wx.ICON_ERROR)
+        if not task_id:
+            wx.MessageBox("Please select a task first", "No Task Selected", wx.OK | wx.ICON_WARNING)
+        elif not response_string:
+            wx.MessageBox("Please enter verification details", "Verification Details Required", wx.OK | wx.ICON_ERROR)
         else:
             try:
                 response = self.task_manager.send_verification_response(
