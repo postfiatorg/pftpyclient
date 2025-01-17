@@ -54,6 +54,11 @@ setup(
     },
     include_package_data=True,
     package_data={
-        'pftpyclient': ['images/*'],
+        'pftpyclient': [
+            'images/*',
+            'sql/*/*.sql',   # Include all .sql files in sql/ subdirectories
+            'sql/*.sql',     # Include .sql files directly in sql/
+        ],
     },
 )
+

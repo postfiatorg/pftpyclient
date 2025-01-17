@@ -9,6 +9,7 @@ import re
 from threading import Thread, Event
 from pathlib import Path
 from enum import Enum, auto
+from typing import List, Dict
 
 # Third-party imports
 import wx
@@ -35,9 +36,7 @@ from pftpyclient.utilities.wallet_state import (
 from pftpyclient.utilities.task_manager import (
     PostFiatTaskManager, 
     NoMatchingTaskException, 
-    WrongTaskStateException, 
-    compress_string,
-    construct_memo
+    WrongTaskStateException
 )
 from pftpyclient.user_login.credentials import CredentialManager
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
@@ -320,27 +319,23 @@ class XRPLMonitorThread(Thread):
                 "validated": tx_message.get("validated", False)
             }
 
-            # Create DataFrame in same format as sync_transactions expects
-            tx_df = pd.DataFrame([formatted_tx])
-
             # Process through sync_memo_transactions pipeline
-            if not tx_df.empty:
-                wx.CallAfter(self.gui.task_manager.sync_memo_transactions, tx_df)
+            wx.CallAfter(self.gui.sql_manager.store_transaction, formatted_tx)
 
-                # Update account info
-                response = await self.client.request(xrpl.models.requests.AccountInfo(
-                    account=self.account,
-                    ledger_index="validated"
-                ))
+            # Update account info
+            response = await self.client.request(xrpl.models.requests.AccountInfo(
+                account=self.account,
+                ledger_index="validated"
+            ))
 
-                if response.is_successful():
-                    def update_all():
-                        self.gui.update_account(response.result["account_data"])
-                        self.gui.update_tokens()
-                        self.gui.refresh_grids()
-                    wx.CallAfter(update_all)
-                else:
-                    logger.error(f"Failed to get account info: {response.result}")
+            if response.is_successful():
+                def update_all():
+                    self.gui.update_account(response.result["account_data"])
+                    self.gui.update_tokens()
+                    self.gui.refresh_grids()
+                wx.CallAfter(update_all)
+            else:
+                logger.error(f"Failed to get account info: {response.result}")
             
             self.set_ui_state(WalletUIState.IDLE)
 
@@ -388,9 +383,9 @@ class WalletApp(wx.Frame):
         'memos': {
             'columns': [
                 ('memo_id', 'Message ID', 190),
-                ('memo', 'Memo', 500),
+                ('content', 'Memo', 500),
                 ('direction', 'To/From', 55),
-                ('display_address', 'Address', 250)
+                ('counterparty', 'Address', 250)
             ]
         },
         'summary': {
@@ -1043,7 +1038,7 @@ class WalletApp(wx.Frame):
         try:
             include_refused = self.chk_show_refused.IsChecked()
             # Get proposals data with the new include_refused setting
-            proposals_df = self.task_manager.get_proposals_df(include_refused=include_refused)
+            proposals_df = self.task_manager.get_proposals(include_refused=include_refused)
             # Update only the proposals grid
             wx.PostEvent(self, UpdateGridEvent(data=proposals_df, target="proposals", caller=f"{self.__class__.__name__}.on_toggle_refused_tasks"))
         except Exception as e:
@@ -1055,7 +1050,7 @@ class WalletApp(wx.Frame):
         try:
             decrypt = self.chk_decrypt_memos.IsChecked()
             # Get memos data with the new decrypt setting
-            memos_df = self.task_manager.get_memos_df(decrypt=decrypt)
+            memos_df = self.task_manager.get_memos(decrypt=decrypt)
             # Update only the memos grid
             wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos", caller=f"{self.__class__.__name__}.on_toggle_decrypt_memos"))
         except Exception as e:
@@ -1453,6 +1448,8 @@ class WalletApp(wx.Frame):
                 config=self.config
             )
 
+            self.task_manager.sync_transactions()
+
         except (ValueError, InvalidToken, KeyError) as e:
             logger.error(f"Login failed: {e}")
             logger.error(traceback.format_exc())
@@ -1512,6 +1509,7 @@ class WalletApp(wx.Frame):
 
     def check_wallet_state(self):
         """Check the wallet state and update the UI accordingly"""
+        logger.debug("WalletApp.check_wallet_state called")
         if hasattr(self, 'task_manager'):
             if self.task_manager.determine_wallet_state():
                 self.update_account_display()
@@ -1835,7 +1833,6 @@ class WalletApp(wx.Frame):
                 ledger_index="validated"
             )
             response = client.request(account_lines)
-            logger.debug(f"AccountLines response: {response.result}")
 
             if not response.is_successful():
                 logger.error(f"Error fetching AccountLines: {response}")
@@ -1914,8 +1911,8 @@ class WalletApp(wx.Frame):
         # Memos, payments grid (available in TRUSTLINED_STATES)
         if current_state in TRUSTLINED_STATES:
             for grid_type, getter_method in [
-                ("memos", self.task_manager.get_memos_df),
-                ("payments", self.task_manager.get_payments_df)
+                ("memos", self.task_manager.get_memos),
+                ("payments", self.task_manager.get_payments)
             ]:
                 try:
                     data = getter_method()
@@ -1927,9 +1924,9 @@ class WalletApp(wx.Frame):
         # Proposals, Rewards, and Verification grids (available in PFT_STATES)
         if current_state in ACTIVATED_STATES:
             for grid_type, getter_method in [
-                ("proposals", self.task_manager.get_proposals_df),
-                ("rewards", self.task_manager.get_rewards_df),
-                ("verification", self.task_manager.get_verification_df)
+                ("proposals", self.task_manager.get_proposals),
+                ("rewards", self.task_manager.get_rewards),
+                ("verification", self.task_manager.get_verifications)
             ]:
                 try:
                     data = getter_method()
@@ -1985,10 +1982,15 @@ class WalletApp(wx.Frame):
         # self.auto_size_window()
 
     @PerformanceMonitor.measure('populate_grid_generic')
-    def populate_grid_generic(self, grid: wx.grid.Grid, data: pd.DataFrame, grid_name: str):
-        """Generic grid population method that respects zoom settings"""
-
-        if data.empty:
+    def populate_grid_generic(self, grid: wx.grid.Grid, data: List[Dict], grid_name: str):
+        """Generic grid population method that respects zoom settings
+        
+        Args:
+            grid: The wxGrid to populate
+            data: List of dictionaries containing the data
+            grid_name: Name of the grid (for configuration lookup)
+        """
+        if len(data) == 0:
             logger.debug(f"No data to populate {grid_name} grid")
             grid.ClearGrid()
             return
@@ -2025,12 +2027,12 @@ class WalletApp(wx.Frame):
             return
 
         # Populate data using the column mapping
-        for idx in range(len(data)):
-            for col, (col_id, _, _) in enumerate(columns):
-                if col_id in data.columns:
-                    value = data.iloc[idx][col_id]
-                    grid.SetCellValue(idx, col, str(value))
-                    grid.SetCellRenderer(idx, col, gridlib.GridCellAutoWrapStringRenderer())
+        for row_idx, row_data in enumerate(data):
+            for col_idx, (col_id, _, _) in enumerate(columns):
+                if col_id in row_data:
+                    value = row_data[col_id]
+                    grid.SetCellValue(row_idx, col_idx, str(value))
+                    grid.SetCellRenderer(row_idx, col_idx, gridlib.GridCellAutoWrapStringRenderer())
                 else:
                     logger.error(f"Column {col_id} not found in data for {grid_name}")
 
@@ -2041,7 +2043,7 @@ class WalletApp(wx.Frame):
         self.grid_row_heights[grid_name] = [
             grid.GetRowSize(row) + self.row_height_margin 
             for row in range(grid.GetNumberRows())
-            ]
+        ]
         
         # Apply the stored row heights and column widths with the zoom factor
         for row in range(grid.GetNumberRows()):
@@ -2086,10 +2088,13 @@ class WalletApp(wx.Frame):
         grid.Refresh()
 
     @PerformanceMonitor.measure('populate_summary_grid')
-    def populate_summary_grid(self, key_account_details):
-        """Convert dictionary to dataframe and use generic grid population method"""
-        summary_df = pd.DataFrame(list(key_account_details.items()), columns=['Key', 'Value'])
-        self.populate_grid_generic(self.summary_grid, summary_df, 'summary')
+    def populate_summary_grid(self, key_account_details: Dict[str, str]):
+        """Convert dictionary to list format and use generic grid population method"""
+        summary_data = [
+            {'Key': key, 'Value': value}
+            for key, value in key_account_details.items()
+        ]
+        self.populate_grid_generic(self.summary_grid, summary_data, 'summary')
 
     def auto_size_window(self):
         """Adjust window size while maintaining reasonable dimensions"""
@@ -2217,8 +2222,7 @@ class WalletApp(wx.Frame):
     def update_proposal_buttons(self, task_id):
         """Enable/disable buttons based on task state"""
         try:
-            task_df = self.task_manager.get_task(task_id)
-            latest_state = self.task_manager.get_task_state(task_df)
+            latest_state = self.task_manager.get_task_state_by_id(task_id)
 
             # Enable/disable buttons based on task state
             self.btn_accept_task.Enable(latest_state == constants.TaskType.PROPOSAL.name)
@@ -2249,7 +2253,7 @@ class WalletApp(wx.Frame):
         if dialog.ShowModal() == wx.ID_OK:
             request_message = dialog.GetValues()["Task Request"]
             try:
-                response = self.task_manager.request_post_fiat(request_message=request_message)
+                response = self.task_manager.request_task(request_message=request_message)
                 formatted_response = self.format_response(response)
                 dialog = SelectableMessageDialog(self, "Task Request Result", formatted_response)
                 dialog.ShowModal()
@@ -2376,7 +2380,7 @@ class WalletApp(wx.Frame):
             task_id = values["Task ID"]
             completion_string = values["Completion String"]
             try:
-                response = self.task_manager.submit_initial_completion(
+                response = self.task_manager.submit_completion(
                     completion_string=completion_string,
                     task_id=task_id
                 )
@@ -2613,21 +2617,8 @@ class WalletApp(wx.Frame):
                             return
                         encrypt = False
 
-            # Estimate chunks needed
-            test_memo = memo_text 
-            if encrypt:
-                # Add encryption overhead to size estimate
-                test_memo = self.task_manager.encrypt_memo(test_memo, received_key)
-
-            # Create test Memo object
-            compressed_memo = construct_memo(
-                memo_format=self.task_manager.credential_manager.postfiat_username,
-                memo_type=self.task_manager.generate_custom_id(),
-                memo_data=compress_string(test_memo)
-            )
-
-            # Calculate chunks needed
-            num_chunks = self.task_manager.calculate_required_chunks(compressed_memo)
+            # Estimate number of chunks needed
+            num_chunks = self.task_manager.estimate_memo_chunks(memo_text, encrypt)
 
             message = (
                 f"Memo will be {'encrypted, ' if encrypt else ''}compressed and sent over {num_chunks} transaction(s) and "
@@ -2641,7 +2632,11 @@ class WalletApp(wx.Frame):
                 return
             
             # Send the memo
-            responses = self.task_manager.send_memo(recipient, memo_text, chunk=True, encrypt=encrypt)
+            responses = self.task_manager.send_memo(
+                destination=recipient,
+                memo_data=memo_text,
+                encrypt=encrypt
+            )
             
             formatted_responses = [self.format_response(response) for response in responses]
             logger.info(f"Memo Submission Result: {formatted_responses}")
@@ -2702,7 +2697,7 @@ class WalletApp(wx.Frame):
                 google_doc_link = dialog.get_link()
                 try:
                     # Validate and send the new Google Doc link
-                    response = self.task_manager.handle_google_doc_setup(google_doc_link)
+                    response = self.task_manager.handle_google_doc(google_doc_link)
                     if response.is_successful():
                         formatted_response = self.format_response(response)
                         success_dialog = SelectableMessageDialog(self, "Success", formatted_response)

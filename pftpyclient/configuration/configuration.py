@@ -270,7 +270,6 @@ def get_network_config(network: Optional[Network] = None) -> NetworkConfig:
 
 GLOBAL_CONFIG_DEFAULTS = {
     'performance_monitor': False,
-    'transaction_cache_format': 'csv', # or pickle
     'last_logged_in_user': '',
     'require_password_for_payment': True,
     'use_testnet': False,

@@ -245,7 +245,7 @@ class CredentialManager:
                 );
             """)
             conn.commit()
-        logger.debug(f"Initialized database at {self.db_path}")
+        logger.debug(f"CredentialManager: Initialized database at {self.db_path}")
 
     def _encrypt_value(self, value):
         """Encrypt a value using the derived encryption key"""

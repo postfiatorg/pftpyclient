@@ -2,7 +2,7 @@ from loguru import logger
 import pandas as pd
 import wx
 import webbrowser
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, List, Dict
 from .dialog_parent import WalletDialogParent
 import traceback
 
@@ -329,18 +329,6 @@ class PreferencesDialog(wx.Dialog):
         self.perf_monitor.SetValue(self.config.get_global_config('performance_monitor'))
         app_sbs.Add(self.perf_monitor, 0, wx.ALL | wx.EXPAND, 5)
 
-        # Cache Format radio buttons
-        cache_box = wx.StaticBox(panel, label="Transaction Cache Format")
-        cache_sbs = wx.StaticBoxSizer(cache_box, wx.HORIZONTAL)
-        self.cache_csv = wx.RadioButton(panel, label="CSV", style=wx.RB_GROUP)
-        self.cache_pickle = wx.RadioButton(panel, label="Pickle")
-        current_format = self.config.get_global_config("transaction_cache_format")
-        self.cache_csv.SetValue(current_format == "csv")
-        self.cache_pickle.SetValue(current_format != "csv")
-        cache_sbs.Add(self.cache_csv, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        cache_sbs.Add(self.cache_pickle, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
-        app_sbs.Add(cache_sbs, 0, wx.ALL | wx.EXPAND, 5)
-
         vbox.Add(app_sbs, 0, wx.ALL | wx.EXPAND, 10)
 
         # Network Settings Box
@@ -520,7 +508,6 @@ class PreferencesDialog(wx.Dialog):
         self.config.set_global_config('use_testnet', new_network)
         self.config.set_global_config('require_password_for_payment', self.require_password_for_payment.GetValue())
         self.config.set_global_config('performance_monitor', self.perf_monitor.GetValue())
-        self.config.set_global_config('transaction_cache_format', 'csv' if self.cache_csv.GetValue() else 'pickle')
         self.EndModal(wx.ID_OK)
 
 class LinkOpeningHtmlWindow(wx.html.HtmlWindow):
@@ -673,24 +660,27 @@ class EncryptionRequestsDialog(wx.Dialog):
     def load_requests(self):
         """Load pending encryption requests into the list control"""
         self.list_ctrl.DeleteAllItems()
-        handshakes = self.task_manager.get_handshakes()
+        handshakes: List[Dict] = self.task_manager.get_handshakes()
 
-        for idx, handshake in handshakes.iterrows():
+        for idx, handshake in enumerate(handshakes):
             index = self.list_ctrl.GetItemCount()
-            display_name = handshake['contact_name'] if pd.notna(handshake['contact_name']) else handshake['address']
+            # Use contact_name if available, otherwise use address
+            display_name = handshake.get('contact_name') or handshake['address']
             self.list_ctrl.InsertItem(index, display_name)
 
-            # Show received time or "Not received" if we haven't received a handshake
-            received_at = handshake['received_at']
-            if pd.notna(received_at):  # check if timestamp is not NaT/None
-                self.list_ctrl.SetItem(index, 1, received_at.strftime('%Y-%m-%d %H:%M:%S'))
+            # Show received time or empty string if we haven't received a handshake
+            received_at = handshake.get('received_at')
+            logger.debug(f"Received at: {received_at}")
+            if received_at:  # If received_at exists and is not None
+                self.list_ctrl.SetItem(index, 1, received_at)
             else:
                 self.list_ctrl.SetItem(index, 1, "")
 
-            # Show accepted time or "Not sent" if we haven't sent a handshake
-            sent_at = handshake['sent_at']
-            if pd.notna(sent_at):  # check if timestamp is not NaT/None
-                self.list_ctrl.SetItem(index, 2, sent_at.strftime('%Y-%m-%d %H:%M:%S'))
+            # Show sent time or empty string if we haven't sent a handshake
+            sent_at = handshake.get('sent_at')
+            logger.debug(f"Sent at: {sent_at}")
+            if sent_at:  # If sent_at exists and is not None
+                self.list_ctrl.SetItem(index, 2, sent_at)
             else:
                 self.list_ctrl.SetItem(index, 2, "")
 
