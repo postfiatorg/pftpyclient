@@ -1,6 +1,13 @@
-from enum import Enum
+from enum import Enum, auto
 from functools import wraps
 from loguru import logger
+
+class WalletUIState(Enum):
+    IDLE = auto()
+    BUSY = auto()
+    SYNCING = auto()
+    TRANSACTION_PENDING = auto()
+    ERROR = auto()
 
 class WalletState(Enum):
     UNFUNDED = "unfunded"                       # XRP address exists but not activated on XRPL

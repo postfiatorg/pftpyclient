@@ -1,8 +1,10 @@
 from typing import Protocol, Any
 from pftpyclient.utilities.task_manager import PostFiatTaskManager
 from pftpyclient.configuration.configuration import ConfigurationManager
+from pftpyclient.utilities.wallet_state import WalletUIState
+from xrpl.wallet import Wallet
 
-class WalletDialogParent(Protocol):
+class WalletApp(Protocol):
     """Protocol defining the interface that dialogs need from WalletApp"""
 
     @property
@@ -23,6 +25,11 @@ class WalletDialogParent(Protocol):
     @property
     def config(self) -> ConfigurationManager:
         """Access to the configuration manager"""
+        ...
+
+    @property
+    def wallet(self) -> Wallet:
+        """Access to the XRPL wallet"""
         ...
 
     def format_response(self, response: Any) -> str:
@@ -79,4 +86,16 @@ class WalletDialogParent(Protocol):
 
     def restart_xrpl_monitor(self) -> None:
         """Restart the XRPL monitor thread"""
+        ...
+
+    def set_wallet_ui_state(self, state: WalletUIState=None, message: str = ""):
+        """Update the status bar with current wallet state"""
+        ...
+
+    def update_account(self, acct):
+        """Update account information and wallet state"""
+        ...
+
+    def update_tokens(self):
+        """Update token balances for the current account"""
         ...

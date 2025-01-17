@@ -3,7 +3,7 @@ import pandas as pd
 import wx
 import webbrowser
 from typing import Optional, TYPE_CHECKING, List, Dict
-from .dialog_parent import WalletDialogParent
+from ..protocols.prod_wallet import WalletApp
 import traceback
 
 if TYPE_CHECKING:
@@ -15,7 +15,7 @@ class ConfirmPaymentDialog(wx.Dialog):
 
     def __init__(
             self, 
-            parent: WalletDialogParent, 
+            parent: WalletApp, 
             amount: str, 
             destination: str, 
             token_type: str
@@ -113,7 +113,7 @@ class ConfirmPaymentDialog(wx.Dialog):
 class ContactsDialog(wx.Dialog):
     """Dialog for managing wallet contacts"""
 
-    def __init__(self, parent: WalletDialogParent) -> None:
+    def __init__(self, parent: WalletApp) -> None:
         """Initialize the contacts management dialog
         
         Args:
@@ -290,7 +290,7 @@ class EndpointControl:
 class PreferencesDialog(wx.Dialog):
     """Dialog for managing wallet preferences and settings"""
 
-    def __init__(self, parent: WalletDialogParent) -> None:
+    def __init__(self, parent: WalletApp) -> None:
         """Initialize the preferences dialog
         
         Args:
@@ -298,7 +298,7 @@ class PreferencesDialog(wx.Dialog):
         """
         super().__init__(parent, title="Preferences")
         self.config: 'ConfigurationManager' = parent.config
-        self.parent: 'WalletDialogParent' = parent
+        self.parent: 'WalletApp' = parent
 
         panel = wx.Panel(self)
         vbox = wx.BoxSizer(wx.VERTICAL)
@@ -532,7 +532,7 @@ class SelectableMessageDialog(wx.Dialog):
     
     def __init__(
             self,
-            parent: WalletDialogParent,
+            parent: WalletApp,
             title: str,
             message: str
         ) -> None:
@@ -590,14 +590,14 @@ class SelectableMessageDialog(wx.Dialog):
 class EncryptionRequestsDialog(wx.Dialog):
     """Dialog for managing encryption requests"""
 
-    def __init__(self, parent: WalletDialogParent) -> None:
+    def __init__(self, parent: WalletApp) -> None:
         """Initialize the encryption requests dialog
         
         Args:
             parent: Parent window implementing WalletDialogParent protocol
         """
         super().__init__(parent, title="Encryption Requests", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self.parent: 'WalletDialogParent' = parent
+        self.parent: 'WalletApp' = parent
         self.task_manager: 'PostFiatTaskManager' = parent.task_manager
 
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -715,7 +715,7 @@ class EncryptionRequestsDialog(wx.Dialog):
 class DeleteCredentialsDialog(wx.Dialog):
     """Dialog for deleting credentials"""
 
-    def __init__(self, parent: WalletDialogParent) -> None:
+    def __init__(self, parent: WalletApp) -> None:
         """Initialize the delete credentials dialog
         
         Args:
@@ -795,7 +795,7 @@ class DeleteCredentialsDialog(wx.Dialog):
 class ChangePasswordDialog(wx.Dialog):
     """Dialog for changing the password"""
     
-    def __init__(self, parent: WalletDialogParent) -> None:
+    def __init__(self, parent: WalletApp) -> None:
         """Initialize the change password dialog
         
         Args:
@@ -838,7 +838,7 @@ class ChangePasswordDialog(wx.Dialog):
 class GoogleDocSetupDialog(wx.Dialog):
     """Dialog for setting up or updating the Google Doc link"""
 
-    def __init__(self, parent: WalletDialogParent, is_initial_setup: bool = False) -> None:
+    def __init__(self, parent: WalletApp, is_initial_setup: bool = False) -> None:
         """Initialize the update Google Doc link dialog
         
         Args:
@@ -914,7 +914,7 @@ class GoogleDocSetupDialog(wx.Dialog):
 class UpdateTrustlineDialog(wx.Dialog):
     """Dialog for updating PFT token trust line limit"""
 
-    def __init__(self, parent: WalletDialogParent) -> None:
+    def __init__(self, parent: WalletApp) -> None:
         """Initialize the update trust line dialog
         
         Args:
@@ -1017,7 +1017,7 @@ class CustomDialog(wx.Dialog):
 
     def __init__(
             self, 
-            parent: WalletDialogParent, 
+            parent: WalletApp, 
             title: str, 
             fields: list[str], 
             message: str = None,

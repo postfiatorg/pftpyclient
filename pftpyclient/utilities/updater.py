@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 from loguru import logger
 from typing import Optional, Dict
-from pftpyclient.wallet_ux.dialog_parent import WalletDialogParent
+from pftpyclient.protocols.prod_wallet import WalletApp
 
 REPO_URL = "https://github.com/postfiatorg/pftpyclient"
 
@@ -43,7 +43,7 @@ def get_commit_details(branch: str) -> Optional[Dict[str, str]]:
         return None
 
 class UpdateDialog(wx.Dialog):
-    def __init__(self, parent: WalletDialogParent, commit_details: Dict[str, str], branch: str):
+    def __init__(self, parent: WalletApp, commit_details: Dict[str, str], branch: str):
         super().__init__(parent, title="Update Available", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.commit_details = commit_details
         self.branch = branch
@@ -594,7 +594,7 @@ def perform_update(branch: str) -> Optional[bool]:
                      wx.OK | wx.ICON_ERROR)
         return False
     
-def check_and_show_update_dialog(parent: WalletDialogParent) -> bool:
+def check_and_show_update_dialog(parent: WalletApp) -> bool:
     """
     Check if update is available and show dialog if necessary.
     Returns True if update was successful or not needed, False if cancelled or failed.

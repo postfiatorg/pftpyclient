@@ -466,8 +466,8 @@ class MemoConstructionParameters:
         cls,
         source: str,
         destination: str,
-        memo_data: str,
-        memo_type: str,
+        memo_data: Optional[str] = None,
+        memo_type: Optional[str] = None,
         should_encrypt: bool = False,
         should_compress: bool = False,
         pft_amount: Optional[Decimal] = None

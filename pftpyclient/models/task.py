@@ -55,11 +55,12 @@ class Task:
         return TaskType.TASK_REQUEST
     
     @classmethod
-    async def from_memo_groups(cls, memo_groups: List[MemoGroup]) -> 'Task':
+    def from_memo_groups(cls, memo_groups: List[MemoGroup]) -> 'Task':
         """Create a Task from a list of MemoGroups.
         
         Args:
             memo_groups: List of MemoGroups related to this task
+            wallet: Wallet object required to decrypt memo_data 
             
         Returns:
             Task: Constructed task object
@@ -77,7 +78,7 @@ class Task:
             raise ValueError("No TASK_REQUEST found in memo groups")
         
         task_id = cls.extract_task_id(request_group.group_id)
-        request = await MemoProcessor.parse_group(request_group)
+        request = MemoProcessor.parse_group(request_group)
         if not request:
             raise ValueError(f"Could not parse request from group {request_group.group_id}")
         
@@ -93,7 +94,7 @@ class Task:
             if group == request_group:
                 continue
 
-            content = await MemoProcessor.parse_group(group)
+            content = MemoProcessor.parse_group(group)
             if not content:
                 continue
 
@@ -123,7 +124,7 @@ class Task:
                     task.verification_response_datetime = datetime
                 case TaskType.REWARD:
                     task.reward = content
-                    task.reward_response_datetime = datetime
+                    task.reward_datetime = datetime
                     task.pft_amount = group.pft_amount
 
         return task

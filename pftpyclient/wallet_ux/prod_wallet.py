@@ -1,14 +1,12 @@
 # Standard library imports
 import time
 import traceback
-import random
 import urllib.parse
 import asyncio
 import os
 import re
-from threading import Thread, Event
+from threading import Thread
 from pathlib import Path
-from enum import Enum, auto
 from typing import List, Dict
 
 # Third-party imports
@@ -42,12 +40,16 @@ from pftpyclient.user_login.credentials import CredentialManager
 from pftpyclient.basic_utilities.configure_logger import configure_logger, update_wx_sink
 from pftpyclient.performance.monitor import PerformanceMonitor
 from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
-import pftpyclient.configuration.constants as constants
+from pftpyclient.configuration.constants import MIN_XRP_PER_TRANSACTION, MessageType
+from pftpyclient.models.memo_processor import generate_custom_id
 from pftpyclient.user_login.migrate_credentials import check_and_show_migration_dialog
 from pftpyclient.utilities.updater import check_and_show_update_dialog
+from pftpyclient.utilities.xrpl_monitor import XRPLMonitorThread
+from pftpyclient.utilities.wallet_state import WalletUIState
 from pftpyclient.wallet_ux.dialogs import *
 from pftpyclient.wallet_ux.dialogs import CustomDialog
 from pftpyclient.version import VERSION
+from pftpyclient.models.task import TaskType
 
 # Configure the logger at module level
 wx_sink = configure_logger(
@@ -74,13 +76,6 @@ nest_asyncio.apply()
 
 UpdateGridEvent, EVT_UPDATE_GRID = wx.lib.newevent.NewEvent()
 
-class WalletUIState(Enum):
-    IDLE = auto()
-    BUSY = auto()
-    SYNCING = auto()
-    TRANSACTION_PENDING = auto()
-    ERROR = auto()
-
 class PostFiatWalletApp(wx.App):
     def OnInit(self):
         frame = WalletApp()
@@ -90,259 +85,6 @@ class PostFiatWalletApp(wx.App):
     
     def ReopenApp(self):
         self.GetTopWindow().Raise()
-
-class XRPLMonitorThread(Thread):
-    def __init__(self, gui):
-        Thread.__init__(self, daemon=True)
-        self.gui: WalletApp = gui
-        self.config = ConfigurationManager()
-        self.ws_urls = self.config.get_ws_endpoints()
-        self.ws_url_index = 0
-        self.url = self.ws_urls[self.ws_url_index]
-        logger.debug(f"Starting XRPL monitor thread with endpoint: {self.url}")
-        self.loop = asyncio.new_event_loop()
-        self.context = None
-        self._stop_event = Event()
-
-        # Error handling parameters
-        self.reconnect_delay = 1  # Initial delay in seconds
-        self.max_reconnect_delay = 30  # Maximum delay
-        self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 5  # Per node
-
-        # Ledger monitoring
-        self.last_ledger_time = None
-        self.LEDGER_TIMEOUT = 30  # seconds
-        self.CHECK_INTERVAL = 4  # match XRPL block time
-        self.PING_INTERVAL = 60  # Send ping every 60 seconds
-        self.PING_TIMEOUT = 10   # Wait up to 10 seconds for pong
-
-    def run(self):
-        """Thread entry point"""
-        asyncio.set_event_loop(self.loop)
-        try:
-            self.context = self.loop.run_until_complete(self.monitor())
-        except Exception as e:
-            if not self.stopped():
-                logger.error(f"Unexpected error in XRPLMonitorThread: {e}")
-        finally:
-            self.loop.close()
-
-    def stop(self):
-        """Signal the thread to stop"""
-        self._stop_event.set()
-
-        # Close websocket connection if it exists
-        if hasattr(self, 'client') and self.client:
-            # Use the worker's existing loop to close
-            future = asyncio.run_coroutine_threadsafe(
-                self.client.close(),
-                self.loop
-            )
-            try:
-                # Wait for the websocket to close with a timeout
-                future.result(timeout=2)
-            except Exception:
-                pass  # Ignore timeout or other errors during close
-
-        # Cancel any pending tasks
-        pending_tasks = asyncio.all_tasks(self.loop)
-        for task in pending_tasks:
-            task.cancel()
-
-        # Stop the event loop
-        try:
-            self.loop.call_soon_threadsafe(
-                lambda: self.loop.stop()
-            )
-        except Exception as e:
-            pass  # Ignore any errors during loop stop
-
-    def stopped(self):
-        """Check if the thread has been signaled to stop"""
-        return self._stop_event.is_set()
-    
-    async def ping_server(self):
-        """Send ping and wait for response"""
-        try:
-            # Use server_info as a lightweight ping
-            response = await self.client.request(xrpl.models.requests.ServerInfo())
-            return response.is_successful()
-        except Exception as e:
-            logger.error(f"Ping failed: {e}")
-            return False
-        
-    async def check_timeouts(self):
-        """Check for ledger timeouts"""
-        last_ping_time = time.time()
-
-        while True:
-            await asyncio.sleep(self.CHECK_INTERVAL)
-
-            current_time = time.time()
-
-            # Check ledger updates
-            if self.last_ledger_time is not None:
-                time_since_last_ledger = time.time() - self.last_ledger_time
-                if time_since_last_ledger > self.LEDGER_TIMEOUT:
-                    logger.warning(f"No ledger updates for {time_since_last_ledger:.1f} seconds")
-                    raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
-                
-            # Check if it's time for a ping
-            time_since_last_ping = current_time - last_ping_time
-            if time_since_last_ping >= self.PING_INTERVAL:
-                try:
-                    async with asyncio.timeout(self.PING_TIMEOUT):
-                        is_alive = await self.ping_server()
-                        if is_alive:
-                            logger.debug(f"Pinged websocket...")
-                        else:
-                            raise Exception("Ping failed - no valid response")
-                    last_ping_time = current_time
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning(f"Connection check failed: {e}")
-                    raise Exception(f"Connection check failed: {e}")
-    
-    def set_ui_state(self, state: WalletUIState, message: str = None):
-        """Helper method to safely update UI state from thread"""
-        wx.CallAfter(self.gui.set_wallet_ui_state, state, message)
-
-    async def handle_connection_error(self, error_msg: str) -> bool:
-        """
-        Connection error handling with exponential backoff
-        Returns True if should retry, False if should switch nodes
-        """
-        logger.error(error_msg)
-        self.set_ui_state(WalletUIState.ERROR, error_msg)
-        
-        self.reconnect_attempts += 1
-        if self.reconnect_attempts >= self.max_reconnect_attempts:
-            logger.warning(f"Max reconnection attempts reached for node {self.url}. Switching to next node.")
-            self.switch_node()
-            self.reconnect_attempts = 0
-            self.reconnect_delay = 1
-            return False
-            
-        # Exponential backoff with jitter
-        jitter = random.uniform(0, 0.1) * self.reconnect_delay
-        delay = min(self.reconnect_delay + jitter, self.max_reconnect_delay)
-        logger.info(f"Reconnecting in {delay:.1f} seconds...")
-        await asyncio.sleep(delay)
-        self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-        return True
-
-    async def monitor(self):
-        """Main monitoring coroutine with error handling and reconnection logic"""
-        while not self.stopped():
-            try:
-                await self.watch_xrpl_account(self.gui.wallet.classic_address, self.gui.wallet)
-                # Reset reconnection parameters on successful connection
-                self.reconnect_delay = 1
-                self.reconnect_attempts = 0
-
-            except asyncio.CancelledError:
-                logger.debug("Monitor task cancelled")
-                break
-
-            except Exception as e:
-                if self.stopped():
-                    break
-
-                await self.handle_connection_error(f"Error in monitor: {e}")
-    
-    def switch_node(self):
-        self.ws_url_index = (self.ws_url_index + 1) % len(self.ws_urls)
-        self.url = self.ws_urls[self.ws_url_index]
-        logger.info(f"Switching to next node: {self.url}")
-
-    async def watch_xrpl_account(self, address, wallet=None):
-        self.account = address
-        self.wallet = wallet
-        self.last_ledger_time = time.time()
-
-        async with AsyncWebsocketClient(self.url) as self.client:
-            self.set_ui_state(WalletUIState.SYNCING, "Connecting to XRPL websocket...")
-
-            # Subcribe to streams
-            response = await self.client.request(xrpl.models.requests.Subscribe(
-                streams=["ledger"],
-                accounts=[self.account]
-            ))
-
-            if not response.is_successful():
-                self.set_ui_state(WalletUIState.IDLE, "Failed to connect to XRPL websocket.")
-                raise Exception(f"Subscription failed: {response.result}")
-            
-            self.set_ui_state(WalletUIState.IDLE)
-            logger.info(f"Successfully subscribed to account {self.account} updates on node {self.url}")
-
-            # Create task for timeout checking     
-            timeout_task = asyncio.create_task(self.check_timeouts())
-
-            try:
-                async for message in self.client:
-                    if self.stopped():
-                        break
-                        
-                    try:
-                        mtype = message.get("type")
-                        
-                        if mtype == "ledgerClosed":
-                            self.last_ledger_time = time.time()
-                            wx.CallAfter(self.gui.update_ledger, message)
-                        elif mtype == "transaction":
-                            await self.process_transaction(message)
-                            
-                    except Exception as e:
-                        logger.error(f"Error processing message: {e}")
-                        self.set_ui_state(WalletUIState.ERROR, f"Error processing update: {str(e)}")
-                        continue
-
-            finally:
-                timeout_task.cancel()
-                try:
-                    await timeout_task
-                except asyncio.CancelledError:
-                    pass
-
-    async def process_transaction(self, tx_message):
-        """Process a single transaction update from websocket"""
-        try:
-            self.set_ui_state(WalletUIState.BUSY, "Processing new transaction...")
-            logger.debug(f"Full websocket transaction message: {tx_message}")
-
-            formatted_tx = {
-                "tx_json": tx_message.get("tx_json", {}),
-                "meta": tx_message.get("meta", {}),
-                "hash": tx_message.get("hash"),
-                "ledger_index": tx_message.get("ledger_index"),
-                "validated": tx_message.get("validated", False)
-            }
-
-            # Process through sync_memo_transactions pipeline
-            wx.CallAfter(self.gui.sql_manager.store_transaction, formatted_tx)
-
-            # Update account info
-            response = await self.client.request(xrpl.models.requests.AccountInfo(
-                account=self.account,
-                ledger_index="validated"
-            ))
-
-            if response.is_successful():
-                def update_all():
-                    self.gui.update_account(response.result["account_data"])
-                    self.gui.update_tokens()
-                    self.gui.refresh_grids()
-                wx.CallAfter(update_all)
-            else:
-                logger.error(f"Failed to get account info: {response.result}")
-            
-            self.set_ui_state(WalletUIState.IDLE)
-
-        except Exception as e:
-            logger.error(f"Error processing transaction update: {e}")
-            logger.error(traceback.format_exc())
-            self.set_ui_state(WalletUIState.IDLE, f"Error: {str(e)}")
 
 class WalletApp(wx.Frame):
 
@@ -449,8 +191,8 @@ class WalletApp(wx.Frame):
         self.wallet = None
         self.build_ui()
 
-        # Add the wx handler to the logger after UI is built
-        update_wx_sink(self.log_text)
+        # # Add the wx handler to the logger after UI is built
+        # update_wx_sink(self.log_text)
 
         self.worker = None
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -467,7 +209,7 @@ class WalletApp(wx.Frame):
         self.wallet_state_in_transition = None
         self.take_action_dialog_shown = False
         self.wallet_state_monitor_timer = None
-        self.state_check_interval = 10000  # 10 seconds
+        self.state_check_interval = 30000  # 30 seconds
 
         # Check for migration
         check_and_show_migration_dialog(parent=self)
@@ -503,7 +245,8 @@ class WalletApp(wx.Frame):
         # Create Account menu
         self.account_menu = wx.Menu()
         self.contacts_item = self.account_menu.Append(wx.ID_ANY, "Manage Contacts")
-        self.update_gdoc_item = self.account_menu.Append(wx.ID_ANY, "Update Google Doc")  # New item
+        self.update_gdoc_item = self.account_menu.Append(wx.ID_ANY, "Update Google Doc") 
+        self.force_update_item = self.account_menu.Append(wx.ID_ANY, "Force Update")
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
         self.update_trustline_item = self.account_menu.Append(wx.ID_ANY, "Update Trustline")
@@ -513,6 +256,7 @@ class WalletApp(wx.Frame):
         # Bind menu events
         self.Bind(wx.EVT_MENU, self.on_manage_contacts, self.contacts_item)
         self.Bind(wx.EVT_MENU, self.on_update_google_doc, self.update_gdoc_item)
+        self.Bind(wx.EVT_MENU, self.on_force_update, self.force_update_item)
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
         self.Bind(wx.EVT_MENU, self.on_update_trustline, self.update_trustline_item)
@@ -682,46 +426,55 @@ class WalletApp(wx.Frame):
         self.verification_sizer = wx.BoxSizer(wx.VERTICAL)
         self.verification_tab.SetSizer(self.verification_sizer)
 
+        # Create splitter window
+        self.verification_splitter = wx.SplitterWindow(self.verification_tab, style=wx.SP_3D | wx.SP_LIVE_UPDATE)
+        top_panel = wx.Panel(self.verification_splitter)
+        top_sizer = wx.BoxSizer(wx.VERTICAL)
+
         # Task ID input box
         task_id_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        task_id_label = wx.StaticText(self.verification_tab, label="Task ID:")
-        self.verification_txt_task_id = wx.StaticText(self.verification_tab, label="")
+        task_id_label = wx.StaticText(top_panel, label="Task ID:")
+        self.verification_txt_task_id = wx.StaticText(top_panel, label="")
         task_id_sizer.Add(task_id_label, flag=wx.ALL | wx.CENTER, border=5)
         task_id_sizer.Add(self.verification_txt_task_id, flag=wx.ALL | wx.CENTER, border=5)
-        self.verification_sizer.Add(task_id_sizer, flag=wx.EXPAND | wx.ALL, border=5)
+        top_sizer.Add(task_id_sizer, flag=wx.EXPAND | wx.ALL, border=5)
 
         # Verification Details input box
-        self.verification_lbl_details = wx.StaticText(self.verification_tab, label="Verification Details:")
-        self.verification_sizer.Add(self.verification_lbl_details, flag=wx.ALL, border=5)
-        self.verification_txt_details = wx.TextCtrl(self.verification_tab, style=wx.TE_MULTILINE, size=(-1, 100))
-        self.verification_sizer.Add(self.verification_txt_details, flag=wx.EXPAND | wx.ALL, border=5)
+        self.verification_lbl_details = wx.StaticText(top_panel, label="Verification Details:")
+        top_sizer.Add(self.verification_lbl_details, flag=wx.ALL, border=5)
+        self.verification_txt_details = wx.TextCtrl(top_panel, style=wx.TE_MULTILINE, size=(-1, 100))
+        top_sizer.Add(self.verification_txt_details, 1, wx.EXPAND | wx.ALL, border=5)
 
-        # Submit Verification Details and Log Pomodoro buttons
-        self.verification_button_sizer_1 = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_submit_verification_details = wx.Button(self.verification_tab, label="Submit Verification Details")
-        self.btn_log_pomodoro = wx.Button(self.verification_tab, label="Log Pomodoro")
-        self.verification_button_sizer_1.Add(self.btn_submit_verification_details, 1, wx.EXPAND | wx.ALL, 5)
-        self.verification_button_sizer_1.Add(self.btn_log_pomodoro, 1, wx.EXPAND | wx.ALL, 5)
+        # Submit Verification Details and Refuse buttons
+        self.verification_button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_submit_verification_details = wx.Button(top_panel, label="Submit Verification Details")
+        self.btn_refuse_verification = wx.Button(top_panel, label="Refuse")
+        self.verification_button_sizer.Add(self.btn_submit_verification_details, 1, wx.EXPAND | wx.ALL, 5)
+        self.verification_button_sizer.Add(self.btn_refuse_verification, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_submit_verification_details.Bind(wx.EVT_BUTTON, self.on_submit_verification_details)
-        self.btn_log_pomodoro.Bind(wx.EVT_BUTTON, self.on_log_pomodoro)
-        self.verification_sizer.Add(self.verification_button_sizer_1, 0, wx.EXPAND)
-
-        # Refuse button and force update button
-        self.verification_button_sizer_2 = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_refuse_verification = wx.Button(self.verification_tab, label="Refuse")
-        self.btn_force_update = wx.Button(self.verification_tab, label="Force Update")
-        self.verification_button_sizer_2.Add(self.btn_refuse_verification, 1, wx.EXPAND | wx.ALL, 5)
-        self.verification_button_sizer_2.Add(self.btn_force_update, 1, wx.EXPAND | wx.ALL, 5)
         self.btn_refuse_verification.Bind(wx.EVT_BUTTON, self.on_refuse_verification)
-        self.btn_force_update.Bind(wx.EVT_BUTTON, self.on_force_update)
-        self.verification_sizer.Add(self.verification_button_sizer_2, 0, wx.EXPAND)
+        top_sizer.Add(self.verification_button_sizer, 0, wx.EXPAND)
+
+        top_panel.SetSizer(top_sizer)
+
+        # Bottom panel with grid
+        bottom_panel = wx.Panel(self.verification_splitter)
+        bottom_sizer = wx.BoxSizer(wx.VERTICAL)
 
         # Add grid to Verification tab
-        self.verification_grid = self.setup_grid(gridlib.Grid(self.verification_tab), 'verification')
+        self.verification_grid = self.setup_grid(gridlib.Grid(bottom_panel), 'verification')
         self.verification_grid.EnableEditing(False)
         self.verification_grid.SetSelectionMode(gridlib.Grid.SelectRows)
         self.verification_grid.Bind(gridlib.EVT_GRID_SELECT_CELL, self.on_verification_selection)
-        self.verification_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 20)
+        bottom_sizer.Add(self.verification_grid, 1, wx.EXPAND | wx.ALL, 20)
+        bottom_panel.SetSizer(bottom_sizer)
+
+        # Initialize splitter
+        self.verification_splitter.SplitHorizontally(top_panel, bottom_panel)
+        self.verification_splitter.SetMinimumPaneSize(150)
+        self.verification_splitter.SetSashGravity(0.4)
+
+        self.verification_sizer.Add(self.verification_splitter, 1, wx.EXPAND)
 
         # Store reference to verification tab page
         self.tab_pages["Verification"] = self.verification_tab
@@ -836,17 +589,17 @@ class WalletApp(wx.Frame):
         # LOGS
         #################################
 
-        self.log_tab = wx.Panel(self.tabs)
-        self.tabs.AddPage(self.log_tab, "Log")
-        self.log_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.log_tab.SetSizer(self.log_sizer)
+        # self.log_tab = wx.Panel(self.tabs)
+        # self.tabs.AddPage(self.log_tab, "Log")
+        # self.log_sizer = wx.BoxSizer(wx.VERTICAL)
+        # self.log_tab.SetSizer(self.log_sizer)
 
-        # Create a text control for logs
-        self.log_text = wx.TextCtrl(self.log_tab, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
-        self.log_sizer.Add(self.log_text, 1, wx.EXPAND | wx.ALL, 5)
+        # # Create a text control for logs
+        # self.log_text = wx.TextCtrl(self.log_tab, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
+        # self.log_sizer.Add(self.log_text, 1, wx.EXPAND | wx.ALL, 5)
 
-        # Store reference to log tab page
-        self.tab_pages["Log"] = self.log_tab
+        # # Store reference to log tab page
+        # self.tab_pages["Log"] = self.log_tab
 
         #################################
 
@@ -1124,7 +877,6 @@ class WalletApp(wx.Frame):
                 
             password = dialog.GetValue()
             dialog.Destroy()
-            # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self.refresh_grids, None)
         
             if not self.task_manager.verify_password(password):
                 wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
@@ -1174,11 +926,21 @@ class WalletApp(wx.Frame):
         self.btn_send.Disable()
 
         try:
+            dest_tag = int(destination_tag) if destination_tag.strip() else None
             if token_type == "XRP":
-                dest_tag = int(destination_tag) if destination_tag.strip() else None
-                response = self.task_manager.send_xrp(amount, destination, memo, destination_tag=dest_tag)
+                response = self.task_manager.send_xrp(
+                    amount=amount, 
+                    destination=destination, 
+                    memo_data=memo,
+                    destination_tag=dest_tag
+                )
             else: # PFT
-                response = self.task_manager.send_pft(amount, destination, memo)
+                response = self.task_manager.send_pft(
+                    amount=amount, 
+                    destination=destination, 
+                    memo_data=memo,
+                    destination_tag=dest_tag
+                )
 
             formatted_response = self.format_response(response)
             dialog = SelectableMessageDialog(self, f"{token_type} Payment Submitted", formatted_response)
@@ -1187,12 +949,15 @@ class WalletApp(wx.Frame):
 
         except ValueError as e:
             logger.error(f"Invalid input: {e}")
+            logger.error(traceback.format_exc())
             wx.MessageBox(f"Invalid input: {e}", "Error", wx.OK | wx.ICON_ERROR)
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             logger.error(f"Error submitting payment: {e}")
+            logger.error(traceback.format_exc())
             wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
         except Exception as e:
             logger.error(f"Error submitting payment: {e}")
+            logger.error(traceback.format_exc())
             wx.MessageBox(f"Error submitting payment: {e}", "Error", wx.OK | wx.ICON_ERROR)
         
         self.btn_send.Enable()
@@ -1669,8 +1434,8 @@ class WalletApp(wx.Frame):
                 )
                 if wx.YES == wx.MessageBox(message, "Set Trust Line", wx.YES_NO | wx.ICON_QUESTION):
                     try:
-                        self.task_manager.handle_trust_line()
                         self.start_wallet_state_monitoring()
+                        self.task_manager.handle_trust_line()
                     except Exception as e:
                         logger.error(f"Error setting trust line: {e}")
                         wx.MessageBox(f"Error setting trust line: {e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1685,13 +1450,12 @@ class WalletApp(wx.Frame):
                 if dialog.ShowModal() == wx.ID_OK:
                     commitment = dialog.GetValues()["Commitment"]
                     try:
+                        self.start_wallet_state_monitoring()
                         response = self.task_manager.send_initiation_rite(commitment)
                         formatted_response = self.format_response(response)
                         dialog = SelectableMessageDialog(self, "Initiation Rite Result", formatted_response)
                         dialog.ShowModal()
                         dialog.Destroy()
-                        wx.CallAfter(lambda: self.check_wallet_state())
-                        self.start_wallet_state_monitoring()
                     except Exception as e:
                         logger.error(f"Error sending initiation rite: {e}")
                         wx.MessageBox(f"Error sending initiation rite: {e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1709,13 +1473,13 @@ class WalletApp(wx.Frame):
                 )
                 if wx.YES == wx.MessageBox(message, "Send Handshake", wx.YES_NO | wx.ICON_QUESTION):
                     try:
+                        self.start_wallet_state_monitoring()
                         response = self.task_manager.send_handshake(self.network_config.node_address)
                         formatted_response = self.format_response(response)
                         dialog = SelectableMessageDialog(self, "Handshake Result", formatted_response)
                         dialog.ShowModal()
                         dialog.Destroy()
                         wx.CallAfter(lambda: self.check_wallet_state())
-                        self.start_wallet_state_monitoring()
                     except Exception as e:
                         logger.error(f"Error sending handshake: {e}")
                         wx.MessageBox(f"Error sending handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -1729,8 +1493,8 @@ class WalletApp(wx.Frame):
 
             case WalletState.HANDSHAKE_RECEIVED:
                 if self.show_google_doc_template(is_initial_setup=True):
-                    self.handle_google_doc_submission(event, is_initial_setup=True)
                     self.start_wallet_state_monitoring()
+                    self.handle_google_doc_submission(event, is_initial_setup=True)
 
             case _:
                 logger.error(f"Unknown wallet state: {current_state}")
@@ -1740,11 +1504,9 @@ class WalletApp(wx.Frame):
         if self.worker.context:
             asyncio.run_coroutine_threadsafe(job, self.worker.loop)
 
-    def update_ledger(self, message):
-        pass  # Simplified for this version
-
     @PerformanceMonitor.measure('update_account')
     def update_account(self, acct):
+        """Update account information and wallet state"""
         logger.debug(f"Updating account: {acct}")
         xrp_balance = str(xrpl.utils.drops_to_xrp(acct["Balance"]))
         self.summary_lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
@@ -1756,7 +1518,6 @@ class WalletApp(wx.Frame):
             # If balance is > 0 XRP and current state is UNFUNDED, update state
             if (current_state == WalletState.UNFUNDED and float(xrp_balance) > 0):
                 logger.info("Account now funded. Updating wallet state.")
-                self.task_manager.wallet_state = WalletState.FUNDED
                 message = (
                     "Your wallet is now funded!\n\n"
                     "You can now proceed with setting up a trust line for PFT tokens.\n"
@@ -1768,7 +1529,6 @@ class WalletApp(wx.Frame):
             # If trust line is detected and current state is FUNDED
             elif (current_state == WalletState.FUNDED and self.task_manager.has_trust_line()):
                 logger.info("Trust line detected. Updating wallet state.")
-                self.task_manager.wallet_state = WalletState.TRUSTLINED
                 message = (
                     "Trust line successfully established!\n\n"
                     "You can now proceed with the initiation rite.\n"
@@ -1781,7 +1541,6 @@ class WalletApp(wx.Frame):
             # If initiation rite is detected and current state is TRUSTLINED
             elif (current_state == WalletState.TRUSTLINED and self.task_manager.initiation_rite_sent()):
                 logger.info("Initiation rite detected. Updating wallet state.")
-                self.task_manager.wallet_state = WalletState.INITIATED
                 message = (
                     "Initiation rite successfully sent!\n\n"
                     "You can now proceed with setting up an encryption channel with the node.\n"
@@ -1794,12 +1553,10 @@ class WalletApp(wx.Frame):
             # If sent handshake is detected and current state is INITIATED
             elif (current_state == WalletState.INITIATED and self.task_manager.handshake_sent()):
                 logger.info("Sent handshake. Updating wallet state.")
-                self.task_manager.wallet_state = WalletState.HANDSHAKE_SENT
 
             # If received handshake is detected and current state is HANDSHAKE_SENT
             elif (current_state == WalletState.HANDSHAKE_SENT and self.task_manager.handshake_received()):
                 logger.info("Received handshake. Updating wallet state.")
-                self.task_manager.wallet_state = WalletState.HANDSHAKE_RECEIVED
                 message = (
                     "Handshake protocol complete!\n\n"
                     "You can now proceed with setting up your Google Doc.\n"
@@ -1812,7 +1569,6 @@ class WalletApp(wx.Frame):
             # If Google Doc is detected and current state is HANDSHAKE_RECEIVED
             elif (current_state == WalletState.HANDSHAKE_RECEIVED and self.task_manager.google_doc_sent()):
                 logger.info("Google Doc detected. Updating wallet state.")
-                self.task_manager.wallet_state = WalletState.ACTIVE
                 message = (
                     "Google Doc successfully set up!\n\n"
                     "Your wallet is now fully initialized and ready to use.\n"
@@ -1825,6 +1581,7 @@ class WalletApp(wx.Frame):
     @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('update_tokens')
     def update_tokens(self):
+        """Update token balances for the current account"""
         logger.debug(f"Fetching token balances for account: {self.wallet.address}")
         try:
             client = xrpl.clients.JsonRpcClient(self.network_url)
@@ -1839,11 +1596,9 @@ class WalletApp(wx.Frame):
                 return
 
             lines = response.result.get('lines', [])
-            logger.debug(f"Account lines: {lines}")
 
             pft_balance = 0.0
             for line in lines:
-                logger.debug(f"Processing line: {line}")
                 if line['currency'] == 'PFT' and line['account'] == self.pft_issuer:
                     pft_balance = float(line['balance'])
                     logger.debug(f"Found PFT balance: {pft_balance}")
@@ -1877,10 +1632,6 @@ class WalletApp(wx.Frame):
     
     def on_force_update(self, _):
         """Handle manual force update requests"""
-        logger.info("Manual force update triggered")
-        self.btn_force_update.SetLabel("Updating...")
-        self.btn_force_update.Update()
-
         try:
             self._sync_and_refresh()
         except Exception as e:
@@ -1890,9 +1641,6 @@ class WalletApp(wx.Frame):
                 "Force Update Error",
                 wx.OK | wx.ICON_ERROR
             )
-        finally:
-            self.btn_force_update.SetLabel("Force Update")
-            self.btn_force_update.Update()
 
     @PerformanceMonitor.measure('refresh_grids')
     def refresh_grids(self, event=None):
@@ -2225,9 +1973,9 @@ class WalletApp(wx.Frame):
             latest_state = self.task_manager.get_task_state_by_id(task_id)
 
             # Enable/disable buttons based on task state
-            self.btn_accept_task.Enable(latest_state == constants.TaskType.PROPOSAL.name)
-            self.btn_refuse_task.Enable(latest_state != constants.TaskType.REFUSAL.name)
-            self.btn_submit_for_verification.Enable(latest_state == constants.TaskType.ACCEPTANCE.name)
+            self.btn_accept_task.Enable(latest_state == TaskType.PROPOSAL)
+            self.btn_refuse_task.Enable(latest_state != TaskType.REFUSAL)
+            self.btn_submit_for_verification.Enable(latest_state == TaskType.ACCEPTANCE)
 
         except Exception as e:
             logger.error(f"Error updating proposal buttons: {e}")
@@ -2286,11 +2034,11 @@ class WalletApp(wx.Frame):
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
             task_id = values["Task ID"]
-            acceptance_string = values["Acceptance String"]
+            acceptance_message = values["Acceptance String"]
             try:
-                response = self.task_manager.send_acceptance_for_task_id(
+                response = self.task_manager.send_acceptance(
                     task_id=task_id,
-                    acceptance_string=acceptance_string
+                    acceptance_message=acceptance_message
                 )
                 formatted_response = self.format_response(response)
                 dialog = SelectableMessageDialog(self, "Task Acceptance Result", formatted_response)
@@ -2305,8 +2053,6 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error accepting task: {e}")
                 wx.MessageBox(f"Error accepting task: {e}", 'Task Acceptance Error', wx.OK | wx.ICON_ERROR)
-            # else:
-            #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_accept_task.SetLabel("Accept Task")
@@ -2334,7 +2080,7 @@ class WalletApp(wx.Frame):
             task_id = values["Task ID"]
             refusal_reason = values["Refusal Reason"]
             try:
-                response = self.task_manager.send_refusal_for_task(
+                response = self.task_manager.send_refusal(
                     task_id=task_id,
                     refusal_reason=refusal_reason
                 )
@@ -2351,8 +2097,6 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error refusing task: {e}")
                 wx.MessageBox(f"Error refusing task: {e}", 'Task Refusal Error', wx.OK | wx.ICON_ERROR)
-            # else:
-            #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         dialog.Destroy()
         self.btn_refuse_task.SetLabel("Refuse Task")
@@ -2378,10 +2122,10 @@ class WalletApp(wx.Frame):
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
             task_id = values["Task ID"]
-            completion_string = values["Completion String"]
+            completion_message = values["Completion String"]
             try:
                 response = self.task_manager.submit_completion(
-                    completion_string=completion_string,
+                    completion_message=completion_message,
                     task_id=task_id
                 )
                 formatted_response = self.format_response(response)
@@ -2397,8 +2141,6 @@ class WalletApp(wx.Frame):
             except Exception as e:
                 logger.error(f"Error submitting initial completion: {e}")
                 wx.MessageBox(f"Error submitting initial completion: {e}", 'Task Submission Error', wx.OK | wx.ICON_ERROR)
-            # else:
-            #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
         dialog.Destroy()
 
         self.btn_submit_for_verification.SetLabel("Submit for Verification")
@@ -2442,7 +2184,7 @@ class WalletApp(wx.Frame):
         if dialog.ShowModal() == wx.ID_OK:
             values = dialog.GetValues()
             try:
-                response = self.task_manager.send_refusal_for_task(
+                response = self.task_manager.send_refusal(
                     task_id=values["Task ID"],
                     refusal_reason=values["Refusal Reason"]
                 )
@@ -2450,7 +2192,6 @@ class WalletApp(wx.Frame):
                 result_dialog = SelectableMessageDialog(self, "Task Refusal Result", formatted_response)
                 result_dialog.ShowModal()
                 result_dialog.Destroy()
-                # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
             except Exception as e:
                 wx.MessageBox(f"Error refusing task: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
@@ -2463,16 +2204,16 @@ class WalletApp(wx.Frame):
         self.btn_submit_verification_details.Update()
 
         task_id = self.verification_txt_task_id.GetLabel()
-        response_string = self.verification_txt_details.GetValue()
+        response_message = self.verification_txt_details.GetValue()
 
         if not task_id:
             wx.MessageBox("Please select a task first", "No Task Selected", wx.OK | wx.ICON_WARNING)
-        elif not response_string:
+        elif not response_message:
             wx.MessageBox("Please enter verification details", "Verification Details Required", wx.OK | wx.ICON_ERROR)
         else:
             try:
                 response = self.task_manager.send_verification_response(
-                    response_string=response_string,
+                    response_message=response_message,
                     task_id=task_id
                 )
                 formatted_response = self.format_response(response)
@@ -2493,37 +2234,9 @@ class WalletApp(wx.Frame):
                 self.verification_txt_task_id.SetLabel("")
                 self.btn_submit_verification_details.SetLabel("Submit Verification Details")
                 self.btn_submit_verification_details.Update()
-                # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         self.btn_submit_verification_details.SetLabel("Submit Verification Details")
         self.btn_submit_verification_details.Update()
-        self.set_wallet_ui_state(WalletUIState.IDLE)
-
-    def on_log_pomodoro(self, event):
-        self.set_wallet_ui_state(WalletUIState.TRANSACTION_PENDING, "Logging Pomodoro...")
-        self.btn_log_pomodoro.SetLabel("Logging Pomodoro...")
-        self.btn_log_pomodoro.Update()
-
-        task_id = self.verification_txt_task_id.GetValue()
-        pomodoro_text = self.verification_txt_details.GetValue()
-
-        if not task_id or not pomodoro_text:
-            wx.MessageBox("Please enter a task ID and pomodoro text", "Error", wx.OK | wx.ICON_ERROR)
-        else:
-            try:
-                response = self.task_manager.send_pomodoro_for_task_id(task_id=task_id, pomodoro_text=pomodoro_text)
-                formatted_response = self.format_response(response)
-                dialog = SelectableMessageDialog(self, "Pomodoro Log Result", formatted_response)
-                dialog.ShowModal()
-                dialog.Destroy()
-            except Exception as e:
-                logger.error(f"Error logging pomodoro: {e}")
-                wx.MessageBox(f"Error logging pomodoro: {e}", 'Pomodoro Log Error', wx.OK | wx.ICON_ERROR)
-            else:
-                self.verification_txt_details.SetValue("")
-
-        self.btn_log_pomodoro.SetLabel("Log Pomodoro")
-        self.btn_log_pomodoro.Update()
         self.set_wallet_ui_state(WalletUIState.IDLE)
 
     def validate_address(self, address: str) -> Optional[str]:
@@ -2589,8 +2302,8 @@ class WalletApp(wx.Frame):
                             wx.YES_NO | wx.ICON_QUESTION
                         ):
                             logger.debug(f"Sending handshake to {recipient}")
-                            response = self.task_manager.send_handshake(recipient)
-                            formatted_response = self.format_response(response)
+                            responses = self.task_manager.send_handshake(recipient)
+                            formatted_response = self.format_response(responses)
                             dialog = SelectableMessageDialog(self, "Handshake Submission Result", formatted_response)
                             dialog.ShowModal()
                             dialog.Destroy()
@@ -2622,7 +2335,7 @@ class WalletApp(wx.Frame):
 
             message = (
                 f"Memo will be {'encrypted, ' if encrypt else ''}compressed and sent over {num_chunks} transaction(s) and "
-                f"cost 1 PFT per chunk ({num_chunks} PFT + {num_chunks * constants.MIN_XRP_PER_TRANSACTION} XRP total).\n\n"
+                f"cost 1 PFT per chunk ({num_chunks} PFT + {num_chunks * MIN_XRP_PER_TRANSACTION} XRP total).\n\n"
                 f"Destination XRP Address: {recipient}\n"
                 f"Memo: {memo_text[:20]}{'...' if len(memo_text) > 20 else ''}\n\n"
                 f"Continue?"
@@ -2635,11 +2348,14 @@ class WalletApp(wx.Frame):
             responses = self.task_manager.send_memo(
                 destination=recipient,
                 memo_data=memo_text,
+                memo_type=generate_custom_id() + "__" + MessageType.MEMO.value,
                 encrypt=encrypt
             )
+            if not isinstance(responses, list):
+                responses = [responses]
             
             formatted_responses = [self.format_response(response) for response in responses]
-            logger.info(f"Memo Submission Result: {formatted_responses}")
+            logger.debug(f"Memo Submission Result: {formatted_responses}")
 
             for idx, formatted_response in enumerate(formatted_responses):
                 if idx == 0:
@@ -2654,7 +2370,6 @@ class WalletApp(wx.Frame):
             wx.MessageBox(f"Error submitting memo: {e}", "Error", wx.OK | wx.ICON_ERROR)
         else:
             self.txt_memo_input.SetValue("")
-            # wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
 
         self.btn_submit_memo.SetLabel("Submit Memo")
         self.set_wallet_ui_state(WalletUIState.IDLE)
@@ -2709,8 +2424,6 @@ class WalletApp(wx.Frame):
                     logger.error(traceback.format_exc())
                     dialog.show_error(str(e))
                     continue
-                # else:
-                #     wx.CallLater(constants.REFRESH_GRIDS_AFTER_TASK_DELAY_SEC * 1000, self._sync_and_refresh)
             else:
                 break
         dialog.Destroy()

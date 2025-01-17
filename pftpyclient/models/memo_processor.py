@@ -1,8 +1,6 @@
 # Standard imports
 from typing import List, Dict, Any, Optional, Union
-import re
 import traceback
-import asyncio
 import math
 import binascii
 from datetime import datetime
@@ -41,7 +39,7 @@ class MemoProcessor:
     @staticmethod
     def parse_group(
         group: MemoGroup,
-        wallet: Wallet,
+        wallet: Optional[Wallet] = None,
         credential_manager: Optional[CredentialManager] = None,
         message_encryption: Optional[MessageEncryption] = None,
         decrypt: bool = True
@@ -64,7 +62,6 @@ class MemoProcessor:
         
         first_tx = group.memos[0]
         structure = MemoStructure.from_transaction(first_tx)
-        logger.debug(f"Structure: {structure}")
 
         if not structure.is_valid_format:
             logger.warning("structure is not valid format")
@@ -85,7 +82,7 @@ class MemoProcessor:
     @staticmethod
     def construct_group(
         memo_params: MemoConstructionParameters,
-        wallet: Wallet,
+        wallet: Optional[Wallet] = None,
         message_encryption: Optional[MessageEncryption] = None,
     ) -> MemoGroup:
         """
@@ -141,7 +138,7 @@ class MemoProcessor:
             if encrypt:
                 if not message_encryption:
                     raise ValueError("message_encryption required for encrypted memos")
-                processed_data = message_encryption.estimate_encrypted_size(processed_data)
+                processed_data = message_encryption.get_dummy_encrypted_content(processed_data)
 
             # Estimate compression if enabled
             if compress:
@@ -383,7 +380,7 @@ class StandardizedMemoProcessor:
     @staticmethod
     def parse_group(
         group: MemoGroup,
-        wallet: Wallet,
+        wallet: Optional[Wallet] = None,
         credential_manager: Optional[CredentialManager] = None,
         message_encryption: Optional[MessageEncryption] = None,
         decrypt: bool = True

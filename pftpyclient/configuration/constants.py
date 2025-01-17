@@ -17,8 +17,8 @@ MEMO_VERSION = "1.0"
 UNIQUE_ID_VERSION = "1.0"  # Unique ID pattern for memo types
 UNIQUE_ID_PATTERN_V1 = re.compile(fr'(v{UNIQUE_ID_VERSION}\.(?:\d{{4}}-\d{{2}}-\d{{2}}_\d{{2}}:\d{{2}}(?:__[A-Z0-9]{{2,4}})?))')
 
-class PFTSendDistribution(Enum):
-    """Strategy for distributing PFT across chunked memos"""
+class SendDistribution(Enum):
+    """Strategy for distributing PFT or XRP across chunked memos"""
     DISTRIBUTE_EVENLY = "distribute_evenly"
     LAST_CHUNK_ONLY = "last_chunk_only"
     FULL_AMOUNT_EACH = "full_amount_each"

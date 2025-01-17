@@ -6,6 +6,7 @@ import traceback
 from typing import List
 import asyncio
 from pathlib import Path
+import json
 
 # Third-party imports
 import xrpl
@@ -211,6 +212,21 @@ class PostFiatTaskManager:
         except Exception as e:
             logger.error(f"Error getting last ledger index: {e}")
             return None
+        
+    def store_transaction(self, transaction: Dict):
+        """Store a transaction in the database"""
+        formatted_tx = self._format_transaction(transaction)
+        self.sql_manager.store_transaction(formatted_tx)
+
+    def _store_transactions(self, transactions: List[Dict]):
+        """Store formatted transactions in database"""
+        try:
+            for tx in transactions:
+                self.sql_manager.store_transaction(tx)
+                
+        except Exception as e:
+            logger.error(f"Error storing transactions: {e}")
+            raise
 
     def sync_transactions(self):
         """Sync transactions from XRPL to local database"""
@@ -221,19 +237,22 @@ class PostFiatTaskManager:
         try:
             # Get last processed ledger index
             last_ledger = self._get_last_ledger_index()
+            ledger_index_min = last_ledger + 1 if last_ledger else -1
+            logger.debug(f"Last ledger index: {ledger_index_min}")
             
             # Fetch and process new transactions
             transactions = await self._fetch_account_transactions(
                 account_address=self.user_wallet.classic_address,
-                ledger_index_min=last_ledger + 1 if last_ledger else -1
+                ledger_index_min=ledger_index_min
             )
-            
             if transactions:
-                formatted_txs = self._format_transactions(transactions)
-                await self._store_transactions(formatted_txs)
+                logger.debug(f"Storing {len(transactions)} transactions")
+                for tx in transactions:
+                    self.store_transaction(tx)
                 
         except Exception as e:
             logger.error(f"Error syncing transactions: {e}")
+            logger.error(traceback.format_exc())
             raise
 
     def _get_last_ledger_index(self) -> Optional[int]:
@@ -248,6 +267,17 @@ class PostFiatTaskManager:
         except Exception as e:
             logger.error(f"Error getting last ledger index: {e}")
             return None
+        
+    def _format_transaction(self, tx: Dict) -> Dict:
+        """Format a single transaction for database storage"""
+        return {
+            'hash': tx.get('hash'),
+            'ledger_index': tx.get('ledger_index'),
+            'close_time_iso': tx.get('close_time_iso'),
+            'validated': tx.get('validated', False),
+            'meta': tx.get('meta', {}),
+            'tx_json': tx.get('tx_json', {})
+        }
 
     async def _fetch_account_transactions(
         self,
@@ -314,21 +344,21 @@ class PostFiatTaskManager:
         return all_transactions
     
     @property
-    def payments(self) -> List[Dict]:
+    def payment_history(self) -> List[Dict]:
         """Get all payments for the user"""
         return self.sql_manager.get_account_payments(
             account_address=self.user_wallet.classic_address
         )
 
     @property
-    def memo_transactions(self) -> List[Dict]:
+    def memo_history(self) -> List[Dict]:
         """Get all memo transactions for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address
         )
     
     @property
-    def memos(self) -> List[Dict]:
+    def message_history(self) -> List[Dict]:
         """Get all memos for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
@@ -336,7 +366,7 @@ class PostFiatTaskManager:
         )
     
     @property
-    def handshakes(self) -> List[Dict]:
+    def handshake_history(self) -> List[Dict]:
         """Get all handshakes for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
@@ -344,7 +374,7 @@ class PostFiatTaskManager:
         )
     
     @property
-    def initiation_rites(self) -> List[Dict]:
+    def initiation_history(self) -> List[Dict]:
         """Get all initiation rites for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
@@ -352,7 +382,7 @@ class PostFiatTaskManager:
         )
     
     @property
-    def google_context_doc_links(self) -> List[Dict]:
+    def context_doc_history(self) -> List[Dict]:
         """Get all google context doc links for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
@@ -360,7 +390,7 @@ class PostFiatTaskManager:
         )
     
     @property
-    def tasks(self) -> List[Dict]:
+    def task_request_history(self) -> List[Dict]:
         """Get all tasks for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
@@ -368,7 +398,7 @@ class PostFiatTaskManager:
         )
     
     @property
-    def proposals(self) -> List[Dict]:
+    def proposal_history(self) -> List[Dict]:
         """Get all proposals for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
@@ -376,7 +406,7 @@ class PostFiatTaskManager:
         )
     
     @property
-    def verifications(self) -> List[Dict]:
+    def verification_history(self) -> List[Dict]:
         """Get all verifications for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
@@ -384,61 +414,12 @@ class PostFiatTaskManager:
         )
     
     @property
-    def rewards(self) -> List[Dict]:
+    def reward_history(self) -> List[Dict]:
         """Get all rewards for the user"""
         return self.sql_manager.get_account_memo_history(
             account_address=self.user_wallet.classic_address,
             memo_type_filter=f'%{TaskType.REWARD.value}%'
         )
-
-    def _format_transactions(self, transactions: List[Dict]) -> List[Dict]:
-        """Format raw transactions for database storage"""
-        formatted_transactions = []
-        
-        for tx in transactions:
-            formatted_tx = {
-                'hash': tx.get('hash'),
-                'ledger_index': tx.get('ledger_index'),
-                'close_time_iso': tx.get('close_time_iso'),
-                'validated': tx.get('validated', False),
-                'meta': tx.get('meta', {}),
-                'tx_json': tx.get('tx_json', {})
-            }
-            formatted_transactions.append(formatted_tx)
-            
-        return formatted_transactions
-
-    def _store_transactions(self, transactions: List[Dict]):
-        """Store formatted transactions in database"""
-        try:
-            for tx in transactions:
-                self.sql_manager.store_transaction(tx)
-                
-        except Exception as e:
-            logger.error(f"Error storing transactions: {e}")
-            raise
-
-    def get_task(self, task_id):
-        """ Returns the task dataframe for a given task ID """
-        task_df = self.tasks[self.tasks['task_id'] == task_id]
-        if task_df.empty or len(task_df) == 0:
-            raise NoMatchingTaskException(f"No task found with task_id {task_id}")
-        return task_df
-    
-    def get_task_state(self, task_df):
-        """ Returns the latest state of a task given a task dataframe containing a single task_id """
-        if task_df.empty or len(task_df) == 0:
-            raise ValueError("The task dataframe is empty")
-
-        # Confirm that the task_id column only has a single value
-        if task_df['task_id'].nunique() != 1:
-            raise ValueError("The task_id column must contain only one unique value")
-        
-        return task_df.sort_values(by='datetime').iloc[-1]['task_type']
-    
-    def get_task_state_using_task_id(self, task_id):
-        """ Returns the latest state of a task given a task ID """
-        return self.get_task_state(self.get_task(task_id))
 
     def spawn_user_wallet(self):
         """ This takes the credential manager and loads the wallet from the
@@ -446,59 +427,6 @@ class PostFiatTaskManager:
         seed = self.credential_manager.get_credential('v1xrpsecret')
         live_wallet = xrpl.wallet.Wallet.from_seed(seed)
         return live_wallet
-
-    @PerformanceMonitor.measure('send_pft')
-    def send_pft(
-        self, 
-        amount: Decimal,
-        destination: str,
-        memo: Union[str, Memo, None] = None,
-        destination_tag: Optional[int] = None,
-        pft_distribution: PFTSendDistribution = PFTSendDistribution.LAST_CHUNK_ONLY
-    ) -> Union[Response, List[Response]]:
-        """Send PFT tokens with optional memo.
-        
-        Args:
-            amount: Amount of PFT to send
-            destination: Destination address
-            memo: Optional memo content or Memo object
-            destination_tag: Optional destination tag
-            pft_distribution: How to distribute PFT across chunks
-            
-        Returns:
-            Response or list of Responses for chunked memos
-            
-        Raises:
-            ValueError: If memo is invalid type
-        """
-        try:
-            # Handle different memo types
-            if isinstance(memo, Memo):
-                memo_data = memo.memo_data
-                memo_type = memo.memo_type
-            elif isinstance(memo, str):
-                memo_data = memo
-                memo_type = None
-            elif memo is None:
-                memo_data = ""
-                memo_type = None
-            else:
-                raise ValueError("Memo must be either a string, Memo object, or None")
-
-            # Use send_memo with PFT amount
-            return self.send_memo(
-                destination=destination,
-                memo_data=memo_data,
-                memo_type=memo_type,
-                pft_amount=amount,
-                destination_tag=destination_tag,
-                pft_distribution=pft_distribution
-            )
-
-        except Exception as e:
-            logger.error(f"Error sending PFT: {e}")
-            logger.error(traceback.format_exc())
-            raise
     
     def handshake_sent(self):
         """Checks if the user has sent a handshake to the node"""
@@ -515,7 +443,7 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('get_handshakes')
     def get_handshakes(self) -> List[Dict]:
         """ Returns a DataFrame of all handshake interactions with their current status"""
-        handshakes = self.handshakes
+        handshakes = self.handshake_history
         if len(handshakes) == 0:
             return []
         
@@ -592,14 +520,64 @@ class PostFiatTaskManager:
         )
         return response
     
+    @PerformanceMonitor.measure('send_pft')
+    def send_pft(
+        self, 
+        amount: Decimal,
+        destination: str,
+        memo_data: Optional[str] = None,
+        memo_type: Optional[str] = None,
+        destination_tag: Optional[int] = None
+    ) -> Union[Response, List[Response]]:
+        """Send PFT tokens with optional memo.
+        
+        Args:
+            amount: Amount of PFT to send
+            destination: Destination address
+            memo_data: Optional memo content or Memo object
+            memo_type: Optional memo type identifier
+            destination_tag: Optional destination tag
+            pft_distribution: How to distribute PFT across chunks
+            
+        Returns:
+            Response or list of Responses for chunked memos
+            
+        Raises:
+            ValueError: If memo is invalid type
+        """
+        if not memo_data:
+            return self._send_single(
+                destination=destination,
+                pft_amount=Decimal(amount),
+                destination_tag=destination_tag
+            )
+
+        params = MemoConstructionParameters.construct_standardized_memo(
+            source=self.user_wallet.classic_address,
+            destination=destination,
+            memo_data=memo_data,
+            memo_type=memo_type
+        )
+
+        memo_group = MemoProcessor.construct_group(
+            memo_params=params,
+            wallet=self.user_wallet,
+            message_encryption=self.message_encryption
+        )
+
+        return self.send_memo_group(
+            destination=destination,
+            memo_group=memo_group,
+            pft_amount=Decimal(amount),
+            destination_tag=destination_tag
+        )
+    
     def send_xrp(
         self,
-        amount: Union[Decimal, int, float], 
+        amount: Decimal, 
         destination: str, 
         memo_data: Optional[str] = None, 
         memo_type: Optional[str] = None,
-        compress: bool = False,
-        encrypt: bool = False,
         destination_tag: Optional[int] = None
     ) -> Union[Response, list[Response]]:
         """Send XRP with optional memo processing capabilities.
@@ -609,8 +587,6 @@ class PostFiatTaskManager:
             destination: XRPL destination address
             memo_data: Optional memo data to include
             memo_type: Optional memo type identifier
-            compress: Whether to compress the memo data
-            encrypt: Whether to encrypt the memo data
             destination_tag: Optional destination tag
             
         Returns:
@@ -618,9 +594,8 @@ class PostFiatTaskManager:
         """
 
         if not memo_data:
-            return self._send_memo_single(
+            return self._send_single(
                 destination=destination,
-                memo=Memo(),  # Empty memo
                 xrp_amount=Decimal(amount),
                 destination_tag=destination_tag
             )
@@ -629,9 +604,7 @@ class PostFiatTaskManager:
             source=self.user_wallet.classic_address,
             destination=destination,
             memo_data=memo_data,
-            memo_type=memo_type,
-            should_encrypt=encrypt,
-            should_compress=compress
+            memo_type=memo_type
         )
 
         memo_group = MemoProcessor.construct_group(
@@ -658,7 +631,7 @@ class PostFiatTaskManager:
         pft_amount: Optional[Decimal] = None,
         xrp_amount: Optional[Decimal] = None,
         destination_tag: Optional[int] = None,
-        pft_distribution: PFTSendDistribution = PFTSendDistribution.LAST_CHUNK_ONLY
+        distribution: SendDistribution = SendDistribution.LAST_CHUNK_ONLY
     ) -> Union[Response, list[Response]]:
         """Send a memo with optional compression and encryption"""
         
@@ -685,7 +658,7 @@ class PostFiatTaskManager:
             pft_amount=pft_amount,
             xrp_amount=xrp_amount,
             destination_tag=destination_tag,
-            pft_distribution=pft_distribution
+            distribution=distribution
         )
     
     def send_memo_group(
@@ -695,7 +668,7 @@ class PostFiatTaskManager:
         pft_amount: Optional[Decimal] = None,
         xrp_amount: Optional[Decimal] = None,
         destination_tag: Optional[int] = None,
-        pft_distribution: PFTSendDistribution = PFTSendDistribution.LAST_CHUNK_ONLY
+        distribution: SendDistribution = SendDistribution.LAST_CHUNK_ONLY
     ) -> Union[Response, list[Response]]:
         """Send a group of related memos"""
         
@@ -706,18 +679,28 @@ class PostFiatTaskManager:
             # Determine PFT amount for this chunk
             chunk_pft_amount = None
             if pft_amount:
-                match pft_distribution:
-                    case PFTSendDistribution.DISTRIBUTE_EVENLY:
+                match distribution:
+                    case SendDistribution.DISTRIBUTE_EVENLY:
                         chunk_pft_amount = pft_amount / num_memos
-                    case PFTSendDistribution.LAST_CHUNK_ONLY:
+                    case SendDistribution.LAST_CHUNK_ONLY:
                         chunk_pft_amount = pft_amount if idx == num_memos - 1 else None
-                    case PFTSendDistribution.FULL_AMOUNT_EACH:
+                    case SendDistribution.FULL_AMOUNT_EACH:
                         chunk_pft_amount = pft_amount
 
-            # Only send XRP with last chunk
-            chunk_xrp_amount = xrp_amount if idx == num_memos - 1 else None
 
-            responses.append(self._send_memo_single(
+            # Determine XRP amount for this chunk
+            chunk_xrp_amount = MIN_XRP_PER_TRANSACTION  # Ensure minimum XRP
+            if xrp_amount and xrp_amount > MIN_XRP_PER_TRANSACTION:
+                extra_xrp = xrp_amount - MIN_XRP_PER_TRANSACTION
+                match distribution:
+                    case SendDistribution.DISTRIBUTE_EVENLY:
+                        chunk_xrp_amount += extra_xrp / num_memos
+                    case SendDistribution.LAST_CHUNK_ONLY:
+                        chunk_xrp_amount += extra_xrp if idx == num_memos - 1 else Decimal('0')
+                    case SendDistribution.FULL_AMOUNT_EACH:
+                        chunk_xrp_amount = xrp_amount
+
+            responses.append(self._send_single(
                 destination=destination,
                 memo=memo,
                 pft_amount=chunk_pft_amount,
@@ -727,10 +710,10 @@ class PostFiatTaskManager:
 
         return responses if len(responses) > 1 else responses[0]
     
-    def _send_memo_single(
+    def _send_single(
             self, 
             destination: str, 
-            memo: Memo, 
+            memo: Optional[Memo] = None, 
             pft_amount: Optional[Decimal] = None,
             xrp_amount: Optional[Decimal] = None,
             destination_tag: Optional[int] = None
@@ -741,8 +724,10 @@ class PostFiatTaskManager:
         payment_args = {
             "account": self.user_wallet.address,
             "destination": destination,
-            "memos": [memo]
         }
+
+        if memo is not None:
+            payment_args["memos"] = [memo]
 
         if destination_tag is not None:
             payment_args["destination_tag"] = destination_tag
@@ -788,7 +773,7 @@ class PostFiatTaskManager:
             Optional[str]: Most recent Google Doc link or None if not found
         """
         try:
-            links = self.google_context_doc_links
+            links = self.context_doc_history
             if not links:
                 logger.debug("No context doc memos found")
                 return None
@@ -836,7 +821,7 @@ class PostFiatTaskManager:
     def get_initiation_rite(self) -> Optional[InitiationRitePayload]:
         """Get the initiation rite payload for the user's wallet if it exists."""
         try:
-            initiation_rites = self.initiation_rites
+            initiation_rites = self.initiation_history
             if len(initiation_rites) == 0:
                 return None
             
@@ -993,13 +978,9 @@ class PostFiatTaskManager:
     def get_tasks(self) -> List[Task]:
         """Get all tasks for the user's wallet"""
         try:
-            task_requests = self.tasks
-            if not task_requests:
-                return []
-
-            task_requests = []
-            # Process each task request
-            for request in task_requests:
+            task_request_history = self.task_request_history
+            tasks = []
+            for request in task_request_history:
                 try:
                     task_id = Task.extract_task_id(request['memo_type'])
 
@@ -1023,16 +1004,17 @@ class PostFiatTaskManager:
 
                     # Create task from memo groups
                     task = Task.from_memo_groups(memo_groups)
-                    task_requests.append(task)
+                    tasks.append(task)
 
                 except Exception as e:
                     logger.warning(f"Error processing task {request['memo_type']}: {e}")
                     continue
 
-            return task_requests
+            return tasks
 
         except Exception as e:
             logger.error(f"Error getting tasks: {e}")
+            logger.error(traceback.format_exc())
             return []
 
     @requires_wallet_state(WalletState.ACTIVE)
@@ -1041,6 +1023,7 @@ class PostFiatTaskManager:
         """Get processed proposals with their requests and responses"""
         try:
             tasks = self.get_tasks()
+
             if not tasks:
                 return []
 
@@ -1061,6 +1044,7 @@ class PostFiatTaskManager:
 
         except Exception as e:
             logger.error(f"Error getting proposals: {e}")
+            logger.error(traceback.format_exc())
             return []
     
     @requires_wallet_state(WalletState.ACTIVE)
@@ -1134,6 +1118,7 @@ class PostFiatTaskManager:
 
         except Exception as e:
             logger.error(f"Error getting rewards: {e}")
+            logger.error(traceback.format_exc())
             return []
     
     @requires_wallet_state(TRUSTLINED_STATES)
@@ -1141,7 +1126,7 @@ class PostFiatTaskManager:
     def get_payments(self) -> List[Dict]:
         """ Returns a list of payment transaction details"""
         try:
-            payment_transactions = self.payments
+            payment_transactions = self.payment_history
             if not payment_transactions:
                 return []
             
@@ -1209,7 +1194,7 @@ class PostFiatTaskManager:
     @PerformanceMonitor.measure('get_memos')
     def get_memos(self, decrypt=True) -> List[Dict]:
         """Returns a dataframe containing only P2P messages (excluding handshakes)"""
-        memo_history = self.memos
+        memo_history = self.message_history
         if len(memo_history) == 0:
             logger.debug("No memos found")
             return []

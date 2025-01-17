@@ -10,6 +10,8 @@ from pftpyclient.sql.sql_manager import SQLManager
 class MessageEncryption:
     """Handles encryption/decryption of messages using ECDH-derived shared secrets"""
 
+    DUMMY_SECRET = b"dummy_secret_for_size_estimation_purposes_only"
+
     def __init__(self, sql_manager: SQLManager):
         """Initialize MessageEncryption with SQLManager for persistence"""
         self.sql_manager = sql_manager
@@ -147,3 +149,19 @@ class MessageEncryption:
         except Exception as e:
             logger.error(f"Failed to decrypt message: {e}")
             return f"[Decryption Failed] {message}"
+        
+    @classmethod
+    def get_dummy_encrypted_content(cls, message: str) -> str:
+        """Creates a dummy encrypted message to estimate final size.
+        
+        This method uses a constant dummy secret to create an encrypted message
+        of the same size as a real encrypted message would be. This is useful
+        for estimating memo chunking without needing real encryption keys.
+        
+        Args:
+            message: The message to encrypt with dummy secret
+            
+        Returns:
+            str: Encrypted message using dummy secret
+        """
+        return cls.encrypt_message(message, cls.DUMMY_SECRET)
