@@ -1108,6 +1108,19 @@ class CustomDialog(wx.Dialog):
         wx.CallAfter(self.close_button.SetFocus)
 
     def OnSubmit(self, e: wx.CommandEvent) -> None:
+        # Check for empty values in text controls
+        for field, control in self.text_controls.items():
+            if isinstance(control, wx.TextCtrl):
+                value = control.GetValue().strip()
+                if not value:
+                    wx.MessageBox(
+                        f"Please enter a value for {field}",
+                        "Required Field",
+                        wx.OK | wx.ICON_WARNING
+                    )
+                    control.SetFocus()
+                    return
+
         self.EndModal(wx.ID_OK)
 
     def OnClose(self, e: wx.CommandEvent) -> None:
