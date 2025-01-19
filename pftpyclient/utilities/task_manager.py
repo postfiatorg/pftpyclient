@@ -14,7 +14,7 @@ from xrpl.models.requests import AccountTx
 from xrpl.models.transactions import Memo
 from xrpl.models.response import Response
 from xrpl.asyncio.clients import AsyncJsonRpcClient
-from xrpl.utils import str_to_hex
+from xrpl.asyncio.transaction import submit_and_wait
 import nest_asyncio
 import pandas as pd
 from loguru import logger
@@ -55,7 +55,7 @@ class PostFiatTaskManager:
     INITIATION_RITE_XRP_COST: Decimal = Decimal(1)
     PFT_AMOUNT: Decimal = Decimal(1)
     
-    def __init__(self, username, password, network_url, config: ConfigurationManager):
+    def __init__(self, username, password, config: ConfigurationManager):
         self.credential_manager=CredentialManager(username,password)
         self.config = config
         self.network_config = get_network_config()
@@ -96,8 +96,8 @@ class PostFiatTaskManager:
         self.wallet_state = WalletState.UNFUNDED
         self.determine_wallet_state()
 
-    def get_xrp_balance(self):
-        return self.fetch_xrp_balance(self.network_url, self.user_wallet.classic_address)
+    async def get_xrp_balance(self):
+        return await self.fetch_xrp_balance(self.network_url, self.user_wallet.classic_address)
     
     def determine_wallet_state(self) -> bool:
         """Determine the current state of the wallet based on blockhain"""
@@ -163,7 +163,7 @@ class PostFiatTaskManager:
                 return "Unknown wallet state"
         
     @requires_wallet_state(TRUSTLINED_STATES)
-    def send_initiation_rite(self, commitment: str) -> dict:
+    async def send_initiation_rite(self, commitment: str) -> dict:
         """Send initiation rite to node.
         
         Args:
@@ -186,7 +186,7 @@ class PostFiatTaskManager:
             memo_type = f"{generate_custom_id()}__{SystemMemoType.INITIATION_RITE.value}"
 
             # Send transaction
-            response = self.send_xrp(
+            response = await self.send_xrp(
                 amount=self.INITIATION_RITE_XRP_COST,
                 destination=self.default_node,
                 memo_data=payload.to_json(),
@@ -228,11 +228,7 @@ class PostFiatTaskManager:
             logger.error(f"Error storing transactions: {e}")
             raise
 
-    def sync_transactions(self):
-        """Sync transactions from XRPL to local database"""
-        asyncio.run(self.sync_transactions_async())
-
-    async def sync_transactions_async(self):
+    async def sync_transactions(self):
         """Sync transactions from XRPL to local database"""
         try:
             # Get last processed ledger index
@@ -503,7 +499,7 @@ class PostFiatTaskManager:
             reverse=True
         )
 
-    def send_handshake(self, channel_counterparty: str) -> bool:
+    async def send_handshake(self, channel_counterparty: str) -> bool:
         """Send a handshake transaction containing the ECDH public key.
         
         Args:
@@ -513,7 +509,7 @@ class PostFiatTaskManager:
             bool: True if handshake sent successfully
         """
         public_key = self.message_encryption.get_ecdh_public_key_from_seed(self.user_wallet.seed)
-        response = self.send_memo(
+        response = await self.send_memo(
             destination=channel_counterparty, 
             memo_data=public_key,
             memo_type=generate_custom_id() + "__" + SystemMemoType.HANDSHAKE.value
@@ -521,7 +517,7 @@ class PostFiatTaskManager:
         return response
     
     @PerformanceMonitor.measure('send_pft')
-    def send_pft(
+    async def send_pft(
         self, 
         amount: Decimal,
         destination: str,
@@ -546,7 +542,7 @@ class PostFiatTaskManager:
             ValueError: If memo is invalid type
         """
         if not memo_data:
-            return self._send_single(
+            return await self._send_single(
                 destination=destination,
                 pft_amount=Decimal(amount),
                 destination_tag=destination_tag
@@ -565,14 +561,14 @@ class PostFiatTaskManager:
             message_encryption=self.message_encryption
         )
 
-        return self.send_memo_group(
+        return await self.send_memo_group(
             destination=destination,
             memo_group=memo_group,
             pft_amount=Decimal(amount),
             destination_tag=destination_tag
         )
     
-    def send_xrp(
+    async def send_xrp(
         self,
         amount: Decimal, 
         destination: str, 
@@ -594,7 +590,7 @@ class PostFiatTaskManager:
         """
 
         if not memo_data:
-            return self._send_single(
+            return await self._send_single(
                 destination=destination,
                 xrp_amount=Decimal(amount),
                 destination_tag=destination_tag
@@ -613,7 +609,7 @@ class PostFiatTaskManager:
             message_encryption=self.message_encryption
         )
 
-        return self.send_memo_group(
+        return await self.send_memo_group(
             destination=destination,
             memo_group=memo_group,
             xrp_amount=Decimal(amount),
@@ -621,7 +617,7 @@ class PostFiatTaskManager:
         )
 
     @PerformanceMonitor.measure('send_memo')
-    def send_memo(
+    async def send_memo(
         self,
         destination: str,
         memo_data: str,
@@ -652,7 +648,7 @@ class PostFiatTaskManager:
             message_encryption=self.message_encryption
         )
 
-        return self.send_memo_group(
+        return await self.send_memo_group(
             destination=destination,
             memo_group=memo_group,
             pft_amount=pft_amount,
@@ -661,7 +657,7 @@ class PostFiatTaskManager:
             distribution=distribution
         )
     
-    def send_memo_group(
+    async def send_memo_group(
         self,
         destination: str,
         memo_group: MemoGroup,
@@ -700,7 +696,7 @@ class PostFiatTaskManager:
                     case SendDistribution.FULL_AMOUNT_EACH:
                         chunk_xrp_amount = xrp_amount
 
-            responses.append(self._send_single(
+            responses.append(await self._send_single(
                 destination=destination,
                 memo=memo,
                 pft_amount=chunk_pft_amount,
@@ -710,7 +706,7 @@ class PostFiatTaskManager:
 
         return responses if len(responses) > 1 else responses[0]
     
-    def _send_single(
+    async def _send_single(
             self, 
             destination: str, 
             memo: Optional[Memo] = None, 
@@ -719,7 +715,7 @@ class PostFiatTaskManager:
             destination_tag: Optional[int] = None
         ) -> Response:
         """ Sends a single memo to a destination. """
-        client = xrpl.clients.JsonRpcClient(self.network_url)
+        client = AsyncJsonRpcClient(self.network_url)
 
         payment_args = {
             "account": self.user_wallet.address,
@@ -754,10 +750,11 @@ class PostFiatTaskManager:
 
         try:
             logger.debug("Submitting and waiting for transaction")
-            response = xrpl.transaction.submit_and_wait(payment, client, self.user_wallet)    
+            response = await submit_and_wait(payment, client, self.user_wallet)    
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             response = f"Transaction submission failed: {e}"
             logger.error(response)
+            logger.error(traceback.format_exc())
         except Exception as e:
             response = f"Unexpected error: {e}"
             logger.error(response)
@@ -875,13 +872,13 @@ class PostFiatTaskManager:
         if google_doc_text == "Failed to retrieve the document. Status code: 401":
             raise GoogleDocIsNotSharedException(google_doc_link)
     
-    def handle_google_doc(self, google_doc_link):
+    async def handle_google_doc(self, google_doc_link):
         """Validates, caches, and sends the Google Doc link"""
         logger.debug("Checking Google Doc link for validity and sending if valid...")
         self.check_if_google_doc_is_valid(google_doc_link)
-        return self.send_google_doc(google_doc_link)
+        return await self.send_google_doc(google_doc_link)
     
-    def send_google_doc(self, google_doc_link: str) -> dict:
+    async def send_google_doc(self, google_doc_link: str) -> dict:
         """Send Google Doc context link to the node.
         
         Args:
@@ -903,7 +900,7 @@ class PostFiatTaskManager:
             memo_type = f"{generate_custom_id()}__{SystemMemoType.GOOGLE_DOC_CONTEXT_LINK.value}"
 
             # Send encrypted memo
-            response = self.send_memo(
+            response = await self.send_memo(
                 destination=self.default_node,
                 memo_data=google_doc_link,
                 memo_type=memo_type,
@@ -1272,7 +1269,7 @@ class PostFiatTaskManager:
         return memos
     
     @PerformanceMonitor.measure('request_task')
-    def request_task(self, request_message ):
+    async def request_task(self, request_message ):
         """Send a PostFiat task request.
         
         Args:
@@ -1290,7 +1287,7 @@ class PostFiatTaskManager:
             f"{request_message}"
         )
 
-        return self.send_memo(
+        return await self.send_memo(
             destination=self.default_node,
             memo_data=request_message,
             memo_type=f"{task_id}__{TaskType.TASK_REQUEST.value}",
@@ -1298,7 +1295,7 @@ class PostFiatTaskManager:
         )
     
     @PerformanceMonitor.measure('send_acceptance')
-    def send_acceptance(self, task_id: str, acceptance_message: str) -> Dict:
+    async def send_acceptance(self, task_id: str, acceptance_message: str) -> Dict:
         """Accept a proposed task.
         
         Args:
@@ -1316,7 +1313,7 @@ class PostFiatTaskManager:
                 actual=task.current_state.name
             )
 
-        return self.send_memo(
+        return await self.send_memo(
             destination=self.default_node,
             memo_data=acceptance_message,
             memo_type=f"{task_id}__{TaskType.ACCEPTANCE.value}",
@@ -1324,7 +1321,7 @@ class PostFiatTaskManager:
         )
 
     @PerformanceMonitor.measure('send_refusal_for_task')
-    def send_refusal(self, task_id: str, refusal_reason: str) -> Dict:
+    async def send_refusal(self, task_id: str, refusal_reason: str) -> Dict:
         """Refuse a task.
         
         Args:
@@ -1343,7 +1340,7 @@ class PostFiatTaskManager:
                 restricted_flag=True
             )
 
-        return self.send_memo(
+        return await self.send_memo(
             destination=self.default_node,
             memo_data=refusal_reason,
             memo_type=f"{task_id}__{TaskType.REFUSAL.value}",
@@ -1351,7 +1348,7 @@ class PostFiatTaskManager:
         )
 
     @PerformanceMonitor.measure('submit_completion')
-    def submit_completion(self, task_id: str, completion_message: str) -> Dict:
+    async def submit_completion(self, task_id: str, completion_message: str) -> Dict:
         """Submit initial task completion.
         
         Args:
@@ -1369,7 +1366,7 @@ class PostFiatTaskManager:
                 actual=task.current_state.name
             )
 
-        return self.send_memo(
+        return await self.send_memo(
             destination=self.default_node,
             memo_data=completion_message,
             memo_type=f"{task_id}__{TaskType.TASK_COMPLETION.value}",
@@ -1377,7 +1374,7 @@ class PostFiatTaskManager:
         )
         
     @PerformanceMonitor.measure('send_verification_response')
-    def send_verification_response(
+    async def send_verification_response(
         self, 
         task_id: str, 
         response_message: str
@@ -1399,7 +1396,7 @@ class PostFiatTaskManager:
                 actual=task.current_state.name
             )
 
-        return self.send_memo(
+        return await self.send_memo(
             destination=self.default_node,
             memo_data=response_message,
             memo_type=f"{task_id}__{TaskType.VERIFICATION_RESPONSE.value}",
@@ -1517,16 +1514,16 @@ class PostFiatTaskManager:
         template = self.network_config.explorer_account_url_mask
         return template.format(address=address)
     
-    def get_current_trust_limit(self):
+    async def get_current_trust_limit(self):
         """Gets the current trust line limit for PFT token"""
         try:
-            client = xrpl.clients.JsonRpcClient(self.network_url)
+            client = AsyncJsonRpcClient(self.network_url)
             request = xrpl.models.requests.AccountLines(
                 account=self.user_wallet.address,
                 peer=self.pft_issuer
             )
             
-            response = client.request(request)
+            response = await client.request(request)
             if not response.is_successful():
                 logger.error(f"Failed to get account lines: {response}")
                 return "0"
@@ -1543,16 +1540,16 @@ class PostFiatTaskManager:
             logger.error(f"Error getting trust line limit: {e}")
             return "0"
     
-    def has_trust_line(self):
+    async def has_trust_line(self):
         """ Checks if the user has a trust line to the PFT token"""
         try:
-            client = xrpl.clients.JsonRpcClient(self.network_url)
+            client = AsyncJsonRpcClient(self.network_url)
             request = xrpl.models.requests.AccountLines(
                 account=self.user_wallet.address,
                 peer=self.pft_issuer  # Only get trust lines with PFT issuer
             )
             
-            response = client.request(request)
+            response = await client.request(request)
             if not response.is_successful():
                 logger.error(f"Failed to get account lines: {response}")
                 return False
@@ -1573,16 +1570,16 @@ class PostFiatTaskManager:
             return False
 
     @requires_wallet_state(FUNDED_STATES)
-    def handle_trust_line(self):
+    async def handle_trust_line(self):
         """ Handles the creation of a trust line to the PFT token if it doesn't exist"""
         logger.debug("Checking if trust line exists...")
-        if not self.has_trust_line():
-            _ = self.update_trust_line_limit()
+        if not await self.has_trust_line():
+            _ = await self.update_trust_line_limit()
             logger.debug("Trust line created")
         else:
             logger.debug("Trust line already exists")
 
-    def update_trust_line_limit(self, new_limit = constants.DEFAULT_PFT_LIMIT):
+    async def update_trust_line_limit(self, new_limit = constants.DEFAULT_PFT_LIMIT):
         """Updates the trust line limit for PFT token
         
         Args:
@@ -1591,7 +1588,7 @@ class PostFiatTaskManager:
         Returns:
             Transaction response
         """
-        client = xrpl.clients.JsonRpcClient(self.network_url)
+        client = AsyncJsonRpcClient(self.network_url)
         trust_set_tx = xrpl.models.transactions.TrustSet(
             account=self.user_wallet.address,
             limit_amount=xrpl.models.amounts.issued_currency_amount.IssuedCurrencyAmount(
@@ -1602,21 +1599,21 @@ class PostFiatTaskManager:
         )
         logger.debug(f"Creating trust line from {self.user_wallet.address} to issuer...")
         try:
-            response = xrpl.transaction.submit_and_wait(trust_set_tx, client, self.user_wallet)
+            response = await submit_and_wait(trust_set_tx, client, self.user_wallet)
         except xrpl.transaction.XRPLReliableSubmissionException as e:
             response = f"Submit failed: {e}"
             logger.error(f"Trust line creation failed: {response}")
         return response
 
     @staticmethod
-    def fetch_xrp_balance(network_url, address):
-        client = xrpl.clients.JsonRpcClient(network_url)
+    async def fetch_xrp_balance(network_url, address):
+        client = AsyncJsonRpcClient(network_url)
         account_info = xrpl.models.requests.account_info.AccountInfo(
             account=address,
             ledger_index="validated"
         )
         try:
-            response = client.request(account_info)
+            response = await client.request(account_info)
             if response.is_successful():
                 return response.result['account_data']['Balance']
             else:

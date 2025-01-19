@@ -13,6 +13,7 @@ install_requires = [
     'cryptography',
     'xrpl-py',
     'wxPython',
+    'wxasync',
     'requests',
     'toml',
     'nest_asyncio',

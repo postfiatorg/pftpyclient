@@ -243,11 +243,11 @@ class XRPLMonitorThread(Thread):
             ))
 
             if response.is_successful():
-                def update_all():
-                    self.gui.update_account(response.result["account_data"])
-                    self.gui.update_tokens()
+                async def update_all():
+                    await self.gui.update_account(response.result["account_data"])
+                    await self.gui.update_tokens()
                     self.gui.refresh_grids()
-                wx.CallAfter(update_all)
+                await update_all()
             else:
                 logger.error(f"Failed to get account info: {response.result}")
 

@@ -92,10 +92,10 @@ class WalletApp(Protocol):
         """Update the status bar with current wallet state"""
         ...
 
-    def update_account(self, acct):
+    async def update_account(self, acct):
         """Update account information and wallet state"""
         ...
 
-    def update_tokens(self):
+    async def update_tokens(self):
         """Update token balances for the current account"""
         ...

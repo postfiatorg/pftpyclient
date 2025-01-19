@@ -1,4 +1,4 @@
-from xrpl.clients import JsonRpcClient
+from xrpl.asyncio.clients import AsyncJsonRpcClient
 from xrpl.models import (
     AMMCreate,
     AMMDeposit,
@@ -9,17 +9,23 @@ from xrpl.models import (
     BookOffers,
     OfferCreate
 )
-from xrpl.transaction import submit_and_wait
+from xrpl.asyncio.transaction import submit_and_wait
 from xrpl.utils import xrp_to_drops
 from xrpl.wallet import Wallet
 from typing import Union, Optional, Dict, List, Tuple
 from decimal import Decimal
+from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
+import asyncio
+from loguru import logger
 
 class AMMUtilities:
-    def __init__(self, client: JsonRpcClient):
-        self.client = client
+    def __init__(self, config: ConfigurationManager):
+        self.config = config
+        self.network_config = get_network_config()
+        self.network_url = self.config.get_current_endpoint()
+        self.pft_issuer = self.network_config.issuer_address
 
-    def create_amm(
+    async def create_amm(
         self,
         wallet: Wallet,
         amount1: Union[str, IssuedCurrencyAmount],
@@ -38,6 +44,7 @@ class AMMUtilities:
         Returns:
             dict: Transaction response
         """
+        client = AsyncJsonRpcClient(self.network_url)
         # Construct the AMMCreate transaction
         create_tx = AMMCreate(
             account=wallet.classic_address,
@@ -47,10 +54,10 @@ class AMMUtilities:
         )
         
         # Sign and submit the transaction
-        response = submit_and_wait(create_tx, self.client, wallet)
+        response = await submit_and_wait(create_tx, client, wallet)
         return response
 
-    def prepare_pft_xrp_amm_create(
+    async def prepare_pft_xrp_amm_create(
         self,
         wallet: Wallet,
         pft_amount: str,
@@ -82,14 +89,14 @@ class AMMUtilities:
         xrp_drops = xrp_to_drops(xrp_amount)
         
         # Create the AMM
-        return self.create_amm(
+        return await self.create_amm(
             wallet=wallet,
             amount1=pft_currency_amount,
             amount2=xrp_drops,
             trading_fee=trading_fee
         )
     
-    def get_amm_info(
+    async def get_amm_info(
         self,
         asset1_currency: str,
         asset2_currency: str,
@@ -109,6 +116,7 @@ class AMMUtilities:
         Raises:
             Exception: If AMM doesn't exist ('actNotFound') or other errors
         """
+        client = AsyncJsonRpcClient(self.network_url)
         # Create asset objects
         asset1 = {"currency": asset1_currency}
         asset2 = {
@@ -123,11 +131,11 @@ class AMMUtilities:
         )
 
         # Send request to the XRPL
-        response = self.client.request(request)
+        response = await client.request(request)
         
         return response.result
 
-    def get_pft_xrp_amm_info(self, pft_issuer: str) -> Dict:
+    async def get_pft_xrp_amm_info(self, pft_issuer: str) -> Dict:
         """
         Helper method specifically for getting PFT/XRP AMM information.
         
@@ -137,13 +145,13 @@ class AMMUtilities:
         Returns:
             dict: AMM information response
         """
-        return self.get_amm_info(
+        return await self.get_amm_info(
             asset1_currency="XRP",
             asset2_currency="PFT",
             asset2_issuer=pft_issuer
         )
     
-    def get_account_lines(
+    async def get_account_lines(
         self,
         account: str,
         peer: Optional[str] = None
@@ -158,16 +166,17 @@ class AMMUtilities:
         Returns:
             dict: Account lines response
         """
+        client = AsyncJsonRpcClient(self.network_url)
         request = AccountLines(
             account=account,
             ledger_index="validated",
             peer=peer
         )
         
-        response = self.client.request(request)
+        response = await client.request(request)
         return response.result
 
-    def deposit_both_assets(
+    async def deposit_both_assets(
         self,
         wallet: Wallet,
         pft_amount: Decimal,
@@ -187,7 +196,8 @@ class AMMUtilities:
             dict: Transaction response
         """
         # Get AMM info first to verify it exists
-        _ = self.get_pft_xrp_amm_info(pft_issuer)
+        client = AsyncJsonRpcClient(self.network_url)
+        _ = await self.get_pft_xrp_amm_info(pft_issuer)
         
         # Create the PFT amount object
         pft_currency_amount = IssuedCurrencyAmount(
@@ -217,10 +227,10 @@ class AMMUtilities:
         )
         
         # Submit and wait for validation
-        response = submit_and_wait(deposit_tx, self.client, wallet)
+        response = await submit_and_wait(deposit_tx, client, wallet)
         return response
 
-    def deposit_single_asset(
+    async def deposit_single_asset(
         self,
         wallet: Wallet,
         amount: Decimal,
@@ -240,7 +250,8 @@ class AMMUtilities:
             dict: Transaction response
         """
         # Get AMM info first to verify it exists
-        _ = self.get_pft_xrp_amm_info(pft_issuer)
+        client = AsyncJsonRpcClient(self.network_url)
+        _ = await self.get_pft_xrp_amm_info(pft_issuer)
         
         # Create asset definitions
         asset1 = {"currency": "XRP"}
@@ -269,10 +280,10 @@ class AMMUtilities:
         )
         
         # Submit and wait for validation
-        response = submit_and_wait(deposit_tx, self.client, wallet)
+        response = await submit_and_wait(deposit_tx, client, wallet)
         return response
     
-    def withdraw_both_assets(
+    async def withdraw_both_assets(
         self,
         wallet: Wallet,
         pft_amount: Decimal,
@@ -292,7 +303,8 @@ class AMMUtilities:
             dict: Transaction response
         """
         # Get AMM info first to verify it exists
-        _ = self.get_pft_xrp_amm_info(pft_issuer)
+        client = AsyncJsonRpcClient(self.network_url)
+        _ = await self.get_pft_xrp_amm_info(pft_issuer)
         
         # Create the PFT amount object
         pft_currency_amount = IssuedCurrencyAmount(
@@ -322,10 +334,10 @@ class AMMUtilities:
         )
         
         # Submit and wait for validation
-        response = submit_and_wait(withdraw_tx, self.client, wallet)
+        response = await submit_and_wait(withdraw_tx, client, wallet)
         return response
 
-    def withdraw_single_asset(
+    async def withdraw_single_asset(
         self,
         wallet: Wallet,
         amount: Decimal,
@@ -345,7 +357,8 @@ class AMMUtilities:
             dict: Transaction response
         """
         # Get AMM info first to verify it exists
-        _ = self.get_pft_xrp_amm_info(pft_issuer)
+        client = AsyncJsonRpcClient(self.network_url)
+        _ = await self.get_pft_xrp_amm_info(pft_issuer)
         
         # Create asset definitions
         asset1 = {"currency": "XRP"}
@@ -374,10 +387,10 @@ class AMMUtilities:
         )
         
         # Submit and wait for validation
-        response = submit_and_wait(withdraw_tx, self.client, wallet)
+        response = await submit_and_wait(withdraw_tx, client, wallet)
         return response
 
-    def withdraw_all(
+    async def withdraw_all(
         self,
         wallet: Wallet,
         pft_issuer: str
@@ -393,7 +406,8 @@ class AMMUtilities:
             dict: Transaction response
         """
         # Get AMM info first to verify it exists
-        _ = self.get_pft_xrp_amm_info(pft_issuer)
+        client = AsyncJsonRpcClient(self.network_url)
+        _ = await self.get_pft_xrp_amm_info(pft_issuer)
         
         # Create asset definitions
         asset1 = {"currency": "XRP"}
@@ -411,10 +425,10 @@ class AMMUtilities:
         )
         
         # Submit and wait for validation
-        response = submit_and_wait(withdraw_tx, self.client, wallet)
+        response = await submit_and_wait(withdraw_tx, client, wallet)
         return response
 
-    def withdraw_with_lp_tokens(
+    async def withdraw_with_lp_tokens(
         self,
         wallet: Wallet,
         lp_token_amount: Decimal,
@@ -432,7 +446,8 @@ class AMMUtilities:
             dict: Transaction response
         """
         # Get AMM info first to verify it exists
-        amm_info = self.get_pft_xrp_amm_info(pft_issuer)
+        client = AsyncJsonRpcClient(self.network_url)
+        amm_info = await self.get_pft_xrp_amm_info(pft_issuer)
         
         # Create asset definitions
         asset1 = {"currency": "XRP"}
@@ -461,10 +476,10 @@ class AMMUtilities:
         )
         
         # Submit and wait for validation
-        response = submit_and_wait(withdraw_tx, self.client, wallet)
+        response = await submit_and_wait(withdraw_tx, client, wallet)
         return response
     
-    def get_orderbook(
+    async def get_orderbook(
         self,
         wallet: Wallet,
         taker_gets_currency: str,
@@ -488,6 +503,7 @@ class AMMUtilities:
             dict: Order book information
         """
         # Prepare currency objects
+        client = AsyncJsonRpcClient(self.network_url)
         taker_gets = {"currency": taker_gets_currency}
         taker_pays = {"currency": taker_pays_currency}
         
@@ -506,10 +522,10 @@ class AMMUtilities:
         )
         
         # Send request
-        response = self.client.request(request)
+        response = await client.request(request)
         return response.result
 
-    def analyze_orderbook(
+    async def analyze_orderbook(
         self,
         wallet: Wallet,
         want_currency: str,
@@ -538,7 +554,7 @@ class AMMUtilities:
         proposed_quality = spend_amount / want_amount
         
         # Get the order book
-        orderbook = self.get_orderbook(
+        orderbook = await self.get_orderbook(
             wallet=wallet,
             taker_gets_currency=want_currency,
             taker_pays_currency=spend_currency,
@@ -551,10 +567,10 @@ class AMMUtilities:
         running_total = Decimal(0)
         matching_offers = []
         
-        print(f"\nAnalyzing order book for {want_amount} {want_currency}...")
+        logger.debug(f"Analyzing order book for {want_amount} {want_currency}...")
         
         if not offers:
-            print("No offers found in the matching book.")
+            logger.debug("No offers found in the matching book.")
             return Decimal(0), []
             
         for offer in offers:
@@ -562,26 +578,26 @@ class AMMUtilities:
             if offer_quality <= proposed_quality:
                 owner_funds = Decimal(offer.get("owner_funds", "0"))
                 matching_offers.append(offer)
-                print(f"Found matching offer with {owner_funds} {want_currency}")
+                logger.debug(f"Found matching offer with {owner_funds} {want_currency}")
                 
                 running_total += owner_funds
                 if running_total >= want_amount:
-                    print("Full amount can be filled!")
+                    logger.debug("Full amount can be filled!")
                     break
             else:
-                print("Remaining offers are too expensive.")
+                logger.debug("Remaining offers are too expensive.")
                 break
         
         matched_amount = min(running_total, want_amount)
-        print(f"Total matched: {matched_amount} {want_currency}")
+        logger.debug(f"Total matched: {matched_amount} {want_currency}")
         
         if 0 < matched_amount < want_amount:
             remaining = want_amount - matched_amount
-            print(f"Remaining {remaining} {want_currency} would be placed as new offer")
+            logger.debug(f"Remaining {remaining} {want_currency} would be placed as new offer")
             
         return matched_amount, matching_offers
 
-    def check_competing_offers(
+    async def check_competing_offers(
         self,
         wallet: Wallet,
         want_currency: str,
@@ -604,7 +620,7 @@ class AMMUtilities:
         offered_quality = want_amount / spend_amount
         
         # Get the competing order book (reversed currencies)
-        orderbook = self.get_orderbook(
+        orderbook = await self.get_orderbook(
             wallet=wallet,
             taker_gets_currency=spend_currency,
             taker_pays_currency=want_currency,
@@ -616,10 +632,10 @@ class AMMUtilities:
         running_total = Decimal(0)
         competing_offers = []
         
-        print("\nChecking for competing offers...")
+        logger.debug("\nChecking for competing offers...")
         
         if not offers:
-            print("No competing offers found. Would be first in book.")
+            logger.debug("No competing offers found. Would be first in book.")
             return Decimal(0), []
             
         for offer in offers:
@@ -627,16 +643,127 @@ class AMMUtilities:
             if offer_quality <= offered_quality:
                 owner_funds = Decimal(offer.get("owner_funds", "0"))
                 competing_offers.append(offer)
-                print(f"Found competing offer with {owner_funds} {spend_currency}")
+                logger.debug(f"Found competing offer with {owner_funds} {spend_currency}")
                 running_total += owner_funds
             else:
-                print("Remaining offers would be below our price point.")
+                logger.debug("Remaining offers would be below our price point.")
                 break
                 
-        print(f"Total competing liquidity: {running_total} {spend_currency}")
+        logger.debug(f"Total competing liquidity: {running_total} {spend_currency}")
         return running_total, competing_offers
     
-    def create_offer(
+    async def calculate_swap_rate(
+        self,
+        wallet: Wallet,
+        spend_currency: str,
+        receive_currency: str,
+        spend_amount: Optional[Decimal] = None,
+        receive_amount: Optional[Decimal] = None,
+        spend_issuer: Optional[str] = None,
+        receive_issuer: Optional[str] = None,
+    ) -> Dict:
+        """
+        Calculate expected swap rate and amounts based on current orderbook.
+        
+        Args:
+            wallet: The wallet to use as taker
+            spend_currency: Currency you're spending
+            receive_currency: Currency you want to receive
+            spend_amount: Amount you want to spend (optional)
+            receive_amount: Amount you want to receive (optional)
+            spend_issuer: Issuer for spend currency if not XRP
+            receive_issuer: Issuer for receive currency if not XRP
+            
+        Returns:
+            Dict containing:
+                - expected_spend: How much will be spent
+                - expected_receive: How much will be received
+                - best_price: Best available price
+                - worst_price: Worst price needed to fill order
+                - sufficient_liquidity: Boolean indicating if enough liquidity exists
+        
+        Note: Either spend_amount or receive_amount must be provided, but not both
+        """
+        if (spend_amount is None and receive_amount is None) or (spend_amount is not None and receive_amount is not None):
+            raise ValueError("Must provide either spend_amount or receive_amount, but not both")
+
+        # Get orderbook with taker perspective
+        orderbook = await self.get_orderbook(
+            wallet=wallet,
+            taker_gets_currency=receive_currency,  # What we want to receive
+            taker_pays_currency=spend_currency,    # What we're willing to spend
+            taker_gets_issuer=receive_issuer,
+            taker_pays_issuer=spend_issuer
+        )
+
+        offers = orderbook.get("offers", [])
+        if not offers:
+            return {
+                "expected_spend": Decimal("0"),
+                "expected_receive": Decimal("0"),
+                "best_price": None,
+                "worst_price": None,
+                "sufficient_liquidity": False
+            }
+
+        # Calculate based on available offers
+        if spend_amount is not None:
+            # We know how much we want to spend, calculate how much we'll receive
+            remaining_spend = spend_amount
+            total_receive = Decimal("0")
+            prices = []
+
+            for offer in offers:
+                offer_quality = Decimal(offer["quality"])  # Price in terms of spend/receive
+                prices.append(offer_quality)
+                
+                # Calculate how much we can get from this offer
+                offer_funds = Decimal(offer.get("owner_funds", "0"))
+                receivable = min(remaining_spend / offer_quality, offer_funds)
+                
+                total_receive += receivable
+                remaining_spend -= receivable * offer_quality
+                
+                if remaining_spend <= 0:
+                    break
+
+            return {
+                "expected_spend": spend_amount - remaining_spend,
+                "expected_receive": total_receive,
+                "best_price": min(prices) if prices else None,
+                "worst_price": max(prices) if prices else None,
+                "sufficient_liquidity": remaining_spend <= 0
+            }
+
+        else:
+            # We know how much we want to receive, calculate how much we need to spend
+            remaining_receive = receive_amount
+            total_spend = Decimal("0")
+            prices = []
+
+            for offer in offers:
+                offer_quality = Decimal(offer["quality"])
+                prices.append(offer_quality)
+                
+                # Calculate how much we can get from this offer
+                offer_funds = Decimal(offer.get("owner_funds", "0"))
+                receivable = min(remaining_receive, offer_funds)
+                
+                total_spend += receivable * offer_quality
+                remaining_receive -= receivable
+                
+                if remaining_receive <= 0:
+                    break
+
+            return {
+                "expected_spend": total_spend,
+                "expected_receive": receive_amount - remaining_receive,
+                "best_price": min(prices) if prices else None,
+                "worst_price": max(prices) if prices else None,
+                "sufficient_liquidity": remaining_receive <= 0
+            }
+    
+    async def create_offer(
         self,
         wallet: Wallet,
         taker_gets_amount: Union[str, Decimal],
@@ -662,6 +789,7 @@ class AMMUtilities:
             dict: Transaction response
         """
         # Convert amounts to proper format
+        client = AsyncJsonRpcClient(self.network_url)
         if taker_gets_currency == "XRP":
             taker_gets = xrp_to_drops(str(taker_gets_amount))
         else:
@@ -688,10 +816,10 @@ class AMMUtilities:
         )
         
         # Submit and wait for validation
-        response = submit_and_wait(offer_tx, self.client, wallet)
+        response = await submit_and_wait(offer_tx, client, wallet)
         return response
 
-    def buy_pft_with_xrp(
+    async def buy_pft_with_xrp(
         self,
         wallet: Wallet,
         pft_amount: Decimal,
@@ -711,7 +839,7 @@ class AMMUtilities:
             dict: Transaction response
         """
         # First analyze the market
-        market_analysis = self.analyze_orderbook(
+        market_analysis = await self.analyze_orderbook(
             wallet=wallet,
             want_currency="PFT",
             want_amount=pft_amount,
@@ -720,11 +848,11 @@ class AMMUtilities:
             want_issuer=pft_issuer
         )
         
-        print(f"\nCreating offer to buy {pft_amount} PFT for {xrp_amount} XRP")
-        print(f"Price: {float(xrp_amount/pft_amount):.6f} XRP per PFT")
+        logger.debug(f"\nCreating offer to buy {pft_amount} PFT for {xrp_amount} XRP")
+        logger.debug(f"Price: {float(xrp_amount/pft_amount):.6f} XRP per PFT")
         
         # Create the offer
-        response = self.create_offer(
+        response = await self.create_offer(
             wallet=wallet,
             taker_gets_currency="PFT",
             taker_gets_amount=pft_amount,
@@ -735,19 +863,19 @@ class AMMUtilities:
         
         # Check if transaction was successful
         if response.result.get("engine_result") == "tesSUCCESS":
-            print("\nOffer created successfully!")
-            print(f"Transaction hash: {response.result.get('tx_json', {}).get('hash')}")
+            logger.debug("\nOffer created successfully!")
+            logger.debug(f"Transaction hash: {response.result.get('tx_json', {}).get('hash')}")
             
             # If there were matching offers, some or all might have been filled immediately
             if market_analysis[0] > 0:
-                print(f"\nOffer may have filled immediately up to {market_analysis[0]} PFT")
-                print("Check your balances to confirm the trade execution.")
+                logger.debug(f"\nOffer may have filled immediately up to {market_analysis[0]} PFT")
+                logger.debug("Check your balances to confirm the trade execution.")
         else:
-            print(f"\nError creating offer: {response.result.get('engine_result_message')}")
+            logger.debug(f"\nError creating offer: {response.result.get('engine_result_message')}")
         
         return response
 
-    def sell_pft_for_xrp(
+    async def sell_pft_for_xrp(
         self,
         wallet: Wallet,
         pft_amount: Decimal,
@@ -767,7 +895,7 @@ class AMMUtilities:
             dict: Transaction response
         """
         # First analyze the market
-        market_analysis = self.analyze_orderbook(
+        market_analysis = await self.analyze_orderbook(
             wallet=wallet,
             want_currency="XRP",
             want_amount=xrp_amount,
@@ -776,11 +904,11 @@ class AMMUtilities:
             spend_issuer=pft_issuer
         )
         
-        print(f"\nCreating offer to sell {pft_amount} PFT for {xrp_amount} XRP")
-        print(f"Price: {float(xrp_amount/pft_amount):.6f} XRP per PFT")
+        logger.debug(f"\nCreating offer to sell {pft_amount} PFT for {xrp_amount} XRP")
+        logger.debug(f"Price: {float(xrp_amount/pft_amount):.6f} XRP per PFT")
         
         # Create the offer
-        response = self.create_offer(
+        response = await self.create_offer(
             wallet=wallet,
             taker_gets_currency="XRP",
             taker_gets_amount=xrp_amount,
@@ -791,14 +919,14 @@ class AMMUtilities:
         
         # Check if transaction was successful
         if response.result.get("engine_result") == "tesSUCCESS":
-            print("\nOffer created successfully!")
-            print(f"Transaction hash: {response.result.get('tx_json', {}).get('hash')}")
+            logger.debug("\nOffer created successfully!")
+            logger.debug(f"Transaction hash: {response.result.get('tx_json', {}).get('hash')}")
             
             # If there were matching offers, some or all might have been filled immediately
             if market_analysis[0] > 0:
-                print(f"\nOffer may have filled immediately up to {market_analysis[0]} XRP")
-                print("Check your balances to confirm the trade execution.")
+                logger.debug(f"\nOffer may have filled immediately up to {market_analysis[0]} XRP")
+                logger.debug("Check your balances to confirm the trade execution.")
         else:
-            print(f"\nError creating offer: {response.result.get('engine_result_message')}")
+            logger.debug(f"\nError creating offer: {response.result.get('engine_result_message')}")
         
         return response

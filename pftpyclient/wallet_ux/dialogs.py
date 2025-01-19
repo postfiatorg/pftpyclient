@@ -5,6 +5,7 @@ import webbrowser
 from typing import Optional, TYPE_CHECKING, List, Dict
 from ..protocols.prod_wallet import WalletApp
 import traceback
+from wxasync import AsyncBind
 
 if TYPE_CHECKING:
     from pftpyclient.utilities.task_manager import PostFiatTaskManager
@@ -624,7 +625,7 @@ class EncryptionRequestsDialog(wx.Dialog):
         # Add buttons
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.accept_btn = wx.Button(self, label="Accept")
-        self.accept_btn.Bind(wx.EVT_BUTTON, self.on_accept)
+        AsyncBind(wx.EVT_BUTTON, self.on_accept, self.accept_btn)
         btn_sizer.Add(self.accept_btn, 0, wx.RIGHT, 5)
 
         self.close_btn = wx.Button(self, label="Close")
@@ -690,7 +691,7 @@ class EncryptionRequestsDialog(wx.Dialog):
 
             self.list_ctrl.SetItemData(index, idx)
 
-    def on_accept(self, event: wx.CommandEvent) -> None:
+    async def on_accept(self, event: wx.CommandEvent) -> None:
         idx = self.list_ctrl.GetFirstSelected()
         if idx == -1:
             return
@@ -698,12 +699,12 @@ class EncryptionRequestsDialog(wx.Dialog):
         address = self.task_manager.get_handshakes().iloc[self.list_ctrl.GetItemData(idx)]['address']
 
         try:
-            response = self.task_manager.send_handshake(address)
+            response = await self.task_manager.send_handshake(address)
             formatted_response = self.parent.format_response(response)
             handshake_dialog = SelectableMessageDialog(self, "Handshake Sent", formatted_response)
             handshake_dialog.ShowModal()
             handshake_dialog.Destroy()
-            self.parent._sync_and_refresh()
+            await self.parent._sync_and_refresh()
             self.load_requests()
         except Exception as e:
             wx.MessageBox(f"Failed to send handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
@@ -914,7 +915,7 @@ class GoogleDocSetupDialog(wx.Dialog):
 class UpdateTrustlineDialog(wx.Dialog):
     """Dialog for updating PFT token trust line limit"""
 
-    def __init__(self, parent: WalletApp) -> None:
+    def __init__(self, parent: WalletApp, current_limit: str) -> None:
         """Initialize the update trust line dialog
         
         Args:
@@ -922,7 +923,21 @@ class UpdateTrustlineDialog(wx.Dialog):
         """
         super().__init__(parent, title="Update Trust Line Limit")
         self.task_manager = parent.task_manager
+        self.current_limit = current_limit
         self.InitUI()
+
+    @classmethod
+    async def create(cls, parent: WalletApp) -> 'UpdateTrustlineDialog':
+        """Async factory method to create the dialog
+        
+        Args:
+            parent: Parent window implementing WalletDialogParent protocol
+            
+        Returns:
+            Initialized UpdateTrustlineDialog
+        """
+        current_limit = await parent.task_manager.get_current_trust_limit()
+        return cls(parent, current_limit)
 
     def InitUI(self) -> None:
         panel = wx.Panel(self)
@@ -939,7 +954,7 @@ class UpdateTrustlineDialog(wx.Dialog):
         sizer.Add(text, 0, wx.ALL | wx.EXPAND, 10)
 
         # Show current limit
-        current_limit = self.task_manager.get_current_trust_limit()
+        current_limit = self.current_limit
         current_limit_formatted = "{:,.2f}".format(float(current_limit))
         current_text = wx.StaticText(panel, label=f"Current limit: {current_limit_formatted} PFT")
         sizer.Add(current_text, 0, wx.ALL, 10)
