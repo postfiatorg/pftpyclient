@@ -115,6 +115,8 @@ class XRPLMonitorThread(Thread):
         self.last_ledger_time = None
         self.LEDGER_TIMEOUT = 30  # seconds
         self.CHECK_INTERVAL = 4  # match XRPL block time
+        self.PING_INTERVAL = 60  # Send ping every 60 seconds
+        self.PING_TIMEOUT = 10   # Wait up to 10 seconds for pong
 
     def run(self):
         """Thread entry point"""
@@ -160,6 +162,47 @@ class XRPLMonitorThread(Thread):
     def stopped(self):
         """Check if the thread has been signaled to stop"""
         return self._stop_event.is_set()
+    
+    async def ping_server(self):
+        """Send ping and wait for response"""
+        try:
+            # Use server_info as a lightweight ping
+            response = await self.client.request(xrpl.models.requests.ServerInfo())
+            return response.is_successful()
+        except Exception as e:
+            logger.error(f"Ping failed: {e}")
+            return False
+        
+    async def check_timeouts(self):
+        """Check for ledger timeouts"""
+        last_ping_time = time.time()
+
+        while True:
+            await asyncio.sleep(self.CHECK_INTERVAL)
+
+            current_time = time.time()
+
+            # Check ledger updates
+            if self.last_ledger_time is not None:
+                time_since_last_ledger = time.time() - self.last_ledger_time
+                if time_since_last_ledger > self.LEDGER_TIMEOUT:
+                    logger.warning(f"No ledger updates for {time_since_last_ledger:.1f} seconds")
+                    raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
+                
+            # Check if it's time for a ping
+            time_since_last_ping = current_time - last_ping_time
+            if time_since_last_ping >= self.PING_INTERVAL:
+                try:
+                    async with asyncio.timeout(self.PING_TIMEOUT):
+                        is_alive = await self.ping_server()
+                        if is_alive:
+                            logger.debug(f"Pinged websocket...")
+                        else:
+                            raise Exception("Ping failed - no valid response")
+                    last_ping_time = current_time
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning(f"Connection check failed: {e}")
+                    raise Exception(f"Connection check failed: {e}")
     
     def set_ui_state(self, state: WalletUIState, message: str = None):
         """Helper method to safely update UI state from thread"""
@@ -234,16 +277,8 @@ class XRPLMonitorThread(Thread):
             self.set_ui_state(WalletUIState.IDLE)
             logger.info(f"Successfully subscribed to account {self.account} updates on node {self.url}")
 
-            # Create task for timeout checking
-            async def check_timeouts():
-                while True:
-                    await asyncio.sleep(self.CHECK_INTERVAL)
-                    if self.last_ledger_time is not None:
-                        time_since_last_ledger = time.time() - self.last_ledger_time
-                        if time_since_last_ledger > self.LEDGER_TIMEOUT:
-                            raise Exception(f"No ledger updates received for {time_since_last_ledger:.1f} seconds")
-            
-            timeout_task = asyncio.create_task(check_timeouts())
+            # Create task for timeout checking     
+            timeout_task = asyncio.create_task(self.check_timeouts())
 
             try:
                 async for message in self.client:
@@ -477,6 +512,8 @@ class WalletApp(wx.Frame):
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
         self.update_trustline_item = self.account_menu.Append(wx.ID_ANY, "Update Trustline")
+        self.verify_discord_item = self.account_menu.Append(wx.ID_ANY, "Verify Discord")
+        self.send_handshake_item = self.account_menu.Append(wx.ID_ANY, "Send Handshake")
         self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
         self.menubar.Append(self.account_menu, "Account")
 
@@ -486,6 +523,8 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
         self.Bind(wx.EVT_MENU, self.on_update_trustline, self.update_trustline_item)
+        self.Bind(wx.EVT_MENU, self.on_verify_discord, self.verify_discord_item)
+        self.Bind(wx.EVT_MENU, self.on_send_handshake, self.send_handshake_item)
         self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
 
         # Extras menu
@@ -778,6 +817,16 @@ class WalletApp(wx.Frame):
         # Add grid to Memos tab
         bottom_panel = wx.Panel(self.memos_splitter)
         bottom_sizer = wx.BoxSizer(wx.VERTICAL)
+
+        # Add decrypt checkbox control
+        decrypt_controls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        decrypt_controls_sizer.AddStretchSpacer()
+        self.chk_decrypt_memos = wx.CheckBox(bottom_panel, label="Decrypt Messages")
+        self.chk_decrypt_memos.SetValue(True)  # Set checked by default
+        self.chk_decrypt_memos.Bind(wx.EVT_CHECKBOX, self.on_toggle_decrypt_memos)
+        decrypt_controls_sizer.Add(self.chk_decrypt_memos, 0, wx.ALL, 2)
+        bottom_sizer.Add(decrypt_controls_sizer, 0, wx.EXPAND | wx.ALL, 2)
+
         self.memos_grid = self.setup_grid(gridlib.Grid(bottom_panel), 'memos')
         bottom_sizer.Add(self.memos_grid, 1, wx.EXPAND | wx.ALL, 20)
         bottom_panel.SetSizer(bottom_sizer)
@@ -1004,6 +1053,18 @@ class WalletApp(wx.Frame):
         except Exception as e:
             logger.error(f"Error updating proposals grid: {e}")
             wx.MessageBox(f"Error updating proposals grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+    def on_toggle_decrypt_memos(self, event):
+        """Handle toggling of the decrypt memos checkbox"""
+        try:
+            decrypt = self.chk_decrypt_memos.IsChecked()
+            # Get memos data with the new decrypt setting
+            memos_df = self.task_manager.get_memos_df(decrypt=decrypt)
+            # Update only the memos grid
+            wx.PostEvent(self, UpdateGridEvent(data=memos_df, target="memos", caller=f"{self.__class__.__name__}.on_toggle_decrypt_memos"))
+        except Exception as e:
+            logger.error(f"Error updating memos grid: {e}")
+            wx.MessageBox(f"Error updating memos grid: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
     def update_all_destination_comboboxes(self):
         """Update all destination comboboxes"""
@@ -1595,6 +1656,7 @@ class WalletApp(wx.Frame):
 
         match current_state:
             case WalletState.UNFUNDED:
+                # Funding the wallet
                 message = (
                     "To activate your wallet, you need \nto send at least 1 XRP to your address. \n\n"
                     f"Your XRP address:\n\n{self.wallet.classic_address}\n\n"
@@ -1604,6 +1666,7 @@ class WalletApp(wx.Frame):
                 dialog.Destroy()
 
             case WalletState.FUNDED:
+                # Setting the trust line
                 message = (
                     "Your wallet needs a trust line to handle PFT tokens.\n\n"
                     "This transaction will:\n"
@@ -1621,8 +1684,18 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(f"Error setting trust line: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
             case WalletState.TRUSTLINED:
+                # Discord verification
+                if not self.handle_discord_verification(prompt_for_confirmation=True):
+                    wx.MessageBox(
+                        "Please complete Discord verification before proceeding with the Initiation Rite.", 
+                        "Verification Required", 
+                        wx.OK | wx.ICON_INFORMATION
+                    )
+                    return
+
+                # Initiation Rite
                 message = (
-                    "To start accepting tasks, you need to perform the Initiation Rite.\n\n"
+                    "Once your address has been verified with the node, you can perform the Initiation Rite.\n\n"
                     "This transaction will cost 1 XRP.\n\n"
                     "Please write 1 sentence committing to a long term objective of your choice:"
                 )
@@ -1643,6 +1716,7 @@ class WalletApp(wx.Frame):
                 dialog.Destroy()
 
             case WalletState.INITIATED:
+                # Initiating an encrypted channel via a request to the node
                 message = (
                     "To continue with wallet initialization,\n"
                     "you need to establish secure communication with the network.\n\n"
@@ -1666,6 +1740,7 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(f"Error sending handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
             case WalletState.HANDSHAKE_SENT:
+                # Finalizing the encrypted channel via a response from the node
                 message = (
                     "Waiting for handshake response from node to establish encrypted channel.\n\n"
                     "This will only take a moment."
@@ -1673,6 +1748,7 @@ class WalletApp(wx.Frame):
                 wx.MessageBox(message, "Waiting for Handshake", wx.OK | wx.ICON_INFORMATION)
 
             case WalletState.HANDSHAKE_RECEIVED:
+                # Setting up the Google Doc
                 if self.show_google_doc_template(is_initial_setup=True):
                     self.handle_google_doc_submission(event, is_initial_setup=True)
                     self.start_wallet_state_monitoring()
@@ -2404,8 +2480,10 @@ class WalletApp(wx.Frame):
         task_id = self.verification_txt_task_id.GetLabel()
         response_string = self.verification_txt_details.GetValue()
 
-        if not task_id or not response_string:
-            wx.MessageBox("Please enter verification details", "Error", wx.OK | wx.ICON_ERROR)
+        if not task_id:
+            wx.MessageBox("Please select a task first", "No Task Selected", wx.OK | wx.ICON_WARNING)
+        elif not response_string:
+            wx.MessageBox("Please enter verification details", "Verification Details Required", wx.OK | wx.ICON_ERROR)
         else:
             try:
                 response = self.task_manager.send_verification_response(
@@ -3111,6 +3189,73 @@ class WalletApp(wx.Frame):
             
             self.worker = XRPLMonitorThread(self)
             self.worker.start()
+
+    def handle_discord_verification(self, prompt_for_confirmation: bool = False) -> bool:
+        """Handle the Discord verification process
+        
+        Returns:
+            bool: True if verification was completed, False otherwise
+        """
+        message = (
+            "To interact with the Post Fiat Task Node, you need to verify your address via Discord.\n\n"
+            "The Post Fiat Task Node requires that you tie this address to your Discord account.\n\n"
+            "Please enter your Discord username below:"
+        )
+        dialog = CustomDialog(self, "Verify Address", ["Discord Username"], message=message)
+        if dialog.ShowModal() != wx.ID_OK:
+            dialog.Destroy()
+            return False
+
+        discord_username = dialog.GetValues()["Discord Username"]
+        dialog.Destroy()
+
+        try:
+            # Sign the Discord username
+            signature, public_key = self.task_manager.sign_message(discord_username)
+
+            # Display verification instructions in a selectable dialog
+            verification_message = (
+                f"Please verify your address in Discord (using the pf_verify command) with the following information:\n\n"
+                f"Discord Username:\n{discord_username}\n\n"
+                f"XRP Address:\n{self.wallet.classic_address}\n\n"
+                f"Signature:\n{signature}\n\n"
+                f"Public Key:\n{public_key}\n\n"
+            )
+            
+            dialog = SelectableMessageDialog(self, "Discord Verification", verification_message)
+            dialog.ShowModal()
+            dialog.Destroy()
+
+            if prompt_for_confirmation:
+                return wx.YES == wx.MessageBox(
+                    "Have you completed the Discord verification?",
+                    "Verification Confirmation",
+                    wx.YES_NO | wx.ICON_QUESTION
+                )
+            else:
+                return True
+
+        except Exception as e:
+            logger.error(f"Error during Discord address verification: {e}")
+            wx.MessageBox(f"Error during Discord address verification: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            return False
+
+    def on_verify_discord(self, event):
+        """Handle the Verify Discord menu item"""
+        self.handle_discord_verification()
+
+    def on_send_handshake(self, event):
+        message = "Send a handshake to an address"
+        handshake_dialog = CustomDialog(self, "Handshake", ["Address"], message=message)
+        if handshake_dialog.ShowModal() == wx.ID_OK:
+            address = handshake_dialog.GetValues()["Address"]
+            handshake_dialog.Destroy()
+            logger.debug(f"Sending handshake to {address}")
+            response = self.task_manager.send_handshake(destination=address)
+            formatted_response = self.format_response(response)
+            dialog = SelectableMessageDialog(self, "Handshake Submission Result", formatted_response)
+            dialog.ShowModal()
+            dialog.Destroy()
 
 def main():
     logger.info("Starting Post Fiat Wallet")

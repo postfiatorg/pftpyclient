@@ -21,6 +21,7 @@ import xrpl
 from xrpl.models.requests import AccountTx
 from xrpl.models.transactions import Memo
 from xrpl.utils import str_to_hex
+from xrpl.core.keypairs import sign
 import nest_asyncio
 import pandas as pd
 import numpy as np
@@ -99,6 +100,22 @@ class PostFiatTaskManager:
         # By default, the wallet is considered UNFUNDED
         self.wallet_state = WalletState.UNFUNDED
         self.determine_wallet_state()
+
+    def sign_message(self, message: str) -> tuple[str, str]:
+        """Signs a message using the wallet's private key
+        
+        Args:
+            message: The message to sign
+            
+        Returns:
+            tuple[str, str]: (signature, public_key)
+        """
+        try:
+            signature = sign(message.encode(), self.user_wallet.private_key)
+            return signature, self.user_wallet.public_key
+        except Exception as e:
+            logger.error(f"Error signing message: {e}")
+            raise
 
     def get_xrp_balance(self):
         return get_xrp_balance(self.network_url, self.user_wallet.classic_address)
@@ -1858,7 +1875,7 @@ class PostFiatTaskManager:
     
     @requires_wallet_state(TRUSTLINED_STATES)
     @PerformanceMonitor.measure('get_memos_df')
-    def get_memos_df(self):
+    def get_memos_df(self, decrypt=True):
         """Returns a dataframe containing only P2P messages (excluding handshakes)"""
         if self.memos.empty:
             logger.debug("No memos or handshakes found")
@@ -1884,6 +1901,7 @@ class PostFiatTaskManager:
                     memo_type=msg_id,
                     memo_data=first_txn['full_output'],
                     full_unchunk=True,
+                    decrypt=decrypt,
                     memo_history=memo_history,
                     channel_counterparty=first_txn['counterparty_address']
                 )
