@@ -513,6 +513,7 @@ class WalletApp(wx.Frame):
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
         self.update_trustline_item = self.account_menu.Append(wx.ID_ANY, "Update Trustline")
         self.verify_discord_item = self.account_menu.Append(wx.ID_ANY, "Verify Discord")
+        self.send_handshake_item = self.account_menu.Append(wx.ID_ANY, "Send Handshake")
         self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
         self.menubar.Append(self.account_menu, "Account")
 
@@ -523,6 +524,7 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
         self.Bind(wx.EVT_MENU, self.on_update_trustline, self.update_trustline_item)
         self.Bind(wx.EVT_MENU, self.on_verify_discord, self.verify_discord_item)
+        self.Bind(wx.EVT_MENU, self.on_send_handshake, self.send_handshake_item)
         self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
 
         # Extras menu
@@ -3241,6 +3243,19 @@ class WalletApp(wx.Frame):
     def on_verify_discord(self, event):
         """Handle the Verify Discord menu item"""
         self.handle_discord_verification()
+
+    def on_send_handshake(self, event):
+        message = "Send a handshake to an address"
+        handshake_dialog = CustomDialog(self, "Handshake", ["Address"], message=message)
+        if handshake_dialog.ShowModal() == wx.ID_OK:
+            address = handshake_dialog.GetValues()["Address"]
+            handshake_dialog.Destroy()
+            logger.debug(f"Sending handshake to {address}")
+            response = self.task_manager.send_handshake(destination=address)
+            formatted_response = self.format_response(response)
+            dialog = SelectableMessageDialog(self, "Handshake Submission Result", formatted_response)
+            dialog.ShowModal()
+            dialog.Destroy()
 
 def main():
     logger.info("Starting Post Fiat Wallet")
