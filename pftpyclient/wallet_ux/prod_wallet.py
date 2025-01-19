@@ -90,12 +90,12 @@ class WalletApp(wx.Frame):
 
     STATE_AVAILABLE_TABS = {
         WalletState.UNFUNDED: ["Summary", "Log"],
-        WalletState.FUNDED: ["Summary", "Payments", "Log"],
-        WalletState.TRUSTLINED: ["Summary", "Payments", "Memos", "Log"],
-        WalletState.INITIATED: ["Summary", "Payments", "Memos", "Log"],
-        WalletState.HANDSHAKE_SENT: ["Summary", "Payments", "Memos", "Log"],
-        WalletState.HANDSHAKE_RECEIVED: ["Summary", "Payments", "Memos", "Log"],
-        WalletState.ACTIVE: ["Summary", "Proposals", "Verification", "Rewards", "Payments", "Memos", "Log"]
+        WalletState.FUNDED: ["Summary", "Payments", "Log", "Swaps"],
+        WalletState.TRUSTLINED: ["Summary", "Payments", "Memos", "Log", "Swaps"],
+        WalletState.INITIATED: ["Summary", "Payments", "Memos", "Log", "Swaps"],
+        WalletState.HANDSHAKE_SENT: ["Summary", "Payments", "Memos", "Log", "Swaps"],
+        WalletState.HANDSHAKE_RECEIVED: ["Summary", "Payments", "Memos", "Log", "Swaps"],
+        WalletState.ACTIVE: ["Summary", "Proposals", "Verification", "Rewards", "Payments", "Memos", "Log", "Swaps"]
     }
 
     GRID_CONFIGS = {
@@ -602,6 +602,266 @@ class WalletApp(wx.Frame):
         # self.tab_pages["Log"] = self.log_tab
 
         #################################
+        # SWAPS
+        #################################
+
+        self.swaps_tab = wx.Panel(self.tabs)
+        self.tabs.AddPage(self.swaps_tab, "Swaps")
+        self.swaps_sizer = wx.BoxSizer(wx.VERTICAL) 
+        self.swaps_tab.SetSizer(self.swaps_sizer)
+
+        # Create outer panel to contain everything
+        outer_panel = wx.Panel(self.swaps_tab)
+        if os.name == 'posix':  # macOS
+            sys_color = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+            darkened_color = self.darken_color(sys_color, 0.95)
+        else:
+            darkened_color = wx.Colour(220, 220, 220)
+        outer_panel.SetBackgroundColour(darkened_color)
+        outer_sizer = wx.BoxSizer(wx.VERTICAL)
+        outer_panel.SetSizer(outer_sizer)
+
+        # Create nested notebook for swap operations
+        self.swap_notebook = wx.Notebook(outer_panel, style=wx.NB_TOP)
+        outer_sizer.Add(self.swap_notebook, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Create the panels for each tab
+        self.swap_operation_panel = wx.Panel(self.swap_notebook)
+        self.add_liquidity_panel = wx.Panel(self.swap_notebook)
+        self.remove_liquidity_panel = wx.Panel(self.swap_notebook)
+        
+        self.swap_notebook.AddPage(self.swap_operation_panel, "Swap")
+        self.swap_notebook.AddPage(self.add_liquidity_panel, "Add Liquidity")
+        self.swap_notebook.AddPage(self.remove_liquidity_panel, "Remove Liquidity")
+        
+        # Set up sizers for each panel
+        swap_operation_sizer = wx.BoxSizer(wx.VERTICAL)
+        add_liquidity_sizer = wx.BoxSizer(wx.VERTICAL)
+        remove_liquidity_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        self.swap_operation_panel.SetSizer(swap_operation_sizer)
+        self.add_liquidity_panel.SetSizer(add_liquidity_sizer)
+        self.remove_liquidity_panel.SetSizer(remove_liquidity_sizer)
+
+        # FROM section
+        swap_operation_sizer.AddSpacer(30)
+        from_label = wx.StaticText(self.swap_operation_panel, label="From")
+        swap_operation_sizer.Add(from_label, 0, wx.LEFT | wx.RIGHT, 20)
+
+        from_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.from_amount = wx.TextCtrl(
+            self.swap_operation_panel, 
+            style=wx.TE_PROCESS_ENTER,
+            size=(200, -1)
+        )
+        
+        self.from_token = wx.ComboBox(
+            self.swap_operation_panel,
+            choices=["XRP", "PFT"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+            size=(70, -1)
+        )
+        self.from_token.SetSelection(0)
+        
+        from_row.Add(self.from_amount, 1, wx.EXPAND | wx.RIGHT, 10)
+        from_row.Add(self.from_token, 0, wx.ALIGN_CENTER_VERTICAL)
+        swap_operation_sizer.Add(from_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        
+        # Arrow between fields
+        arrow_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        arrow_label = wx.StaticText(self.swap_operation_panel, label="↓")
+        font = arrow_label.GetFont()
+        font.SetPointSize(24)
+        arrow_label.SetFont(font)
+        arrow_sizer.Add(arrow_label, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        swap_operation_sizer.Add(arrow_sizer, 0, wx.ALIGN_CENTER)
+        
+        # TO section
+        to_label = wx.StaticText(self.swap_operation_panel, label="To (estimated)")
+        swap_operation_sizer.Add(to_label, 0, wx.LEFT | wx.RIGHT, 20)
+        
+        to_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.to_amount = wx.TextCtrl(
+            self.swap_operation_panel,
+            style=wx.TE_PROCESS_ENTER,
+            size=(200, -1)
+        )
+        
+        self.to_token = wx.ComboBox(
+            self.swap_operation_panel,
+            choices=["PFT", "XRP"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+            size=(70, -1)
+        )
+        self.to_token.SetSelection(0)
+        
+        to_row.Add(self.to_amount, 1, wx.EXPAND | wx.RIGHT, 10)
+        to_row.Add(self.to_token, 0, wx.ALIGN_CENTER_VERTICAL)
+        swap_operation_sizer.Add(to_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        
+        # Add some space before the swap button
+        swap_operation_sizer.AddSpacer(20)
+        
+        # Swap button
+        self.swap_button = wx.Button(self.swap_operation_panel, label="Swap")
+        self.swap_button.SetBackgroundColour(wx.Colour(200, 200, 200))
+        swap_operation_sizer.Add(self.swap_button, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
+
+        # Add the outer panel to the main sizer with centering
+        self.swaps_sizer.AddStretchSpacer()
+        self.swaps_sizer.Add(outer_panel, 0, wx.ALIGN_CENTER | wx.ALL, 20)
+        self.swaps_sizer.AddStretchSpacer()
+        
+        # Bind events
+        self.from_amount.Bind(wx.EVT_TEXT, self.on_amount_change)
+        self.to_amount.Bind(wx.EVT_TEXT, self.on_amount_change)
+        self.from_token.Bind(wx.EVT_COMBOBOX, self.on_token_switch)
+        self.to_token.Bind(wx.EVT_COMBOBOX, self.on_token_switch)
+        self.swap_button.Bind(wx.EVT_BUTTON, self.on_swap)
+
+        # Add Liquidity Panel Content
+        add_liquidity_sizer.AddSpacer(30)
+        add_from_label = wx.StaticText(self.add_liquidity_panel, label="")
+        add_liquidity_sizer.Add(add_from_label, 0, wx.LEFT | wx.RIGHT, 20)
+
+        add_from_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.add_from_amount = wx.TextCtrl(
+            self.add_liquidity_panel, 
+            style=wx.TE_PROCESS_ENTER,
+            size=(200, -1)
+        )
+        
+        self.add_from_token = wx.ComboBox(
+            self.add_liquidity_panel,
+            choices=["XRP", "PFT"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+            size=(70, -1)
+        )
+        self.add_from_token.SetSelection(0)
+        
+        add_from_row.Add(self.add_from_amount, 1, wx.EXPAND | wx.RIGHT, 10)
+        add_from_row.Add(self.add_from_token, 0, wx.ALIGN_CENTER_VERTICAL)
+        add_liquidity_sizer.Add(add_from_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        
+        # Plus symbol between fields
+        add_symbol_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        add_symbol_label = wx.StaticText(self.add_liquidity_panel, label="+")
+        font = add_symbol_label.GetFont()
+        font.SetPointSize(24)
+        add_symbol_label.SetFont(font)
+        add_symbol_sizer.Add(add_symbol_label, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        add_liquidity_sizer.Add(add_symbol_sizer, 0, wx.ALIGN_CENTER)
+        
+        # Second token input
+        add_to_label = wx.StaticText(self.add_liquidity_panel, label="")
+        add_liquidity_sizer.Add(add_to_label, 0, wx.LEFT | wx.RIGHT, 20)
+        
+        add_to_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.add_to_amount = wx.TextCtrl(
+            self.add_liquidity_panel,
+            style=wx.TE_PROCESS_ENTER,
+            size=(200, -1)
+        )
+        
+        self.add_to_token = wx.ComboBox(
+            self.add_liquidity_panel,
+            choices=["PFT", "XRP"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+            size=(70, -1)
+        )
+        self.add_to_token.SetSelection(0)
+        
+        add_to_row.Add(self.add_to_amount, 1, wx.EXPAND | wx.RIGHT, 10)
+        add_to_row.Add(self.add_to_token, 0, wx.ALIGN_CENTER_VERTICAL)
+        add_liquidity_sizer.Add(add_to_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        
+        add_liquidity_sizer.AddSpacer(20)
+        
+        # Add Liquidity button
+        self.add_liquidity_button = wx.Button(self.add_liquidity_panel, label="Add Liquidity")
+        self.add_liquidity_button.SetBackgroundColour(wx.Colour(200, 200, 200))
+        add_liquidity_sizer.Add(self.add_liquidity_button, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
+
+        # Remove Liquidity Panel Content
+        remove_liquidity_sizer.AddSpacer(30)
+        remove_from_label = wx.StaticText(self.remove_liquidity_panel, label="")
+        remove_liquidity_sizer.Add(remove_from_label, 0, wx.LEFT | wx.RIGHT, 20)
+
+        remove_from_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.remove_from_amount = wx.TextCtrl(
+            self.remove_liquidity_panel, 
+            style=wx.TE_PROCESS_ENTER,
+            size=(200, -1)
+        )
+        
+        self.remove_from_token = wx.ComboBox(
+            self.remove_liquidity_panel,
+            choices=["XRP", "PFT"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+            size=(70, -1)
+        )
+        self.remove_from_token.SetSelection(0)
+        
+        remove_from_row.Add(self.remove_from_amount, 1, wx.EXPAND | wx.RIGHT, 10)
+        remove_from_row.Add(self.remove_from_token, 0, wx.ALIGN_CENTER_VERTICAL)
+        remove_liquidity_sizer.Add(remove_from_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        
+        # Minus symbol between fields
+        remove_symbol_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        remove_symbol_label = wx.StaticText(self.remove_liquidity_panel, label="−")  # Using minus sign
+        font = remove_symbol_label.GetFont()
+        font.SetPointSize(24)
+        remove_symbol_label.SetFont(font)
+        remove_symbol_sizer.Add(remove_symbol_label, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        remove_liquidity_sizer.Add(remove_symbol_sizer, 0, wx.ALIGN_CENTER)
+        
+        # Second token input
+        remove_to_label = wx.StaticText(self.remove_liquidity_panel, label="")
+        remove_liquidity_sizer.Add(remove_to_label, 0, wx.LEFT | wx.RIGHT, 20)
+        
+        remove_to_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.remove_to_amount = wx.TextCtrl(
+            self.remove_liquidity_panel,
+            style=wx.TE_PROCESS_ENTER,
+            size=(200, -1)
+        )
+        
+        self.remove_to_token = wx.ComboBox(
+            self.remove_liquidity_panel,
+            choices=["PFT", "XRP"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+            size=(70, -1)
+        )
+        self.remove_to_token.SetSelection(0)
+        
+        remove_to_row.Add(self.remove_to_amount, 1, wx.EXPAND | wx.RIGHT, 10)
+        remove_to_row.Add(self.remove_to_token, 0, wx.ALIGN_CENTER_VERTICAL)
+        remove_liquidity_sizer.Add(remove_to_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        
+        remove_liquidity_sizer.AddSpacer(20)
+        
+        # Remove Liquidity button
+        self.remove_liquidity_button = wx.Button(self.remove_liquidity_panel, label="Remove Liquidity")
+        self.remove_liquidity_button.SetBackgroundColour(wx.Colour(200, 200, 200))
+        remove_liquidity_sizer.Add(self.remove_liquidity_button, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
+
+        # Add bindings for the new controls
+        self.add_from_amount.Bind(wx.EVT_TEXT, self.on_amount_change)
+        self.add_to_amount.Bind(wx.EVT_TEXT, self.on_amount_change)
+        self.add_from_token.Bind(wx.EVT_COMBOBOX, self.on_add_liquidity_token_switch)
+        self.add_to_token.Bind(wx.EVT_COMBOBOX, self.on_add_liquidity_token_switch)
+        self.add_liquidity_button.Bind(wx.EVT_BUTTON, self.on_add_liquidity)
+
+        self.remove_from_amount.Bind(wx.EVT_TEXT, self.on_amount_change)
+        self.remove_to_amount.Bind(wx.EVT_TEXT, self.on_amount_change)
+        self.remove_from_token.Bind(wx.EVT_COMBOBOX, self.on_remove_liquidity_token_switch)
+        self.remove_to_token.Bind(wx.EVT_COMBOBOX, self.on_remove_liquidity_token_switch)
+        self.remove_liquidity_button.Bind(wx.EVT_BUTTON, self.on_remove_liquidity)
+        
+        # Store reference to swaps tab page
+        self.tab_pages["Swaps"] = self.swaps_tab
+
+        #################################
 
         self.panel.SetSizer(self.sizer)
 
@@ -716,14 +976,14 @@ class WalletApp(wx.Frame):
         top_row_input_sizer.Add(self.payment_txt_amount, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
         # Token selector
-        self.token_selector = wx.ComboBox(
+        self.payments_token_selector = wx.ComboBox(
             self.payments_tab,
             choices=["XRP", "PFT"],
             style=wx.CB_READONLY | wx.CB_DROPDOWN,
             size=(70, -1)
         )
-        self.token_selector.SetSelection(0)  # Default to XRP
-        top_row_input_sizer.Add(self.token_selector, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
+        self.payments_token_selector.SetSelection(0)  # Default to XRP
+        top_row_input_sizer.Add(self.payments_token_selector, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
 
         # Destination input with label
         dest_label = wx.StaticText(self.payments_tab, label="To:")
@@ -882,7 +1142,7 @@ class WalletApp(wx.Frame):
                 wx.MessageBox("Incorrect password", "Error", wx.OK | wx.ICON_ERROR)
                 return
     
-        token_type = self.token_selector.GetValue()
+        token_type = self.payments_token_selector.GetValue()
         amount = self.payment_txt_amount.GetValue()
 
         # Get destination - check if it's a saved contact first
@@ -2878,6 +3138,100 @@ class WalletApp(wx.Frame):
             
             self.worker = XRPLMonitorThread(self)
             self.worker.start()
+
+    def on_amount_change(self, event):
+        """Handle changes to amount fields"""
+        # Ensure only numbers and decimal points are entered
+        ctrl = event.GetEventObject()
+        val = ctrl.GetValue()
+        
+        # Remove any non-numeric characters except decimal point
+        new_val = ''.join([c for c in val if c.isdigit() or c == '.'])
+        
+        # Ensure only one decimal point
+        if new_val.count('.') > 1:
+            new_val = new_val[:new_val.rfind('.')]
+            
+        if new_val != val:
+            ctrl.SetValue(new_val)
+            ctrl.SetInsertionPointEnd()
+            
+        # TODO: Add price estimation logic here
+        event.Skip()
+
+    def on_token_switch(self, event):
+        """Handle token selection changes"""
+        # Get the combobox that triggered the event
+        combo = event.GetEventObject()
+        
+        # Switch the other combobox to the opposite selection
+        if combo == self.from_token:
+            other_combo = self.to_token
+        else:
+            other_combo = self.from_token
+            
+        # Set the opposite token
+        if combo.GetValue() == "XRP":
+            other_combo.SetValue("PFT")
+        else:
+            other_combo.SetValue("XRP")
+            
+        # TODO: Update price estimation
+        event.Skip()
+
+    def on_add_liquidity_token_switch(self, event):
+        """Handle token selection changes in Add Liquidity panel"""
+        combo = event.GetEventObject()
+        
+        # Switch the other combobox to the opposite selection
+        if combo == self.add_from_token:
+            other_combo = self.add_to_token
+        else:
+            other_combo = self.add_from_token
+            
+        # Set the opposite token
+        if combo.GetValue() == "XRP":
+            other_combo.SetValue("PFT")
+        else:
+            other_combo.SetValue("XRP")
+            
+        # TODO: Update price estimation
+        event.Skip()
+
+    def on_remove_liquidity_token_switch(self, event):
+        """Handle token selection changes in Remove Liquidity panel"""
+        combo = event.GetEventObject()
+        
+        # Switch the other combobox to the opposite selection
+        if combo == self.remove_from_token:
+            other_combo = self.remove_to_token
+        else:
+            other_combo = self.remove_from_token
+            
+        # Set the opposite token
+        if combo.GetValue() == "XRP":
+            other_combo.SetValue("PFT")
+        else:
+            other_combo.SetValue("XRP")
+            
+        # TODO: Update price estimation
+        event.Skip()
+
+    def on_swap(self, event):
+        """Handle swap button click"""
+        # TODO: Implement swap functionality
+        logger.debug("Swap button clicked")
+        event.Skip()
+
+    def on_add_liquidity(self, event):
+        # TODO: Implement add liquidity functionality
+        print("Add liquidity button clicked")
+        event.Skip()
+
+    def on_remove_liquidity(self, event):
+        # TODO: Implement remove liquidity functionality
+        print("Remove liquidity button clicked")
+        event.Skip()
 
 def main():
     logger.info("Starting Post Fiat Wallet")
