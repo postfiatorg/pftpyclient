@@ -415,7 +415,7 @@ class PostFiatTaskManager:
             return
 
         # flag rows with memos
-        new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x)
+        new_tx_df['has_memos'] = new_tx_df['tx_json'].apply(lambda x: 'Memos' in x and len(x['Memos']) > 0)
 
         # filter for rows with memos and convert to dataframe
         memo_tx_df = new_tx_df[new_tx_df['has_memos']== True].copy()
