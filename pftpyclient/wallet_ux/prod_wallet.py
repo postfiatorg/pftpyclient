@@ -512,6 +512,8 @@ class WalletApp(wx.Frame):
         self.change_password_item = self.account_menu.Append(wx.ID_ANY, "Change Password")
         self.show_secret_item = self.account_menu.Append(wx.ID_ANY, "Show Secret")
         self.update_trustline_item = self.account_menu.Append(wx.ID_ANY, "Update Trustline")
+        self.verify_discord_item = self.account_menu.Append(wx.ID_ANY, "Verify Discord")
+        self.send_handshake_item = self.account_menu.Append(wx.ID_ANY, "Send Handshake")
         self.delete_account_item = self.account_menu.Append(wx.ID_ANY, "Delete Account")
         self.menubar.Append(self.account_menu, "Account")
 
@@ -521,6 +523,8 @@ class WalletApp(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_change_password, self.change_password_item)
         self.Bind(wx.EVT_MENU, self.on_show_secret, self.show_secret_item)
         self.Bind(wx.EVT_MENU, self.on_update_trustline, self.update_trustline_item)
+        self.Bind(wx.EVT_MENU, self.on_verify_discord, self.verify_discord_item)
+        self.Bind(wx.EVT_MENU, self.on_send_handshake, self.send_handshake_item)
         self.Bind(wx.EVT_MENU, self.on_delete_credentials, self.delete_account_item)
 
         # Extras menu
@@ -1652,6 +1656,7 @@ class WalletApp(wx.Frame):
 
         match current_state:
             case WalletState.UNFUNDED:
+                # Funding the wallet
                 message = (
                     "To activate your wallet, you need \nto send at least 1 XRP to your address. \n\n"
                     f"Your XRP address:\n\n{self.wallet.classic_address}\n\n"
@@ -1661,6 +1666,7 @@ class WalletApp(wx.Frame):
                 dialog.Destroy()
 
             case WalletState.FUNDED:
+                # Setting the trust line
                 message = (
                     "Your wallet needs a trust line to handle PFT tokens.\n\n"
                     "This transaction will:\n"
@@ -1678,8 +1684,18 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(f"Error setting trust line: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
             case WalletState.TRUSTLINED:
+                # Discord verification
+                if not self.handle_discord_verification(prompt_for_confirmation=True):
+                    wx.MessageBox(
+                        "Please complete Discord verification before proceeding with the Initiation Rite.", 
+                        "Verification Required", 
+                        wx.OK | wx.ICON_INFORMATION
+                    )
+                    return
+
+                # Initiation Rite
                 message = (
-                    "To start accepting tasks, you need to perform the Initiation Rite.\n\n"
+                    "Once your address has been verified with the node, you can perform the Initiation Rite.\n\n"
                     "This transaction will cost 1 XRP.\n\n"
                     "Please write 1 sentence committing to a long term objective of your choice:"
                 )
@@ -1700,6 +1716,7 @@ class WalletApp(wx.Frame):
                 dialog.Destroy()
 
             case WalletState.INITIATED:
+                # Initiating an encrypted channel via a request to the node
                 message = (
                     "To continue with wallet initialization,\n"
                     "you need to establish secure communication with the network.\n\n"
@@ -1723,6 +1740,7 @@ class WalletApp(wx.Frame):
                         wx.MessageBox(f"Error sending handshake: {e}", "Error", wx.OK | wx.ICON_ERROR)
 
             case WalletState.HANDSHAKE_SENT:
+                # Finalizing the encrypted channel via a response from the node
                 message = (
                     "Waiting for handshake response from node to establish encrypted channel.\n\n"
                     "This will only take a moment."
@@ -1730,6 +1748,7 @@ class WalletApp(wx.Frame):
                 wx.MessageBox(message, "Waiting for Handshake", wx.OK | wx.ICON_INFORMATION)
 
             case WalletState.HANDSHAKE_RECEIVED:
+                # Setting up the Google Doc
                 if self.show_google_doc_template(is_initial_setup=True):
                     self.handle_google_doc_submission(event, is_initial_setup=True)
                     self.start_wallet_state_monitoring()
@@ -3170,6 +3189,73 @@ class WalletApp(wx.Frame):
             
             self.worker = XRPLMonitorThread(self)
             self.worker.start()
+
+    def handle_discord_verification(self, prompt_for_confirmation: bool = False) -> bool:
+        """Handle the Discord verification process
+        
+        Returns:
+            bool: True if verification was completed, False otherwise
+        """
+        message = (
+            "To interact with the Post Fiat Task Node, you need to verify your address via Discord.\n\n"
+            "The Post Fiat Task Node requires that you tie this address to your Discord account.\n\n"
+            "Please enter your Discord username below:"
+        )
+        dialog = CustomDialog(self, "Verify Address", ["Discord Username"], message=message)
+        if dialog.ShowModal() != wx.ID_OK:
+            dialog.Destroy()
+            return False
+
+        discord_username = dialog.GetValues()["Discord Username"]
+        dialog.Destroy()
+
+        try:
+            # Sign the Discord username
+            signature, public_key = self.task_manager.sign_message(discord_username)
+
+            # Display verification instructions in a selectable dialog
+            verification_message = (
+                f"Please verify your address in Discord (using the pf_verify command) with the following information:\n\n"
+                f"Discord Username:\n{discord_username}\n\n"
+                f"XRP Address:\n{self.wallet.classic_address}\n\n"
+                f"Signature:\n{signature}\n\n"
+                f"Public Key:\n{public_key}\n\n"
+            )
+            
+            dialog = SelectableMessageDialog(self, "Discord Verification", verification_message)
+            dialog.ShowModal()
+            dialog.Destroy()
+
+            if prompt_for_confirmation:
+                return wx.YES == wx.MessageBox(
+                    "Have you completed the Discord verification?",
+                    "Verification Confirmation",
+                    wx.YES_NO | wx.ICON_QUESTION
+                )
+            else:
+                return True
+
+        except Exception as e:
+            logger.error(f"Error during Discord address verification: {e}")
+            wx.MessageBox(f"Error during Discord address verification: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            return False
+
+    def on_verify_discord(self, event):
+        """Handle the Verify Discord menu item"""
+        self.handle_discord_verification()
+
+    def on_send_handshake(self, event):
+        message = "Send a handshake to an address"
+        handshake_dialog = CustomDialog(self, "Handshake", ["Address"], message=message)
+        if handshake_dialog.ShowModal() == wx.ID_OK:
+            address = handshake_dialog.GetValues()["Address"]
+            handshake_dialog.Destroy()
+            logger.debug(f"Sending handshake to {address}")
+            response = self.task_manager.send_handshake(destination=address)
+            formatted_response = self.format_response(response)
+            dialog = SelectableMessageDialog(self, "Handshake Submission Result", formatted_response)
+            dialog.ShowModal()
+            dialog.Destroy()
 
 def main():
     logger.info("Starting Post Fiat Wallet")
