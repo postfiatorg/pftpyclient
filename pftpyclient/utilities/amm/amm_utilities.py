@@ -12,11 +12,12 @@ from xrpl.models import (
 from xrpl.asyncio.transaction import submit_and_wait
 from xrpl.utils import xrp_to_drops
 from xrpl.wallet import Wallet
-from typing import Union, Optional, Dict, List, Tuple
+from typing import Union, Optional, Dict, List, Tuple, Any
 from decimal import Decimal
+from decimal import InvalidOperation
 from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config
-import asyncio
 from loguru import logger
+from dataclasses import dataclass
 
 class AMMUtilities:
     def __init__(self, config: ConfigurationManager):
@@ -100,14 +101,16 @@ class AMMUtilities:
         self,
         asset1_currency: str,
         asset2_currency: str,
+        asset1_issuer: Optional[str] = None,
         asset2_issuer: Optional[str] = None
     ) -> Dict:
         """
-        Get information about an AMM instance.
+        Sync information about an AMM instance with the local AMMInfo object.
         
         Args:
             asset1_currency: Currency code of the first asset (e.g., "XRP")
             asset2_currency: Currency code of the second asset (e.g., "PFT")
+            asset1_issuer: Issuer address for the first asset (required if not XRP)
             asset2_issuer: Issuer address for the second asset (required if not XRP)
             
         Returns:
@@ -117,22 +120,25 @@ class AMMUtilities:
             Exception: If AMM doesn't exist ('actNotFound') or other errors
         """
         client = AsyncJsonRpcClient(self.network_url)
-        # Create asset objects
-        asset1 = {"currency": asset1_currency}
-        asset2 = {
-            "currency": asset2_currency,
-            "issuer": asset2_issuer
-        }
+        
+        # Construct asset objects
+        asset1_obj = {"currency": asset1_currency}
+        asset2_obj = {"currency": asset2_currency}
+        
+        if asset1_issuer:
+            asset1_obj["issuer"] = asset1_issuer
+        if asset2_issuer:
+            asset2_obj["issuer"] = asset2_issuer
 
         # Create the AMM info request
         request = AMMInfo(
-            asset=asset1,
-            asset2=asset2
+            asset=asset1_obj,
+            asset2=asset2_obj
         )
 
         # Send request to the XRPL
+        logger.debug(f"Requesting AMM info for {asset1_currency}/{asset2_currency}")
         response = await client.request(request)
-        
         return response.result
 
     async def get_pft_xrp_amm_info(self, pft_issuer: str) -> Dict:
@@ -481,7 +487,6 @@ class AMMUtilities:
     
     async def get_orderbook(
         self,
-        wallet: Wallet,
         taker_gets_currency: str,
         taker_pays_currency: str,
         taker_gets_issuer: Optional[str] = None,
@@ -492,7 +497,6 @@ class AMMUtilities:
         Get the order book for a currency pair.
         
         Args:
-            wallet: The wallet to use as taker
             taker_gets_currency: Currency the taker would receive
             taker_pays_currency: Currency the taker would pay
             taker_gets_issuer: Issuer for taker_gets (if not XRP)
@@ -514,7 +518,6 @@ class AMMUtilities:
             
         # Create the request
         request = BookOffers(
-            taker=wallet.classic_address,
             taker_gets=taker_gets,
             taker_pays=taker_pays,
             limit=limit,
@@ -524,245 +527,398 @@ class AMMUtilities:
         # Send request
         response = await client.request(request)
         return response.result
-
-    async def analyze_orderbook(
-        self,
-        wallet: Wallet,
-        want_currency: str,
-        want_amount: Decimal,
-        spend_currency: str,
-        spend_amount: Decimal,
-        want_issuer: Optional[str] = None,
-        spend_issuer: Optional[str] = None
-    ) -> Tuple[Decimal, List[Dict]]:
-        """
-        Analyze order book to estimate if and how an offer would execute.
-        
-        Args:
-            wallet: The wallet that would place the offer
-            want_currency: Currency you want to receive
-            want_amount: Amount you want to receive
-            spend_currency: Currency you're willing to spend
-            spend_amount: Amount you're willing to spend
-            want_issuer: Issuer for want_currency (if not XRP)
-            spend_issuer: Issuer for spend_currency (if not XRP)
-            
-        Returns:
-            Tuple[Decimal, List[Dict]]: (matching_amount, matching_offers)
-        """
-        # Calculate the proposed quality (price)
-        proposed_quality = spend_amount / want_amount
-        
-        # Get the order book
-        orderbook = await self.get_orderbook(
-            wallet=wallet,
-            taker_gets_currency=want_currency,
-            taker_pays_currency=spend_currency,
-            taker_gets_issuer=want_issuer,
-            taker_pays_issuer=spend_issuer
-        )
-        
-        # Analyze matching offers
-        offers = orderbook.get("offers", [])
-        running_total = Decimal(0)
-        matching_offers = []
-        
-        logger.debug(f"Analyzing order book for {want_amount} {want_currency}...")
-        
-        if not offers:
-            logger.debug("No offers found in the matching book.")
-            return Decimal(0), []
-            
-        for offer in offers:
-            offer_quality = Decimal(offer["quality"])
-            if offer_quality <= proposed_quality:
-                owner_funds = Decimal(offer.get("owner_funds", "0"))
-                matching_offers.append(offer)
-                logger.debug(f"Found matching offer with {owner_funds} {want_currency}")
-                
-                running_total += owner_funds
-                if running_total >= want_amount:
-                    logger.debug("Full amount can be filled!")
-                    break
-            else:
-                logger.debug("Remaining offers are too expensive.")
-                break
-        
-        matched_amount = min(running_total, want_amount)
-        logger.debug(f"Total matched: {matched_amount} {want_currency}")
-        
-        if 0 < matched_amount < want_amount:
-            remaining = want_amount - matched_amount
-            logger.debug(f"Remaining {remaining} {want_currency} would be placed as new offer")
-            
-        return matched_amount, matching_offers
-
-    async def check_competing_offers(
-        self,
-        wallet: Wallet,
-        want_currency: str,
-        want_amount: Decimal,
-        spend_currency: str,
-        spend_amount: Decimal,
-        want_issuer: Optional[str] = None,
-        spend_issuer: Optional[str] = None
-    ) -> Tuple[Decimal, List[Dict]]:
-        """
-        Check for competing offers at the same price point.
-        
-        Args:
-            (same as analyze_orderbook)
-            
-        Returns:
-            Tuple[Decimal, List[Dict]]: (competing_amount, competing_offers)
-        """
-        # Calculate the inverse quality for competing offers
-        offered_quality = want_amount / spend_amount
-        
-        # Get the competing order book (reversed currencies)
-        orderbook = await self.get_orderbook(
-            wallet=wallet,
-            taker_gets_currency=spend_currency,
-            taker_pays_currency=want_currency,
-            taker_gets_issuer=spend_issuer,
-            taker_pays_issuer=want_issuer
-        )
-        
-        offers = orderbook.get("offers", [])
-        running_total = Decimal(0)
-        competing_offers = []
-        
-        logger.debug("\nChecking for competing offers...")
-        
-        if not offers:
-            logger.debug("No competing offers found. Would be first in book.")
-            return Decimal(0), []
-            
-        for offer in offers:
-            offer_quality = Decimal(offer["quality"])
-            if offer_quality <= offered_quality:
-                owner_funds = Decimal(offer.get("owner_funds", "0"))
-                competing_offers.append(offer)
-                logger.debug(f"Found competing offer with {owner_funds} {spend_currency}")
-                running_total += owner_funds
-            else:
-                logger.debug("Remaining offers would be below our price point.")
-                break
-                
-        logger.debug(f"Total competing liquidity: {running_total} {spend_currency}")
-        return running_total, competing_offers
     
-    async def calculate_swap_rate(
+    async def get_amm_pool_balances(
         self,
-        wallet: Wallet,
+        base_currency: str,
+        quote_currency: str,
+        base_issuer: Optional[str] = None,
+        quote_issuer: Optional[str] = None,
+    ) -> Dict[str, Decimal]:
+        """Get current pool balances for a currency pair"""
+        response = await self.get_amm_info(base_currency, quote_currency, base_issuer, quote_issuer)
+
+        if not response or "amm" not in response:
+            return {base_currency: Decimal("0"), quote_currency: Decimal("0")}
+            
+        pool = response["amm"]
+        amount1 = pool["amount"]
+        amount2 = pool["amount2"]
+        trading_fee = Decimal(pool["trading_fee"]) / Decimal("100000")  # Convert from 1/100000 units
+
+        # Handle amounts which might be objects or direct values
+        # Convert XRP from drops
+        balance1 = Decimal(amount1.get("value", "0") if isinstance(amount1, dict) else amount1)
+        if not isinstance(amount1, dict):  # This is XRP in drops
+            balance1 = balance1 / Decimal("1000000")
+            
+        balance2 = Decimal(amount2.get("value", "0") if isinstance(amount2, dict) else amount2)
+        if not isinstance(amount2, dict):  # This is XRP in drops
+            balance2 = balance2 / Decimal("1000000")
+        
+        # Match balances to currencies based on amount2's currency
+        if isinstance(amount2, dict) and amount2.get("currency") == base_currency:
+            return {base_currency: balance2, quote_currency: balance1, "trading_fee": trading_fee}
+        else:
+            return {base_currency: balance1, quote_currency: balance2, "trading_fee": trading_fee}
+
+    def _get_amount_value(self, amount: Union[Dict, str]) -> Decimal:
+        """Helper to get decimal value from either XRP drops or issued currency amount"""
+        if isinstance(amount, dict):
+            return Decimal(amount.get("value", "0"))
+        else:
+            # Convert XRP drops to XRP
+            return Decimal(amount) / Decimal("1000000")
+        
+    def convert_quality_to_price(self, offer: Dict[str, Any], side: str) -> float:
+        """
+        Convert the XRPL 'quality' field to a float price in terms of PFT/XRP.
+
+        Args:
+            offer: The offer dictionary returned from the XRPL orderbook.
+            side: "asks" for offers selling PFT, "bids" for offers buying PFT.
+
+        Returns:
+            A float price in PFT/XRP.
+        """
+        raw_quality = float(offer.get("quality", 0))
+        if side == "bids":
+            return raw_quality * 1_000_000
+        elif side == "asks":
+            return (1 / raw_quality) * 1_000_000
+        else:
+            raise ValueError(f"Invalid side: {side}. Must be 'asks' or 'bids'.")
+    
+    def _print_orderbook(
+        self,
+        asks: List[Dict],
+        bids: List[Dict],
+        base_currency: str,
+        quote_currency: str
+    ) -> Dict:
+        """Get orderbook liquidity in a readable format.
+        
+        Args:
+            asks: List of ask offers
+            bids: List of bid offers
+            base_currency: Base currency of the pair (e.g. PFT in PFT/XRP)
+            quote_currency: Quote currency of the pair (e.g. XRP in PFT/XRP)
+        """
+        logger.debug(f"=== {base_currency}/{quote_currency} Orderbook ===")
+        
+        # Print asks (selling base currency)
+        logger.debug(f"Asks (Selling {base_currency}):")
+        logger.debug(f"Price (in {quote_currency}) | Amount {base_currency}    | Amount {quote_currency}")
+        logger.debug("-" * 45)
+
+        asks = asks.get('offers', [])
+        bids = bids.get('offers', [])
+
+        # Process asks (selling PFT)
+        ask_base_amount = Decimal("0")
+        ask_quote_amount = Decimal("0")
+        best_ask = None
+        
+        for offer in asks:
+            base_amount = self._get_amount_value(
+                offer['TakerGets'] if isinstance(offer['TakerGets'], dict) 
+                else {'value': offer['TakerGets']}
+            )
+            quote_amount = self._get_amount_value(
+                offer['TakerPays'] if isinstance(offer['TakerPays'], dict)
+                else {'value': offer['TakerPays']}
+            )
+            
+            # Convert drops to XRP if needed
+            if base_currency == "XRP":
+                base_amount = base_amount / Decimal("1000000")
+            if quote_currency == "XRP":
+                quote_amount = quote_amount / Decimal("1000000")
+            
+            ask_base_amount += base_amount
+            ask_quote_amount += quote_amount
+            
+            price = 1.0 / self.convert_quality_to_price(offer, side="asks")
+            best_ask = min(price, best_ask) if best_ask is not None else price
+            logger.debug(f"  {price:12.9f} | {base_amount:10.6f} | {quote_amount:10.6f}")
+        
+        logger.debug("")
+        
+        # Print bids (buying base currency)
+        logger.debug(f"Bids (Buying {base_currency}):")
+        logger.debug(f"Price (in {quote_currency}) | Amount {base_currency}    | Amount {quote_currency}")
+        logger.debug("-" * 45)
+
+        # Process bids
+        bid_base_amount = Decimal("0")
+        bid_quote_amount = Decimal("0")
+        best_bid = None
+        
+        for offer in bids:
+            base_amount = self._get_amount_value(
+                offer['TakerPays'] if isinstance(offer['TakerPays'], dict)
+                else {'value': offer['TakerPays']}
+            )
+            quote_amount = self._get_amount_value(
+                offer['TakerGets'] if isinstance(offer['TakerGets'], dict)
+                else {'value': offer['TakerGets']}
+            )
+            
+            # Convert drops to XRP if needed
+            if base_currency == "XRP":
+                base_amount = base_amount / Decimal("1000000")
+            if quote_currency == "XRP":
+                quote_amount = quote_amount / Decimal("1000000")
+
+            bid_base_amount += base_amount
+            bid_quote_amount += quote_amount
+            
+            price = 1.0 / self.convert_quality_to_price(offer, side="bids")
+            best_bid = max(price, best_bid) if best_bid is not None else price
+            logger.debug(f"  {price:12.9f} | {base_amount:10.6f} | {quote_amount:10.6f}")
+        
+        logger.debug("")
+
+        if asks:
+            best_ask = 1.0 / self.convert_quality_to_price(asks[0], side="asks")
+            logger.debug(f"Best ask: {best_ask:.9f} PFT/XRP")
+        else:
+            logger.debug("No asks (sell orders) in the book")
+        
+        if bids:
+            best_bid = 1.0 / self.convert_quality_to_price(bids[0], side="bids")
+            logger.debug(f"Best bid: {best_bid:.9f} PFT/XRP")
+        else:
+            logger.debug("No bids (buy orders) in the book")
+        
+    async def print_orderbook(
+        self,
+        base_currency: str,  # PFT in PFT/XRP
+        quote_currency: str,  # XRP in PFT/XRP
+        base_issuer: Optional[str] = None,
+        quote_issuer: Optional[str] = None,
+    ) -> None:
+        """Get orderbook liquidity in a readable format.
+        
+        Args:
+            asks: List of ask offers
+            bids: List of bid offers
+            base_currency: Base currency of the pair (e.g. PFT in PFT/XRP)
+            quote_currency: Quote currency of the pair (e.g. XRP in PFT/XRP)
+        """
+        # Get asks (i.e. offers selling PFT for XRP)
+        asks = await self.get_orderbook(
+            taker_gets_currency=base_currency,
+            taker_pays_currency=quote_currency,
+            taker_gets_issuer=base_issuer if base_currency != "XRP" else None,
+            taker_pays_issuer=quote_issuer if quote_currency != "XRP" else None
+        )
+
+        # Get bids (i.e. offers buying PFT with XRP)
+        bids = await self.get_orderbook(
+            taker_gets_currency=quote_currency,
+            taker_pays_currency=base_currency,
+            taker_gets_issuer=quote_issuer if quote_currency != "XRP" else None,
+            taker_pays_issuer=base_issuer if base_currency != "XRP" else None
+        )
+
+        # Print orderbook for debugging
+        return self._print_orderbook(asks, bids, base_currency, quote_currency)
+    
+    async def calculate_estimated_receive(
+        self,
         spend_currency: str,
         receive_currency: str,
-        spend_amount: Optional[Decimal] = None,
-        receive_amount: Optional[Decimal] = None,
+        spend_amount: Decimal,
         spend_issuer: Optional[str] = None,
-        receive_issuer: Optional[str] = None,
+        receive_issuer: Optional[str] = None
     ) -> Dict:
         """
-        Calculate expected swap rate and amounts based on current orderbook.
+        Calculate expected receive amount for a market order by walking AMM and orderbook.
         
         Args:
-            wallet: The wallet to use as taker
-            spend_currency: Currency you're spending
-            receive_currency: Currency you want to receive
-            spend_amount: Amount you want to spend (optional)
-            receive_amount: Amount you want to receive (optional)
+            spend_currency: Currency being spent
+            receive_currency: Currency to receive
+            spend_amount: Amount to spend
             spend_issuer: Issuer for spend currency if not XRP
             receive_issuer: Issuer for receive currency if not XRP
             
         Returns:
             Dict containing:
-                - expected_spend: How much will be spent
-                - expected_receive: How much will be received
-                - best_price: Best available price
-                - worst_price: Worst price needed to fill order
-                - sufficient_liquidity: Boolean indicating if enough liquidity exists
-        
-        Note: Either spend_amount or receive_amount must be provided, but not both
+                - expected_receive: Total amount expected to receive
+                - routing: Dict showing amount routed to each source
+                - steps: List of execution steps for UI
+                - sufficient_liquidity: Boolean indicating if full amount can be filled
         """
-        if (spend_amount is None and receive_amount is None) or (spend_amount is not None and receive_amount is not None):
-            raise ValueError("Must provide either spend_amount or receive_amount, but not both")
-
-        # Get orderbook with taker perspective
-        orderbook = await self.get_orderbook(
-            wallet=wallet,
-            taker_gets_currency=receive_currency,  # What we want to receive
-            taker_pays_currency=spend_currency,    # What we're willing to spend
-            taker_gets_issuer=receive_issuer,
-            taker_pays_issuer=spend_issuer
-        )
-
-        offers = orderbook.get("offers", [])
-        if not offers:
-            return {
-                "expected_spend": Decimal("0"),
-                "expected_receive": Decimal("0"),
-                "best_price": None,
-                "worst_price": None,
-                "sufficient_liquidity": False
-            }
-
-        # Calculate based on available offers
-        if spend_amount is not None:
-            # We know how much we want to spend, calculate how much we'll receive
-            remaining_spend = spend_amount
-            total_receive = Decimal("0")
-            prices = []
-
-            for offer in offers:
-                offer_quality = Decimal(offer["quality"])  # Price in terms of spend/receive
-                prices.append(offer_quality)
-                
-                # Calculate how much we can get from this offer
-                offer_funds = Decimal(offer.get("owner_funds", "0"))
-                receivable = min(remaining_spend / offer_quality, offer_funds)
-                
-                total_receive += receivable
-                remaining_spend -= receivable * offer_quality
-                
-                if remaining_spend <= 0:
-                    break
-
-            return {
-                "expected_spend": spend_amount - remaining_spend,
-                "expected_receive": total_receive,
-                "best_price": min(prices) if prices else None,
-                "worst_price": max(prices) if prices else None,
-                "sufficient_liquidity": remaining_spend <= 0
-            }
-
+        # Determine the trade direction
+        if spend_currency == "XRP":
+            # Spending XRP to receive PFT (look at asks)
+            base_currency = receive_currency
+            quote_currency = spend_currency
+            base_issuer = receive_issuer
+            quote_issuer = spend_issuer
+            orderbook_side = "asks"
+            logger.debug(f"Trade direction: Buying {base_currency} with {quote_currency}")
+            logger.debug(f"Looking at {orderbook_side} side of orderbook")
         else:
-            # We know how much we want to receive, calculate how much we need to spend
-            remaining_receive = receive_amount
-            total_spend = Decimal("0")
-            prices = []
-
-            for offer in offers:
-                offer_quality = Decimal(offer["quality"])
-                prices.append(offer_quality)
-                
-                # Calculate how much we can get from this offer
-                offer_funds = Decimal(offer.get("owner_funds", "0"))
-                receivable = min(remaining_receive, offer_funds)
-                
-                total_spend += receivable * offer_quality
-                remaining_receive -= receivable
-                
-                if remaining_receive <= 0:
-                    break
-
-            return {
-                "expected_spend": total_spend,
-                "expected_receive": receive_amount - remaining_receive,
-                "best_price": min(prices) if prices else None,
-                "worst_price": max(prices) if prices else None,
-                "sufficient_liquidity": remaining_receive <= 0
-            }
+            # Spending PFT to receive XRP (look at bids)
+            base_currency = spend_currency
+            quote_currency = receive_currency
+            base_issuer = spend_issuer
+            quote_issuer = receive_issuer
+            orderbook_side = "bids"
+            logger.debug(f"Trade direction: Selling {base_currency} for {quote_currency}")
+            logger.debug(f"Looking at {orderbook_side} side of orderbook")
     
+        # Get current liquidity state
+        amm_info = await self.get_amm_pool_balances(
+            base_currency=base_currency,
+            quote_currency=quote_currency,
+            base_issuer=base_issuer,
+            quote_issuer=quote_issuer
+        )
+        logger.debug(f"AMM Pool State:")
+        logger.debug(f"Base ({base_currency}): {amm_info[base_currency]}")
+        logger.debug(f"Quote ({quote_currency}): {amm_info[quote_currency]}")
+        logger.debug(f"Fee: {amm_info['trading_fee']}")
+
+        # Fetch the correct orderbook side
+        if orderbook_side == "asks":
+            # Fetch asks (selling base_currency for quote_currency)
+            logger.debug("Fetching asks (selling base for quote)")
+            orderbook_offers = await self.get_orderbook(
+                taker_gets_currency=quote_currency,
+                taker_pays_currency=base_currency,
+                taker_gets_issuer=quote_issuer if quote_currency != "XRP" else None,
+                taker_pays_issuer=base_issuer if base_currency != "XRP" else None
+            )
+        else:
+            # Fetch bids (buying base_currency with quote_currency)
+            logger.debug("Fetching bids (buying base with quote)")
+            orderbook_offers = await self.get_orderbook(
+                taker_gets_currency=base_currency,
+                taker_pays_currency=quote_currency,
+                taker_gets_issuer=base_issuer if base_currency != "XRP" else None,
+                taker_pays_issuer=quote_issuer if quote_currency != "XRP" else None
+            )
+
+        # Debugging
+        await self.print_orderbook(base_currency, quote_currency, base_issuer, quote_issuer)
+
+        # Initialize state
+        remaining_spend = spend_amount
+        total_receive = Decimal("0")
+        routing = {"amm": Decimal("0"), "orderbook": Decimal("0")}
+        steps = []
+
+        # Working copy of AMM state
+        pool_state = amm_info.copy()
+        orderbook_offers = orderbook_offers.get("offers", [])
+
+        logger.debug(f"Initial state:")
+        logger.debug(f"Spend amount: {spend_amount} {quote_currency}")
+        logger.debug(f"Remaining spend: {remaining_spend}")
+
+        while remaining_spend > 0:
+            # Calculate AMM output and price
+            amm_fee_adjusted = remaining_spend * (1 - pool_state["trading_fee"])
+            amm_output = (pool_state[quote_currency] * amm_fee_adjusted) / (
+                pool_state[base_currency] + amm_fee_adjusted
+            )
+            amm_price = remaining_spend / amm_output if amm_output > 0 else Decimal("0")
+
+            logger.debug(f"AMM calculation:")
+            logger.debug(f"Fee adjusted spend: {amm_fee_adjusted}")
+            logger.debug(f"AMM output: {amm_output:.9f} {quote_currency}")
+            logger.debug(f"AMM price: {amm_price:.9f} {base_currency} per {quote_currency}")
+
+            # Get best orderbook price and liquidity
+            if orderbook_offers:
+                best_offer = orderbook_offers[0]
+                offer_spend_amount = self._get_amount_value(best_offer["TakerPays"])
+                offer_receive_amount = self._get_amount_value(best_offer["TakerGets"])
+                ob_price = offer_receive_amount / offer_spend_amount if offer_spend_amount > 0 else Decimal("0")
+                logger.debug(f"Best orderbook offer:")
+                logger.debug(f"Spend amount: {offer_spend_amount} {base_currency}")
+                logger.debug(f"Receive amount: {offer_receive_amount} {quote_currency}")
+                logger.debug(f"Price: {ob_price} {base_currency} per {quote_currency}")
+            else:
+                ob_price = Decimal("0")
+                logger.debug("No orderbook offers available")
+
+            # Determine which source to route to
+            if amm_output and (not ob_price or amm_price <= ob_price):
+                # Route to AMM (better price or no orderbook liquidity)
+                logger.debug(f"Routing to AMM (better price or no orderbook liquidity)")
+                routed_amount = remaining_spend
+                received_amount = amm_output
+                source = "amm"
+
+                # Update pool state
+                pool_state[base_currency] += amm_fee_adjusted
+                pool_state[quote_currency] -= received_amount
+            else:
+                # Route to orderbook
+                logger.debug(f"Routing to orderbook")
+                offer_spend_amount = self._get_amount_value(best_offer["TakerPays"])
+                offer_receive_amount = self._get_amount_value(best_offer["TakerGets"])
+
+                # Calculate how much of this offer can be filled
+                fillable_spend = min(remaining_spend, offer_spend_amount)
+                fillable_receive = (fillable_spend / offer_spend_amount) * offer_receive_amount
+                logger.debug(f"Fillable spend: {fillable_spend} {base_currency}")
+                logger.debug(f"Fillable receive: {fillable_receive} {quote_currency}")
+
+                routed_amount = fillable_spend
+                received_amount = fillable_receive
+                source = "orderbook"
+
+                # Update orderbook state
+                if fillable_spend == offer_spend_amount:
+                    # Remove the filled offer
+                    logger.debug("Removing filled offer")
+                    orderbook_offers.pop(0)
+                else:
+                    # Partially fill the offer
+                    logger.debug("Partially filling offer")
+                    best_offer["TakerPays"] = self._get_amount_value(best_offer["TakerPays"]) - fillable_spend
+                    best_offer["TakerGets"] = self._get_amount_value(best_offer["TakerGets"]) - fillable_receive
+
+            logger.debug(f"Routed amount: {routed_amount} {base_currency}")
+            logger.debug(f"Received amount: {received_amount} {quote_currency}")
+            logger.debug(f"Updated remaining spend: {remaining_spend} {base_currency}")
+            logger.debug(f"Updated total receive: {total_receive} {quote_currency}")
+
+            # Update totals
+            remaining_spend -= routed_amount
+            total_receive += received_amount
+            routing[source] += routed_amount
+
+            # Log step
+            steps.append({
+                "source": source,
+                "spend": routed_amount,
+                "receive": received_amount,
+                "price": received_amount / routed_amount if routed_amount > 0 else Decimal("0")
+            })
+
+            # Break if no more liquidity
+            if routed_amount == 0:
+                break
+
+        logger.debug(f"Final results:")
+        logger.debug(f"Total received: {total_receive} {quote_currency}")
+        logger.debug(f"Routing: AMM={routing['amm']}, Orderbook={routing['orderbook']}")
+        logger.debug(f"Sufficient liquidity: {remaining_spend == 0}")
+
+        return {
+            "expected_receive": total_receive,
+            "routing": routing,
+            "steps": steps,
+            "sufficient_liquidity": remaining_spend == 0,
+            "effective_price": total_receive / spend_amount if spend_amount > 0 else Decimal("0")
+        }
+
     async def create_offer(
         self,
         wallet: Wallet,
@@ -788,10 +944,15 @@ class AMMUtilities:
         Returns:
             dict: Transaction response
         """
-        # Convert amounts to proper format
+        if isinstance(taker_gets_amount, str):
+            taker_gets_amount = Decimal(taker_gets_amount)
+        if isinstance(taker_pays_amount, str):
+            taker_pays_amount = Decimal(taker_pays_amount)
+
         client = AsyncJsonRpcClient(self.network_url)
+
         if taker_gets_currency == "XRP":
-            taker_gets = xrp_to_drops(str(taker_gets_amount))
+            taker_gets = xrp_to_drops(taker_gets_amount)
         else:
             taker_gets = IssuedCurrencyAmount(
                 currency=taker_gets_currency,
@@ -800,7 +961,7 @@ class AMMUtilities:
             )
             
         if taker_pays_currency == "XRP":
-            taker_pays = xrp_to_drops(str(taker_pays_amount))
+            taker_pays = xrp_to_drops(taker_pays_amount)
         else:
             taker_pays = IssuedCurrencyAmount(
                 currency=taker_pays_currency,
@@ -812,7 +973,8 @@ class AMMUtilities:
         offer_tx = OfferCreate(
             account=wallet.classic_address,
             taker_gets=taker_gets,
-            taker_pays=taker_pays
+            taker_pays=taker_pays,
+            flags=131072  # Immediate or cancel
         )
         
         # Submit and wait for validation
@@ -840,7 +1002,6 @@ class AMMUtilities:
         """
         # First analyze the market
         market_analysis = await self.analyze_orderbook(
-            wallet=wallet,
             want_currency="PFT",
             want_amount=pft_amount,
             spend_currency="XRP",
@@ -848,7 +1009,7 @@ class AMMUtilities:
             want_issuer=pft_issuer
         )
         
-        logger.debug(f"\nCreating offer to buy {pft_amount} PFT for {xrp_amount} XRP")
+        logger.debug(f"Creating offer to buy {pft_amount} PFT for {xrp_amount} XRP")
         logger.debug(f"Price: {float(xrp_amount/pft_amount):.6f} XRP per PFT")
         
         # Create the offer
@@ -863,15 +1024,15 @@ class AMMUtilities:
         
         # Check if transaction was successful
         if response.result.get("engine_result") == "tesSUCCESS":
-            logger.debug("\nOffer created successfully!")
+            logger.debug("Offer created successfully!")
             logger.debug(f"Transaction hash: {response.result.get('tx_json', {}).get('hash')}")
             
             # If there were matching offers, some or all might have been filled immediately
             if market_analysis[0] > 0:
-                logger.debug(f"\nOffer may have filled immediately up to {market_analysis[0]} PFT")
+                logger.debug(f"Offer may have filled immediately up to {market_analysis[0]} PFT")
                 logger.debug("Check your balances to confirm the trade execution.")
         else:
-            logger.debug(f"\nError creating offer: {response.result.get('engine_result_message')}")
+            logger.debug(f"Error creating offer: {response.result.get('engine_result_message')}")
         
         return response
 
@@ -896,7 +1057,6 @@ class AMMUtilities:
         """
         # First analyze the market
         market_analysis = await self.analyze_orderbook(
-            wallet=wallet,
             want_currency="XRP",
             want_amount=xrp_amount,
             spend_currency="PFT",
@@ -904,7 +1064,7 @@ class AMMUtilities:
             spend_issuer=pft_issuer
         )
         
-        logger.debug(f"\nCreating offer to sell {pft_amount} PFT for {xrp_amount} XRP")
+        logger.debug(f"Creating offer to sell {pft_amount} PFT for {xrp_amount} XRP")
         logger.debug(f"Price: {float(xrp_amount/pft_amount):.6f} XRP per PFT")
         
         # Create the offer
@@ -919,14 +1079,14 @@ class AMMUtilities:
         
         # Check if transaction was successful
         if response.result.get("engine_result") == "tesSUCCESS":
-            logger.debug("\nOffer created successfully!")
+            logger.debug("Offer created successfully!")
             logger.debug(f"Transaction hash: {response.result.get('tx_json', {}).get('hash')}")
             
             # If there were matching offers, some or all might have been filled immediately
             if market_analysis[0] > 0:
-                logger.debug(f"\nOffer may have filled immediately up to {market_analysis[0]} XRP")
+                logger.debug(f"Offer may have filled immediately up to {market_analysis[0]} XRP")
                 logger.debug("Check your balances to confirm the trade execution.")
         else:
-            logger.debug(f"\nError creating offer: {response.result.get('engine_result_message')}")
+            logger.debug(f"Error creating offer: {response.result.get('engine_result_message')}")
         
         return response

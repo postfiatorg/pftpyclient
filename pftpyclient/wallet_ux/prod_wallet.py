@@ -153,6 +153,7 @@ class WalletApp(wx.Frame):
 
     def __init__(self):
         wx.Frame.__init__(self, None, title=f"PftPyClient v{VERSION}", size=(1150, 700))
+        self.loop = asyncio.get_event_loop()
         self.default_size = (1150, 700)
         self.min_size = (800, 600)
         self.max_size = (1600, 1000)
@@ -163,6 +164,10 @@ class WalletApp(wx.Frame):
         self.ctrl_pressed = False
         self.last_ctrl_press_time = 0
         self.ctrl_toggle_delay = 0.2  # 200 ms debounce
+
+        # balances attributes
+        self.pft_balance = Decimal("0")
+        self.xrp_balance = Decimal("0")
 
         # Bind the zoom event to the entire frame
         wx.GetApp().Bind(wx.EVT_MOUSEWHEEL, self.on_mouse_wheel_zoom)
@@ -220,11 +225,11 @@ class WalletApp(wx.Frame):
         # Check for update
         check_and_show_update_dialog(parent=self)
 
+        # AMM utilities
         self.amm_utils = AMMUtilities(self.config)
-
-        self.loop = asyncio.get_event_loop()
-
         self._updating = False  # Add flag to prevent recursive updates
+        self._update_timer = None
+        self.debounce_ms = 1000  # Wait 1 second after typing stops
 
     def setup_grid(self, grid, grid_name):
         """Setup grid with columns based on grid configuration"""
@@ -667,8 +672,23 @@ class WalletApp(wx.Frame):
 
         # FROM section
         swap_operation_sizer.AddSpacer(30)
+
+        # From balance (right-aligned above input)
+        from_header_sizer = wx.BoxSizer(wx.HORIZONTAL)
         from_label = wx.StaticText(self.swap_operation_panel, label="From")
-        swap_operation_sizer.Add(from_label, 0, wx.LEFT | wx.RIGHT, 20)
+        self.from_balance = wx.StaticText(
+            self.swap_operation_panel, 
+            label="0.00 XRP", 
+            size=(200, -1),  # Increased width from 120 to 200
+            style=wx.ALIGN_RIGHT
+        )
+        from_header_sizer.Add(from_label, 0)
+        from_header_sizer.AddStretchSpacer()
+        from_header_sizer.Add(self.from_balance, 0, wx.RIGHT, 20)
+        swap_operation_sizer.Add(from_header_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+
+        # Small gap between label and input
+        swap_operation_sizer.AddSpacer(5)
 
         from_row = wx.BoxSizer(wx.HORIZONTAL)
         self.from_amount = wx.TextCtrl(
@@ -699,8 +719,21 @@ class WalletApp(wx.Frame):
         swap_operation_sizer.Add(arrow_sizer, 0, wx.ALIGN_CENTER)
         
         # TO section
+        to_header_sizer = wx.BoxSizer(wx.HORIZONTAL)
         to_label = wx.StaticText(self.swap_operation_panel, label="To (estimated)")
-        swap_operation_sizer.Add(to_label, 0, wx.LEFT | wx.RIGHT, 20)
+        self.to_balance = wx.StaticText(
+            self.swap_operation_panel, 
+            label="0.00 PFT", 
+            size=(200, -1),  # Increased width from 120 to 200
+            style=wx.ALIGN_RIGHT
+        )
+        to_header_sizer.Add(to_label, 0)
+        to_header_sizer.AddStretchSpacer()
+        to_header_sizer.Add(self.to_balance, 0, wx.RIGHT, 20)
+        swap_operation_sizer.Add(to_header_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        
+        # Small gap between label and input
+        swap_operation_sizer.AddSpacer(5)
         
         to_row = wx.BoxSizer(wx.HORIZONTAL)
         self.to_amount = wx.TextCtrl(
@@ -720,6 +753,34 @@ class WalletApp(wx.Frame):
         to_row.Add(self.to_amount, 1, wx.EXPAND | wx.RIGHT, 10)
         to_row.Add(self.to_token, 0, wx.ALIGN_CENTER_VERTICAL)
         swap_operation_sizer.Add(to_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+
+        # Add info panel
+        info_panel = wx.Panel(self.swap_operation_panel)
+        info_sizer = wx.GridBagSizer(vgap=5, hgap=10)
+        info_panel.SetSizer(info_sizer)
+        
+        # Routing info
+        routing_label = wx.StaticText(info_panel, label="Routing:")
+        self.routing_info = wx.StaticText(info_panel, label="100% AMM")
+        info_sizer.Add(routing_label, pos=(0, 0), flag=wx.ALIGN_RIGHT)
+        info_sizer.Add(self.routing_info, pos=(0, 1), span=(1, 2), flag=wx.ALIGN_LEFT)
+        
+        # Price impact
+        impact_label = wx.StaticText(info_panel, label="Price Impact:")
+        self.price_impact = wx.StaticText(info_panel, label="0.00%")
+        info_sizer.Add(impact_label, pos=(1, 0), flag=wx.ALIGN_RIGHT)
+        info_sizer.Add(self.price_impact, pos=(1, 1), span=(1, 2), flag=wx.ALIGN_LEFT)
+
+        # Price info
+        price_label = wx.StaticText(info_panel, label="Final Price:")
+        self.current_price = wx.StaticText(info_panel, label="1 PFT = 0.00000 XRP")
+        info_sizer.Add(price_label, pos=(2, 0), flag=wx.ALIGN_RIGHT)
+        info_sizer.Add(self.current_price, pos=(2, 1), span=(1, 2), flag=wx.ALIGN_LEFT)
+        
+        # Add info panel to main sizer
+        swap_operation_sizer.AddSpacer(10)
+        swap_operation_sizer.Add(info_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        swap_operation_sizer.AddSpacer(10)
         
         # Add some space before the swap button
         swap_operation_sizer.AddSpacer(20)
@@ -739,7 +800,7 @@ class WalletApp(wx.Frame):
         self.to_amount.Bind(wx.EVT_TEXT, self.on_amount_change)
         self.from_token.Bind(wx.EVT_COMBOBOX, self.on_token_switch)
         self.to_token.Bind(wx.EVT_COMBOBOX, self.on_token_switch)
-        self.swap_button.Bind(wx.EVT_BUTTON, self.on_swap)
+        AsyncBind(wx.EVT_BUTTON, self.on_swap, self.swap_button)
 
         # Add Liquidity Panel Content
         add_liquidity_sizer.AddSpacer(30)
@@ -1495,6 +1556,7 @@ class WalletApp(wx.Frame):
             )
 
             await self.task_manager.sync_transactions()
+            await self.task_manager.determine_wallet_state()
 
         except (ValueError, InvalidToken, KeyError) as e:
             logger.error(f"Login failed: {e}")
@@ -1557,7 +1619,7 @@ class WalletApp(wx.Frame):
         """Check the wallet state and update the UI accordingly"""
         logger.debug("WalletApp.check_wallet_state called")
         if hasattr(self, 'task_manager'):
-            if self.task_manager.determine_wallet_state():
+            if await self.task_manager.determine_wallet_state():
                 await self.update_account_display()
                 self.update_ui_based_on_wallet_state()
 
@@ -1682,6 +1744,7 @@ class WalletApp(wx.Frame):
 
         xrp_balance = await self.task_manager.get_xrp_balance()
         xrp_balance = xrpl.utils.drops_to_xrp(str(xrp_balance))
+        self.xrp_balance = xrp_balance
         self.summary_lbl_xrp_balance.SetLabel(f"XRP Balance: {xrp_balance}")
 
         # PFT balance pending update
@@ -1689,6 +1752,38 @@ class WalletApp(wx.Frame):
 
         self.summary_lbl_wallet_state.SetLabel(f"Wallet State: {self.task_manager.wallet_state.value}")
         self.summary_lbl_next_action.SetLabel(f"Next Action: {self.task_manager.get_required_action()}")
+
+    @requires_wallet_state(TRUSTLINED_STATES)
+    @PerformanceMonitor.measure('update_tokens')
+    async def update_tokens(self):
+        """Update token balances for the current account"""
+        logger.debug(f"Fetching token balances for account: {self.wallet.address}")
+        try:
+            client = AsyncJsonRpcClient(self.network_url)
+            account_lines = xrpl.models.requests.AccountLines(
+                account=self.wallet.address,
+                ledger_index="validated"
+            )
+            response = await client.request(account_lines)
+
+            if not response.is_successful():
+                logger.error(f"Error fetching AccountLines: {response}")
+                return
+
+            lines = response.result.get('lines', [])
+
+            pft_balance = 0.0
+            for line in lines:
+                if line['currency'] == 'PFT' and line['account'] == self.pft_issuer:
+                    pft_balance = float(line['balance'])
+                    logger.debug(f"Found PFT balance: {pft_balance}")
+
+            self.pft_balance = pft_balance
+            
+            self.summary_lbl_pft_balance.SetLabel(f"PFT Balance: {pft_balance}")
+
+        except Exception as e:
+            logger.exception(f"Exception in update_tokens: {e}")
 
     async def on_take_action(self, event):
         """Handle wallet action button click based on current state"""
@@ -1808,7 +1903,7 @@ class WalletApp(wx.Frame):
                 await self.check_wallet_state()
 
             # If trust line is detected and current state is FUNDED
-            elif (current_state == WalletState.FUNDED and self.task_manager.has_trust_line()):
+            elif (current_state == WalletState.FUNDED and self.task_manager.fetch_trust_line()):
                 logger.info("Trust line detected. Updating wallet state.")
                 message = (
                     "Trust line successfully established!\n\n"
@@ -1858,36 +1953,6 @@ class WalletApp(wx.Frame):
                 self.stop_wallet_state_monitoring()
                 wx.CallAfter(lambda: wx.MessageBox(message, "Google Doc Ready!", wx.OK | wx.ICON_INFORMATION))
                 await self.check_wallet_state()
-
-    @requires_wallet_state(TRUSTLINED_STATES)
-    @PerformanceMonitor.measure('update_tokens')
-    async def update_tokens(self):
-        """Update token balances for the current account"""
-        logger.debug(f"Fetching token balances for account: {self.wallet.address}")
-        try:
-            client = AsyncJsonRpcClient(self.network_url)
-            account_lines = xrpl.models.requests.AccountLines(
-                account=self.wallet.address,
-                ledger_index="validated"
-            )
-            response = await client.request(account_lines)
-
-            if not response.is_successful():
-                logger.error(f"Error fetching AccountLines: {response}")
-                return
-
-            lines = response.result.get('lines', [])
-
-            pft_balance = 0.0
-            for line in lines:
-                if line['currency'] == 'PFT' and line['account'] == self.pft_issuer:
-                    pft_balance = float(line['balance'])
-                    logger.debug(f"Found PFT balance: {pft_balance}")
-
-            self.summary_lbl_pft_balance.SetLabel(f"PFT Balance: {pft_balance}")
-
-        except Exception as e:
-            logger.exception(f"Exception in update_tokens: {e}")
 
     def on_close(self, event):
         self.logout()
@@ -3159,10 +3224,78 @@ class WalletApp(wx.Frame):
             self.worker = XRPLMonitorThread(self)
             self.worker.start()
 
+    def _format_amount(self, amount: Decimal) -> str:
+        """Format amount to 4 decimal places"""
+        return f"{amount:.4f}".rstrip('0').rstrip('.')
+    
+    def get_balance(self, currency: str) -> Decimal:
+        """Get balance of a given currency"""
+        if currency == "PFT":
+            return self.pft_balance
+        elif currency == "XRP":
+            return self.xrp_balance
+        else:
+            return Decimal("0")
+
+    def _update_swap_ui(self, result: Dict, ctrl, from_currency: str, to_currency: str):
+        """Internal method to update swap UI elements"""
+        self._updating = True
+        
+        try:
+            # Update amounts
+            if result["sufficient_liquidity"]:
+                if ctrl == self.from_amount:
+                    formatted_amount = self._format_amount(result["expected_receive"])
+                    self.to_amount.SetValue(formatted_amount)
+                else:
+                    formatted_amount = self._format_amount(result["expected_spend"])
+                    self.from_amount.SetValue(formatted_amount)
+            else:
+                target_ctrl = self.to_amount if ctrl == self.from_amount else self.from_amount
+                target_ctrl.SetValue("Insufficient liquidity")
+            
+            # Update routing info
+            routing = result.get("routing", {})
+            total_spend = sum(routing.values())
+            if total_spend > 0:
+                amm_pct = (routing.get("amm", 0) / total_spend) * 100
+                ob_pct = (routing.get("orderbook", 0) / total_spend) * 100
+                if amm_pct == 0:
+                    self.routing_info.SetLabel(f"Routing: {self._format_amount(ob_pct)}% Orderbook")
+                elif ob_pct == 0:
+                    self.routing_info.SetLabel(f"Routing: {self._format_amount(amm_pct)}% AMM")
+                else:
+                    self.routing_info.SetLabel(f"Routing: {self._format_amount(amm_pct)}/{self._format_amount(ob_pct)} AMM/Orderbook")
+            else:
+                self.routing_info.SetLabel("Routing: --")
+            
+            # Update effective price
+            if result.get("effective_price"):
+                price = result["effective_price"]
+                self.current_price.SetLabel(f"1 {from_currency} = {self._format_amount(price)} {to_currency}")
+            else:
+                self.current_price.SetLabel("Rate: --")
+            
+            # Update price impact (if available)
+            if "price_impact" in result:
+                impact = result["price_impact"] * 100
+                self.price_impact.SetLabel(f"{self._format_amount(impact)}%")
+                
+                # Change color based on impact
+                if impact > 5:
+                    self.price_impact.SetForegroundColour(wx.RED)
+                elif impact > 1:
+                    self.price_impact.SetForegroundColour(wx.Colour(255, 165, 0))  # Orange
+                else:
+                    self.price_impact.SetForegroundColour(wx.BLACK)
+            
+            self.swap_button.Enable(result["sufficient_liquidity"])
+            
+        finally:
+            self._updating = False
+
     async def _update_swap_amounts(self, ctrl, amount_str):
-        """
-        Async helper to update swap amounts based on user input
-        """
+        """Async helper to update swap amounts based on user input"""
         if self._updating:  # Prevent recursive updates
             return
             
@@ -3172,54 +3305,22 @@ class WalletApp(wx.Frame):
             to_currency = self.to_token.GetValue()
             
             # Get issuer for PFT if needed
-            from_issuer = self.config.get_global_config('issuer_address') if from_currency == "PFT" else None
-            to_issuer = self.config.get_global_config('issuer_address') if to_currency == "PFT" else None
+            from_issuer = self.pft_issuer if from_currency == "PFT" else None
+            to_issuer = self.pft_issuer if to_currency == "PFT" else None
             
-            # Calculate rates based on which field was changed
-            if ctrl == self.from_amount:
-                result = await self.amm_utils.calculate_swap_rate(
-                    wallet=self.wallet,
-                    spend_currency=from_currency,
-                    receive_currency=to_currency,
-                    spend_amount=amount,
-                    spend_issuer=from_issuer,
-                    receive_issuer=to_issuer
-                )
-                
-                def update_ui():
-                    self._updating = True
-                    if result["sufficient_liquidity"]:
-                        self.to_amount.SetValue(str(result["expected_receive"]))
-                    else:
-                        self.to_amount.SetValue("Insufficient liquidity")
-                    self.swap_button.Enable(result["sufficient_liquidity"])
-                    self._updating = False
-                    
-                wx.CallAfter(update_ui)
-                    
-            else:  # to_amount was changed
-                result = await self.amm_utils.calculate_swap_rate(
-                    wallet=self.wallet,
-                    spend_currency=from_currency,
-                    receive_currency=to_currency,
-                    receive_amount=amount,
-                    spend_issuer=from_issuer,
-                    receive_issuer=to_issuer
-                )
-                
-                def update_ui():
-                    self._updating = True
-                    if result["sufficient_liquidity"]:
-                        self.from_amount.SetValue(str(result["expected_spend"]))
-                    else:
-                        self.from_amount.SetValue("Insufficient liquidity")
-                    self.swap_button.Enable(result["sufficient_liquidity"])
-                    self._updating = False
-                    
-                wx.CallAfter(update_ui)
+            # Calculate expected receive amount
+            result = await self.amm_utils.calculate_estimated_receive(
+                spend_currency=from_currency,
+                receive_currency=to_currency,
+                spend_amount=amount,
+                spend_issuer=from_issuer,
+                receive_issuer=to_issuer
+            )
+            
+            wx.CallAfter(self._update_swap_ui, result, ctrl, from_currency, to_currency)
             
         except (ValueError, InvalidOperation):
-            def update_ui():
+            def clear_ui():
                 self._updating = True
                 self.swap_button.Enable(False)
                 if ctrl == self.from_amount:
@@ -3228,7 +3329,7 @@ class WalletApp(wx.Frame):
                     self.from_amount.SetValue("")
                 self._updating = False
                 
-            wx.CallAfter(update_ui)
+            wx.CallAfter(clear_ui)
 
     def on_amount_change(self, event):
         """Handle changes to amount fields"""
@@ -3256,12 +3357,32 @@ class WalletApp(wx.Frame):
             self._updating = False
             return
             
-        # Run the async calculation
-        asyncio.create_task(self._update_swap_amounts(ctrl, new_val))
+        # Cancel any pending timer
+        if self._update_timer:
+            self._update_timer.Stop()
+            
+        # Start a new timer
+        self._update_timer = wx.Timer(self)
+        self.Bind(
+            wx.EVT_TIMER,
+            lambda evt, c=ctrl, v=new_val: self._on_update_timer(c, v),
+            self._update_timer
+        )
+        self._update_timer.Start(self.debounce_ms, oneShot=True)
+
         event.Skip()
+
+    def _on_update_timer(self, ctrl, value):
+        """Called when the debounce timer expires"""
+        asyncio.create_task(self._update_swap_amounts(ctrl, value))
 
     def on_token_switch(self, event):
         """Handle token selection changes"""
+        if self._updating:
+            return
+            
+        self._updating = True
+
         # Get the combobox that triggered the event
         combo = event.GetEventObject()
         
@@ -3276,8 +3397,108 @@ class WalletApp(wx.Frame):
             other_combo.SetValue("PFT")
         else:
             other_combo.SetValue("XRP")
+        
+        # Get current selections
+        from_token = self.from_token.GetValue()
+        to_token = self.to_token.GetValue()
+        
+        # Update balances with new token selections
+        from_balance = self._format_amount(self.get_balance(from_token))
+        to_balance = self._format_amount(self.get_balance(to_token))
+        self.from_balance.SetLabel(f"{from_balance} {from_token}")
+        self.to_balance.SetLabel(f"{to_balance} {to_token}")
+        
+        # Clear amounts
+        self.from_amount.SetValue("")
+        self.to_amount.SetValue("")
+        self.swap_button.Enable(False)
+        
+        self._updating = False
+        event.Skip()
+
+    async def on_swap(self, event):
+        """Handle swap button click"""
+        logger.debug("Executing swap")
+        
+        try:
+            # Wait for any ongoing updates to complete
+            while self._updating:
+                await asyncio.sleep(0.1)
+
+            # Get current values
+            from_currency = self.from_token.GetValue()
+            to_currency = self.to_token.GetValue()
+            from_amount = Decimal(self.from_amount.GetValue())
+            to_amount = Decimal(self.to_amount.GetValue())
+
+            # Validate input amounts
+            if not from_amount or not to_amount:
+                raise ValueError("Please enter an amount to swap")
+                
+            try:
+                from_amount = Decimal(from_amount)
+                to_amount = Decimal(to_amount)
+            except (InvalidOperation, ValueError):
+                raise ValueError("Please enter a valid numerical amount")
             
-        # TODO: Update price estimation
+            if from_amount <= 0 or to_amount <= 0:
+                raise ValueError("Amount must be greater than zero")
+            
+            # Disable UI during swap
+            self.swap_button.Enable(False)
+            self.swap_button.SetLabel("Swapping...")
+            
+            # Execute the swap based on direction
+            if from_currency == "XRP":
+                response = await self.amm_utils.buy_pft_with_xrp(
+                    wallet=self.wallet,
+                    pft_amount=to_amount,
+                    xrp_amount=from_amount,
+                    pft_issuer=self.pft_issuer
+                )
+            else:  # from_currency == "PFT"
+                response = await self.amm_utils.sell_pft_for_xrp(
+                    wallet=self.wallet,
+                    pft_amount=from_amount,
+                    xrp_amount=to_amount,
+                    pft_issuer=self.pft_issuer
+                )
+            
+            def update_ui():
+                # Format and display response
+                formatted_response = self.format_response(response)
+                dialog = SelectableMessageDialog(self, "Swap Transaction Submitted", formatted_response)
+                dialog.ShowModal()
+                dialog.Destroy()
+                
+                if response.result.get("engine_result") == "tesSUCCESS":
+                    # Clear the input fields
+                    self.from_amount.SetValue("")
+                    self.to_amount.SetValue("")
+                
+                # Re-enable swap button
+                self.swap_button.SetLabel("Swap")
+                self.swap_button.Enable(True)
+                
+                # Update balances
+                asyncio.create_task(self.update_account_display())
+                
+            wx.CallAfter(update_ui)
+            
+        except Exception as e:
+            logger.exception("Error during swap execution")
+            logger.error(traceback.format_exc())
+            self.swap_button.SetLabel("Swap")
+            self.swap_button.Enable(True)
+
+    def on_add_liquidity(self, event):
+        # TODO: Implement add liquidity functionality
+        print("Add liquidity button clicked")
+        event.Skip()
+
+    def on_remove_liquidity(self, event):
+        # TODO: Implement remove liquidity functionality
+        print("Remove liquidity button clicked")
         event.Skip()
 
     def on_add_liquidity_token_switch(self, event):
@@ -3316,22 +3537,6 @@ class WalletApp(wx.Frame):
             other_combo.SetValue("XRP")
             
         # TODO: Update price estimation
-        event.Skip()
-
-    def on_swap(self, event):
-        """Handle swap button click"""
-        # TODO: Implement swap functionality
-        logger.debug("Swap button clicked")
-        event.Skip()
-
-    def on_add_liquidity(self, event):
-        # TODO: Implement add liquidity functionality
-        print("Add liquidity button clicked")
-        event.Skip()
-
-    def on_remove_liquidity(self, event):
-        # TODO: Implement remove liquidity functionality
-        print("Remove liquidity button clicked")
         event.Skip()
 
 def main():

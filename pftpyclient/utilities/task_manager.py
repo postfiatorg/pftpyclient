@@ -94,12 +94,11 @@ class PostFiatTaskManager:
         # Initialize wallet state based on account status
         # By default, the wallet is considered UNFUNDED
         self.wallet_state = WalletState.UNFUNDED
-        self.determine_wallet_state()
 
     async def get_xrp_balance(self):
         return await self.fetch_xrp_balance(self.network_url, self.user_wallet.classic_address)
     
-    def determine_wallet_state(self) -> bool:
+    async def determine_wallet_state(self) -> bool:
         """Determine the current state of the wallet based on blockhain"""
         logger.debug(f"Determining wallet state for {self.user_wallet.classic_address}")
         client = xrpl.clients.JsonRpcClient(self.network_url)
@@ -118,7 +117,7 @@ class PostFiatTaskManager:
                 balance = int(response.result['account_data']['Balance'])
                 if balance > 0:
                     new_state = WalletState.FUNDED
-                    if self.has_trust_line():
+                    if await self.fetch_trust_line():  # Todo: reference the cache instead of fetching from 
                         new_state = WalletState.TRUSTLINED
                         if self.initiation_rite_sent():
                             new_state = WalletState.INITIATED
@@ -1540,7 +1539,7 @@ class PostFiatTaskManager:
             logger.error(f"Error getting trust line limit: {e}")
             return "0"
     
-    async def has_trust_line(self):
+    async def fetch_trust_line(self):
         """ Checks if the user has a trust line to the PFT token"""
         try:
             client = AsyncJsonRpcClient(self.network_url)
@@ -1573,7 +1572,7 @@ class PostFiatTaskManager:
     async def handle_trust_line(self):
         """ Handles the creation of a trust line to the PFT token if it doesn't exist"""
         logger.debug("Checking if trust line exists...")
-        if not await self.has_trust_line():
+        if not await self.fetch_trust_line():
             _ = await self.update_trust_line_limit()
             logger.debug("Trust line created")
         else:

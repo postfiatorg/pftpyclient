@@ -1,9 +1,8 @@
 from decimal import Decimal
-from xrpl.clients import JsonRpcClient
-from xrpl.wallet import Wallet
+import asyncio
 from pftpyclient.utilities.amm.amm_utilities import AMMUtilities
-from pftpyclient.configuration.configuration import XRPL_TESTNET
-from typing import Dict
+from pftpyclient.configuration.configuration import ConfigurationManager, get_network_config, Network
+from typing import Dict, Any
 
 def print_offer_details(offer: Dict) -> None:
     """Helper function to print details of an individual offer"""
@@ -28,100 +27,86 @@ def print_offer_details(offer: Dict) -> None:
     if 'owner_funds' in offer:
         print(f"Owner Funds: {offer['owner_funds']}")
 
-def analyze_market(seed: str):
-    """
-    Analyze the market for a PFT/XRP trade.
+async def analyze_market():
+    """Analyze the PFT/XRP market on XRPL."""
+    config = ConfigurationManager()
+    network_config = get_network_config(Network.XRPL_TESTNET)
+    amm_utils = AMMUtilities(config)
     
-    Args:
-        seed: The seed for the wallet to use as taker
-    """
-    client = JsonRpcClient(XRPL_TESTNET.public_rpc_urls[0])
-    wallet = Wallet.from_seed(seed)
-    amm_utils = AMMUtilities(client)
+    # Get bids (offers buying PFT for XRP)
+    pft_bids = await amm_utils.get_orderbook(
+        taker_gets_currency="XRP",
+        taker_pays_currency="PFT",
+        taker_pays_issuer=network_config.issuer_address
+    )
+
+    # Get asks (offers selling PFT for XRP)
+    pft_asks = await amm_utils.get_orderbook(
+        taker_gets_currency="PFT",
+        taker_pays_currency="XRP",
+        taker_gets_issuer=network_config.issuer_address
+    )
+
+    print("\n=== PFT/XRP Orderbook ===")
     
-    # Define what we want to trade
-    want_amount = Decimal("1000")  # Want 1000 PFT
-    spend_amount = Decimal("100")  # Willing to spend 100 XRP
+    print("\nAsks (Selling PFT):")
+    print("Price (PFT/XRP) | Amount PFT    | Amount XRP")
+    print("-" * 45)
+    for offer in pft_asks.get('offers', []):
+        price = 1.0 / amm_utils.convert_quality_to_price(offer, side="asks")
+        pft_quantity = float(offer['TakerGets']['value'] if isinstance(offer['TakerGets'], dict) else 0)
+        xrp_quantity = float(offer['TakerPays']) / 1_000_000  # Convert drops to XRP
+        print(f"{price:13.9f} | {pft_quantity:11.2f} | {xrp_quantity:10.2f}")
+
+    print("\nBids (Buying PFT):")
+    print("Price (PFT/XRP) | Amount PFT    | Amount XRP")
+    print("-" * 45)
+    for offer in pft_bids.get('offers', []):
+        price = 1.0 / amm_utils.convert_quality_to_price(offer, side="bids")
+        pft_quantity = float(offer['TakerPays']['value'] if isinstance(offer['TakerPays'], dict) else 0)
+        xrp_quantity = float(offer['TakerGets']) / 1_000_000  # Convert drops to XRP
+        print(f"{price:13.9f} | {pft_quantity:11.2f} | {xrp_quantity:10.2f}")
+    all_asks = pft_asks.get('offers', [])
+    all_bids = pft_bids.get('offers', [])
     
-    # Analyze the order book
-    matched_amount, matching_offers = amm_utils.analyze_orderbook(
-        wallet=wallet,
-        want_currency="PFT",
-        want_amount=want_amount,
-        spend_currency="XRP",
-        spend_amount=spend_amount,
-        want_issuer=XRPL_TESTNET.issuer_address
+    if all_asks:
+        best_ask = 1.0 / amm_utils.convert_quality_to_price(all_asks[0], side="asks")
+        print(f"Best ask (lowest sell): {best_ask:.6f} PFT/XRP")
+    else:
+        print("No asks (sell orders) in the book")
+        
+    if all_bids:
+        best_bid = 1.0 / amm_utils.convert_quality_to_price(all_bids[0], side="bids")
+        print(f"Best bid (highest buy): {best_bid:.6f} PFT/XRP")
+    else:
+        print("No bids (buy orders) in the book")
+
+    # Market depth analysis
+    total_ask_volume_pft = sum(
+        float(offer['TakerGets']['value']) 
+        for offer in all_asks 
+        if isinstance(offer['TakerGets'], dict)
+    )
+    total_bid_volume_pft = sum(
+        float(offer['TakerPays']['value']) 
+        for offer in all_bids 
+        if isinstance(offer['TakerPays'], dict)
     )
     
-    if matched_amount > 0:
-        print(f"\nFound {len(matching_offers)} matching offer(s) that could fill {matched_amount} PFT")
-        print("\nMatching offers details:")
-        for i, offer in enumerate(matching_offers, 1):
-            print(f"\nOffer {i}:")
-            print_offer_details(offer)
-            
-        if matched_amount < want_amount:
-            remaining = want_amount - matched_amount
-            print(f"\nRemaining {remaining} PFT would be placed as a new offer")
-            
-    else:
-        print("\nNo immediate matches found. Checking competing offers...")
-        competing_amount, competing_offers = amm_utils.check_competing_offers(
-            wallet=wallet,
-            want_currency="PFT",
-            want_amount=want_amount,
-            spend_currency="XRP",
-            spend_amount=spend_amount,
-            want_issuer=XRPL_TESTNET.issuer_address
-        )
-        
-        if competing_amount > 0:
-            print(f"\nFound {len(competing_offers)} competing offer(s) with total volume: {competing_amount} XRP")
-            print("\nCompeting offers details:")
-            for i, offer in enumerate(competing_offers, 1):
-                print(f"\nCompeting Offer {i}:")
-                print_offer_details(offer)
-                
-            print("\nMarket Analysis:")
-            print("Your offer would be placed below these competing offers.")
-            print(f"Consider adjusting your price to be more competitive.")
-        else:
-            print("\nNo competing offers found at this price point.")
-            print("Your offer would be the first in the book at this price.")
-    
-    # Calculate and display some market statistics
-    all_offers = matching_offers + competing_offers
-    if all_offers:
-        prices = [float(offer['quality']) for offer in all_offers]
-        avg_price = sum(prices) / len(prices)
-        min_price = min(prices)
-        max_price = max(prices)
-        
-        print("\nMarket Statistics:")
-        print(f"Number of relevant offers: {len(all_offers)}")
-        print(f"Average price: {avg_price:.6f} XRP/PFT")
-        print(f"Price range: {min_price:.6f} - {max_price:.6f} XRP/PFT")
-        print(f"Your proposed price: {float(spend_amount/want_amount):.6f} XRP/PFT")
-    
+    print(f"\nMarket Depth:")
+    print(f"Total PFT for sale: {total_ask_volume_pft:,.2f} PFT")
+    print(f"Total PFT bid for: {total_bid_volume_pft:,.2f} PFT")
+
     return {
-        'matched_amount': matched_amount,
-        'matching_offers': matching_offers,
-        'competing_amount': competing_amount if matched_amount == 0 else 0,
-        'competing_offers': competing_offers if matched_amount == 0 else [],
-        'proposed_price': float(spend_amount/want_amount)
+        'asks': pft_asks.get('offers', []),
+        'bids': pft_bids.get('offers', []),
+        # 'your_price': your_price,
+        'best_ask': best_ask if all_asks else None,
+        'best_bid': best_bid if all_bids else None
     }
 
-def main():
-    SEED = "your_seed_here"
-    result = analyze_market(SEED)
-    
-    # You can use the returned result for further processing if needed
-    if result['matched_amount'] > 0:
-        print("\nRecommendation: Consider executing the trade immediately")
-    elif result['competing_amount'] > 0:
-        print("\nRecommendation: Consider adjusting your price to be more competitive")
-    else:
-        print("\nRecommendation: Safe to place order as first in book")
+async def main():
+    await analyze_market()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

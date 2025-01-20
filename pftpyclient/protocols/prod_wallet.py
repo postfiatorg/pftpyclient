@@ -99,3 +99,4 @@ class WalletApp(Protocol):
     async def update_tokens(self):
         """Update token balances for the current account"""
         ...
+
